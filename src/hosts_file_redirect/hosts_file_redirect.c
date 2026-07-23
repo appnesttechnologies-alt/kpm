@@ -8,13 +8,11 @@
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <printk.h>
-#include <sched.h>
-#include <string.h>
-#include <slab.h>
-#include <mm.h>
-#include <gfp.h>
-#include <uaccess.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/errno.h>
+#include <linux/printk.h>
+#include <linux/string.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -25,6 +23,10 @@ KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.")
 #define KPM_PREFIX             "HFR_MEM"
 #define kpm_info(fmt, ...)     pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)      pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+
+/* Manual defines - not available from KPM headers */
+#define GFP_KERNEL  0xcc0
+#define PAGE_SIZE   4096
 
 /* Safety limits */
 #define MAX_TRANSFER_SIZE     0x100000   /* 1 MiB */
@@ -65,19 +67,15 @@ struct k_packet {
     uint32_t reserved;
 } __attribute__((aligned(8), packed));
 
-/* ---------- Kernel function pointers ---------- */
+/* ---------- Kernel function pointers resolved via kallsyms ---------- */
 typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
                                    void *buf, int len, int write);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
 typedef void (*put_task_struct_t)(struct task_struct *t);
-typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *task);
-typedef void (*mmput_t)(struct mm_struct *);
 
 static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
 static put_task_struct_t put_task_struct_fn;
-static get_task_mm_t get_task_mm_fn;
-static mmput_t mmput_fn;
 
 /* ---------- Core memory operations ---------- */
 
@@ -147,7 +145,7 @@ int handle_resolve_base(struct k_packet *pkt)
     }
 
     get_task_struct_fn(task);
-    mm = get_task_mm_fn(task);
+    mm = get_task_mm(task);
     if (!mm) {
         pkt->status = STATUS_INVALID_PID;
         put_task_struct_fn(task);
@@ -155,7 +153,7 @@ int handle_resolve_base(struct k_packet *pkt)
     }
 
     pkt->resolved_base = mm->start_code;
-    mmput_fn(mm);
+    mmput(mm);
     put_task_struct_fn(task);
     pkt->status = STATUS_SUCCESS;
     return 0;
@@ -189,7 +187,7 @@ int handle_memory_read(struct k_packet *pkt)
         return ret;
     }
 
-    if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
+    if (compat_copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kbuf);
         return -EFAULT;
@@ -217,7 +215,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -ENOMEM;
     }
 
-    if (copy_from_user(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
+    if (compat_copy_to_user(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kbuf);
         return -EFAULT;
@@ -292,11 +290,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    get_task_mm_fn = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
-    mmput_fn = (mmput_t)kallsyms_lookup_name("mmput");
 
-    if (!access_process_vm_fn || !get_task_struct_fn ||
-        !put_task_struct_fn || !get_task_mm_fn || !mmput_fn) {
+    if (!access_process_vm_fn || !get_task_struct_fn || !put_task_struct_fn) {
         kpm_err("Failed to resolve required kernel symbols\n");
         return -EFAULT;
     }
