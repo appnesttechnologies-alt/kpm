@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2026 Surajit. All Rights Reserved.
  * Single-File Self-Contained KPM Memory Debugger Module
- * Creates /dev/hfr_mem node for direct panel communication
+ * Creates /proc/hfr_mem node for direct panel communication
  */
 
 #include <compiler.h>
@@ -13,8 +13,7 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/miscdevice.h>
-#include <linux/fs.h>
+#include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 
 KPM_NAME("hosts_file_redirect");
@@ -39,8 +38,6 @@ KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.")
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_PID    0x1001
-#define STATUS_INVALID_ADDR   0x1002
-#define STATUS_ACCESS_DENIED  0x1003
 #define STATUS_PAGE_FAULT     0x1004
 #define STATUS_INVALID_SIZE   0x1005
 #define STATUS_MEM_ALLOC_FAIL 0x1008
@@ -76,32 +73,12 @@ static find_task_by_vpid_t find_task_by_vpid_fn;
 static kmalloc_t kmalloc_fn;
 static kfree_t kfree_fn;
 
-/* Forward decl */
-static long hfr_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
-static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t len, loff_t *off);
-static ssize_t hfr_dev_read(struct file *filp, char __user *buf, size_t len, loff_t *off);
-static int hfr_dev_open(struct inode *inode, struct file *filp);
+static struct proc_dir_entry *proc_entry;
+static struct k_packet g_pkt;
+static bool g_ready = false;
 
-static struct file_operations hfr_fops = {
-    .owner = THIS_MODULE,
-    .open = hfr_dev_open,
-    .read = hfr_dev_read,
-    .write = hfr_dev_write,
-    .unlocked_ioctl = hfr_dev_ioctl,
-};
-
-static struct miscdevice hfr_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "hfr_mem",
-    .fops = &hfr_fops,
-};
-
-static struct k_packet g_last_result;
-static bool g_result_ready = false;
-
-static int hfr_dev_open(struct inode *inode, struct file *filp) { return 0; }
-
-static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t len, loff_t *off)
+/* /proc/hfr_mem write handler - receive packet from panel */
+static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t len, loff_t *off)
 {
     struct k_packet pkt;
     int ret;
@@ -109,7 +86,7 @@ static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t l
     if (len != sizeof(struct k_packet)) return -EINVAL;
     if (copy_from_user(&pkt, buf, len)) return -EFAULT;
 
-    g_result_ready = false;
+    g_ready = false;
 
     switch (pkt.op_code) {
     case OP_READ_VM: {
@@ -131,6 +108,7 @@ static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t l
         if (ret == pkt.size) {
             memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
+            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
         } else {
             pkt.status = STATUS_PAGE_FAULT;
         }
@@ -150,8 +128,12 @@ static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t l
         ret = access_process_vm_fn(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
         put_task_struct_fn(task);
 
-        if (ret == pkt.size) pkt.status = STATUS_SUCCESS;
-        else pkt.status = STATUS_PAGE_FAULT;
+        if (ret == pkt.size) {
+            pkt.status = STATUS_SUCCESS;
+            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
+        } else {
+            pkt.status = STATUS_PAGE_FAULT;
+        }
         break;
     }
     default:
@@ -159,25 +141,25 @@ static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t l
         break;
     }
 
-    g_last_result = pkt;
-    g_result_ready = true;
+    g_pkt = pkt;
+    g_ready = true;
     return len;
 }
 
-static ssize_t hfr_dev_read(struct file *filp, char __user *buf, size_t len, loff_t *off)
+/* /proc/hfr_mem read handler - return result to panel */
+static ssize_t hfr_proc_read(struct file *file, char __user *buf, size_t len, loff_t *off)
 {
-    if (!g_result_ready) return 0;
+    if (!g_ready) return 0;
     if (len < sizeof(struct k_packet)) return -EINVAL;
-    if (copy_to_user(buf, &g_last_result, sizeof(struct k_packet))) return -EFAULT;
-    g_result_ready = false;
+    if (copy_to_user(buf, &g_pkt, sizeof(struct k_packet))) return -EFAULT;
+    g_ready = false;
     return sizeof(struct k_packet);
 }
 
-static long hfr_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
-{
-    // Alternative: ioctl interface
-    return -ENOTTY;
-}
+static const struct proc_ops hfr_proc_ops = {
+    .proc_read = hfr_proc_read,
+    .proc_write = hfr_proc_write,
+};
 
 /* ---------- Init & Exit ---------- */
 
@@ -196,19 +178,20 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    if (misc_register(&hfr_misc)) {
-        kpm_err("Failed to register /dev/hfr_mem\n");
+    proc_entry = proc_create("hfr_mem", 0666, NULL, &hfr_proc_ops);
+    if (!proc_entry) {
+        kpm_err("Failed to create /proc/hfr_mem\n");
         return -EFAULT;
     }
 
-    kpm_info("HFR Memory Debugger Module Loaded Successfully! Node: /dev/hfr_mem\n");
+    kpm_info("HFR Memory Debugger Module Loaded! Node: /proc/hfr_mem\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    misc_deregister(&hfr_misc);
-    kpm_info("HFR Memory Debugger Module Unloaded Safely!\n");
+    if (proc_entry) proc_remove(proc_entry);
+    kpm_info("HFR Memory Debugger Module Unloaded!\n");
     return 0;
 }
 
