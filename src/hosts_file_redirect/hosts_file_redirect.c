@@ -2,16 +2,14 @@
 /*
  * Copyright (C) 2026 Surajit. All Rights Reserved.
  * Single-File Self-Contained KPM Memory Debugger Module
+ * All functions resolved via kallsyms_lookup_name - no kfunc macros.
  */
 
 #include <compiler.h>
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <ksyms.h>
 #include <linux/sched.h>
-#include <linux/sched/mm.h>
-#include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
@@ -66,22 +64,23 @@ struct k_packet {
     uint32_t reserved;
 } __attribute__((aligned(8), packed));
 
-/* Kernel function pointers */
+/* ---------- All function pointers resolved via kallsyms ---------- */
 typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
                                    void *buf, int len, int write);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
 typedef void (*put_task_struct_t)(struct task_struct *t);
+typedef struct task_struct *(*find_task_by_vpid_t)(pid_t nr);
+typedef void *(*kmalloc_t)(unsigned long size, unsigned int flags);
+typedef void (*kfree_t)(const void *objp);
 
 static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
 static put_task_struct_t put_task_struct_fn;
+static find_task_by_vpid_t find_task_by_vpid_fn;
+static kmalloc_t kmalloc_fn;
+static kfree_t kfree_fn;
 
-#define lookup_sym(func) \
-    kfunc_lookup_name(func); \
-    if (!kfunc(func)) { \
-        kpm_err("Failed to resolve: " #func); \
-        return -EFAULT; \
-    }
+/* ---------- Core memory operations ---------- */
 
 static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t size)
 {
@@ -91,7 +90,7 @@ static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t 
     if (!buf || size == 0 || size > MAX_TRANSFER_SIZE)
         return -EINVAL;
 
-    task = find_task_by_vpid(pid);
+    task = find_task_by_vpid_fn(pid);
     if (!task)
         return -ESRCH;
 
@@ -113,7 +112,7 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
     if (!buf || size == 0 || size > MAX_TRANSFER_SIZE)
         return -EINVAL;
 
-    task = find_task_by_vpid(pid);
+    task = find_task_by_vpid_fn(pid);
     if (!task)
         return -ESRCH;
 
@@ -126,6 +125,8 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
     if (ret != size) return -EFAULT;
     return 0;
 }
+
+/* ---------- Handlers ---------- */
 
 int handle_resolve_base(struct k_packet *pkt)
 {
@@ -144,7 +145,7 @@ int handle_memory_read(struct k_packet *pkt)
         return -EINVAL;
     }
 
-    kbuf = kmalloc(pkt->size, GFP_KERNEL);
+    kbuf = kmalloc_fn(pkt->size, GFP_KERNEL);
     if (!kbuf) {
         pkt->status = STATUS_MEM_ALLOC_FAIL;
         return -ENOMEM;
@@ -155,17 +156,17 @@ int handle_memory_read(struct k_packet *pkt)
         if (ret == -ESRCH) pkt->status = STATUS_INVALID_PID;
         else if (ret == -EFAULT) pkt->status = STATUS_PAGE_FAULT;
         else pkt->status = STATUS_ACCESS_DENIED;
-        kfree(kbuf);
+        kfree_fn(kbuf);
         return ret;
     }
 
     if (compat_copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
-        kfree(kbuf);
+        kfree_fn(kbuf);
         return -EFAULT;
     }
 
-    kfree(kbuf);
+    kfree_fn(kbuf);
     pkt->status = STATUS_SUCCESS;
     pkt->page_count = (pkt->size + PAGE_SIZE - 1) / PAGE_SIZE;
     return 0;
@@ -181,7 +182,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -EINVAL;
     }
 
-    kbuf = kmalloc(pkt->size, GFP_KERNEL);
+    kbuf = kmalloc_fn(pkt->size, GFP_KERNEL);
     if (!kbuf) {
         pkt->status = STATUS_MEM_ALLOC_FAIL;
         return -ENOMEM;
@@ -189,12 +190,12 @@ int handle_memory_write(struct k_packet *pkt)
 
     if (compat_copy_to_user(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
-        kfree(kbuf);
+        kfree_fn(kbuf);
         return -EFAULT;
     }
 
     ret = write_process_memory(pkt->target_pid, pkt->target_addr, kbuf, pkt->size);
-    kfree(kbuf);
+    kfree_fn(kbuf);
 
     if (ret < 0) {
         if (ret == -ESRCH) pkt->status = STATUS_INVALID_PID;
@@ -214,6 +215,8 @@ int handle_query_phys(struct k_packet *pkt)
     pkt->physical_addr = 0;
     return -ENOSYS;
 }
+
+/* ---------- Control interface ---------- */
 
 static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 {
@@ -250,21 +253,27 @@ static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
     return ret;
 }
 
+/* ---------- Init & Exit ---------- */
+
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    /* Resolve all kfunc symbols that KPM framework needs */
-    lookup_sym(kmalloc);
-    lookup_sym(__kmalloc);
-    lookup_sym(find_task_by_vpid);
-    lookup_sym(kfree);
-
-    /* Resolve other symbols via kallsyms directly */
+    /* Resolve ALL functions via kallsyms_lookup_name - no kfunc macros */
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
+    find_task_by_vpid_fn = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
+    kmalloc_fn = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
+    kfree_fn = (kfree_t)kallsyms_lookup_name("kfree");
 
-    if (!access_process_vm_fn || !get_task_struct_fn || !put_task_struct_fn) {
+    if (!access_process_vm_fn || !get_task_struct_fn || !put_task_struct_fn ||
+        !find_task_by_vpid_fn || !kmalloc_fn || !kfree_fn) {
         kpm_err("Failed to resolve required kernel symbols\n");
+        kpm_err("access_process_vm: %p\n", access_process_vm_fn);
+        kpm_err("get_task_struct: %p\n", get_task_struct_fn);
+        kpm_err("put_task_struct: %p\n", put_task_struct_fn);
+        kpm_err("find_task_by_vpid: %p\n", find_task_by_vpid_fn);
+        kpm_err("__kmalloc: %p\n", kmalloc_fn);
+        kpm_err("kfree: %p\n", kfree_fn);
         return -EFAULT;
     }
 
