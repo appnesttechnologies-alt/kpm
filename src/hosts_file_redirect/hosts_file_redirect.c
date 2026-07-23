@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* ROBUST /dev/hfr_mem - Direct Panel Communication */
-/* NO memcpy redefinition - uses string.h provided memcpy */
+/* register_chrdev + string.h memcpy - NO redefinition */
 
 #include <compiler.h>
 #include <hook.h>
@@ -48,7 +48,6 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE_DATA];
 } __attribute__((aligned(8), packed));
 
-/* Kernel functions via kallsyms */
 typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, int);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
 typedef void (*put_task_struct_t)(struct task_struct *);
@@ -76,11 +75,13 @@ static int hfr_open(void *inode, void *filp) { return 0; }
 static ssize_t hfr_write(void *filp, const char __user *buf, size_t len, void *off)
 {
     struct k_packet pkt;
-    
     if (len != sizeof(pkt)) return -EINVAL;
-    
-    { const unsigned char *s=(const unsigned char*)buf; unsigned char *d=(unsigned char*)&pkt; unsigned long i; for(i=0;i<len;i++) d[i]=s[i]; }
-
+    {
+        const unsigned char *s = (const unsigned char *)buf;
+        unsigned char *d = (unsigned char *)&pkt;
+        unsigned long i;
+        for (i = 0; i < len; i++) d[i] = s[i];
+    }
     g_ready = 0;
     pkt.status = STATUS_MODULE_BUSY;
 
@@ -94,8 +95,11 @@ static ssize_t hfr_write(void *filp, const char __user *buf, size_t len, void *o
         p_get_task_struct(task);
         int ret = p_access_process_vm(task, pkt.target_addr, kbuf, pkt.size, 0);
         p_put_task_struct(task);
-        if (ret == pkt.size) { memcpy(pkt.inline_data, kbuf, pkt.size); pkt.status = STATUS_SUCCESS; }
-        else pkt.status = STATUS_PAGE_FAULT;
+        if (ret == pkt.size) {
+            memcpy(pkt.inline_data, kbuf, pkt.size);
+            pkt.status = STATUS_SUCCESS;
+            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
+        } else pkt.status = STATUS_PAGE_FAULT;
         p_kfree(kbuf);
     }
     else if (pkt.op_code == OP_WRITE_VM) {
@@ -105,7 +109,10 @@ static ssize_t hfr_write(void *filp, const char __user *buf, size_t len, void *o
         p_get_task_struct(task);
         int ret = p_access_process_vm(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
         p_put_task_struct(task);
-        pkt.status = (ret == pkt.size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
+        if (ret == pkt.size) {
+            pkt.status = STATUS_SUCCESS;
+            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
+        } else pkt.status = STATUS_PAGE_FAULT;
     }
 
 done:
@@ -123,8 +130,23 @@ static ssize_t hfr_read(void *filp, char __user *buf, size_t len, void *off)
     return sizeof(g_pkt);
 }
 
-struct my_file_operations { void *owner; void *open; void *read; void *write; void *unlocked_ioctl; void *compat_ioctl; };
-static struct my_file_operations hfr_fops = { NULL, (void*)hfr_open, (void*)hfr_read, (void*)hfr_write, NULL, NULL };
+struct my_file_operations {
+    void *owner;
+    void *open;
+    void *read;
+    void *write;
+    void *unlocked_ioctl;
+    void *compat_ioctl;
+};
+
+static struct my_file_operations hfr_fops = {
+    .owner = NULL,
+    .open = (void *)hfr_open,
+    .read = (void *)hfr_read,
+    .write = (void *)hfr_write,
+    .unlocked_ioctl = NULL,
+    .compat_ioctl = NULL,
+};
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
@@ -137,13 +159,17 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_register_chrdev    = (register_chrdev_t)   kallsyms_lookup_name("__register_chrdev");
     p_unregister_chrdev  = (unregister_chrdev_t) kallsyms_lookup_name("__unregister_chrdev");
 
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree || !p_register_chrdev) {
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc ||
+        !p_kfree || !p_register_chrdev || !p_get_task_struct || !p_put_task_struct) {
         kpm_err("Symbol resolution failed\n");
         return -EFAULT;
     }
 
     g_major = p_register_chrdev(0, "hfr_mem", &hfr_fops);
-    if (g_major < 0) { kpm_err("register_chrdev failed\n"); return -EFAULT; }
+    if (g_major < 0) {
+        kpm_err("register_chrdev failed: %d\n", g_major);
+        return -EFAULT;
+    }
 
     kpm_info("LOADED /dev/hfr_mem (major=%d) - mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
     return 0;
