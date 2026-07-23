@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - Direct panel communication, no APatch control needed */
+/* /dev/hfr_mem - memcpy from string.h, no redefinition */
 
 #include <compiler.h>
 #include <hook.h>
@@ -22,7 +22,6 @@ KPM_DESCRIPTION("Kernel memory read/write via /dev/hfr_mem");
 
 #define GFP_KERNEL 0xcc0
 #define PAGE_SIZE 4096
-#define MAX_TRANSFER_SIZE 0x100000
 #define MAX_INLINE_DATA 256
 
 #define OP_READ_VM 0x2000
@@ -48,16 +47,6 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE_DATA];
 } __attribute__((aligned(8), packed));
 
-/* Self-contained memcpy */
-void *memcpy(void *dest, const void *src, unsigned long n) {
-    unsigned char *d = (unsigned char *)dest;
-    const unsigned char *s = (const unsigned char *)src;
-    unsigned long i;
-    for (i = 0; i < n; i++) d[i] = s[i];
-    return dest;
-}
-
-/* Working memory functions from earlier successful load */
 typedef int (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -84,7 +73,6 @@ static struct k_packet g_pkt;
 static int g_ready = 0;
 static int g_major = -1;
 
-/* File operations */
 static int hfr_open(void *inode, void *filp) { return 0; }
 
 static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
@@ -112,9 +100,7 @@ static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
         if (ret == pkt.size) {
             memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
-        } else {
-            pkt.status = STATUS_PAGE_FAULT;
-        }
+        } else pkt.status = STATUS_PAGE_FAULT;
         p_kfree(kbuf);
     }
     else if (pkt.op_code == OP_WRITE_VM) {
@@ -143,7 +129,6 @@ static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
     return sizeof(g_pkt);
 }
 
-/* Minimal fops - no THIS_MODULE */
 struct my_fops {
     void *owner;
     void *open;
@@ -183,7 +168,7 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
         return -14;
     }
 
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - Run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! /dev/hfr_mem (major %d)\n", g_major);
     return 0;
 }
 
