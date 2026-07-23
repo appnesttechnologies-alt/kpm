@@ -9,21 +9,14 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <asm/pgtable.h>
 #include <linux/pagemap.h>
-#include <linux/rwsem.h>
 
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-/* Include process_helper functions */
-extern int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task);
-extern void put_process_mm(struct mm_struct *mm);
-extern unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr);
-extern int validate_user_address(struct mm_struct *mm, unsigned long vaddr, unsigned long size);
-
+/* Internal context structure */
 struct mem_op_context {
     struct mm_struct *target_mm;
     struct page **pages;
@@ -34,6 +27,11 @@ struct mem_op_context {
     int write_mode;
 };
 
+/* External functions from process_helper.c */
+extern int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task);
+extern void put_process_mm(struct mm_struct *mm);
+extern unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr);
+extern int validate_user_address(struct mm_struct *mm, unsigned long vaddr, unsigned long size);
 extern int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
                                  unsigned long size, int write, struct mem_op_context *ctx);
 extern void unpin_user_pages(struct mem_op_context *ctx);
