@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - NO memcpy, manual copy loop */
+/* /dev/hfr_mem - Direct panel communication, no APatch control needed */
 
 #include <compiler.h>
 #include <hook.h>
@@ -22,9 +22,12 @@ KPM_DESCRIPTION("Kernel memory read/write via /dev/hfr_mem");
 
 #define GFP_KERNEL 0xcc0
 #define PAGE_SIZE 4096
+#define MAX_TRANSFER_SIZE 0x100000
 #define MAX_INLINE_DATA 256
+
 #define OP_READ_VM 0x2000
 #define OP_WRITE_VM 0x3000
+
 #define STATUS_SUCCESS 0x0000
 #define STATUS_INVALID_PID 0x1001
 #define STATUS_PAGE_FAULT 0x1004
@@ -38,13 +41,23 @@ struct k_packet {
     uint64_t target_addr;
     uint32_t size;
     uint32_t status;
-    uint8_t inline_data[MAX_INLINE_DATA];
-    uint32_t page_count;
     uint64_t resolved_base;
     uint64_t physical_addr;
+    uint32_t page_count;
     uint32_t reserved;
+    uint8_t inline_data[MAX_INLINE_DATA];
 } __attribute__((aligned(8), packed));
 
+/* Self-contained memcpy */
+void *memcpy(void *dest, const void *src, unsigned long n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned long i;
+    for (i = 0; i < n; i++) d[i] = s[i];
+    return dest;
+}
+
+/* Working memory functions from earlier successful load */
 typedef int (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -71,14 +84,7 @@ static struct k_packet g_pkt;
 static int g_ready = 0;
 static int g_major = -1;
 
-/* Manual copy - no memcpy needed */
-static void my_copy(void *dst, const void *src, unsigned long n) {
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    unsigned long i;
-    for (i = 0; i < n; i++) d[i] = s[i];
-}
-
+/* File operations */
 static int hfr_open(void *inode, void *filp) { return 0; }
 
 static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
@@ -104,9 +110,11 @@ static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
         p_put_task_struct(task);
 
         if (ret == pkt.size) {
-            my_copy(pkt.inline_data, kbuf, pkt.size);
+            memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
-        } else pkt.status = STATUS_PAGE_FAULT;
+        } else {
+            pkt.status = STATUS_PAGE_FAULT;
+        }
         p_kfree(kbuf);
     }
     else if (pkt.op_code == OP_WRITE_VM) {
@@ -121,7 +129,7 @@ static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
     }
 
 done:
-    my_copy(&g_pkt, &pkt, sizeof(pkt));
+    memcpy(&g_pkt, &pkt, sizeof(pkt));
     g_ready = 1;
     return len;
 }
@@ -135,6 +143,7 @@ static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
     return sizeof(g_pkt);
 }
 
+/* Minimal fops - no THIS_MODULE */
 struct my_fops {
     void *owner;
     void *open;
@@ -174,7 +183,7 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
         return -14;
     }
 
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! /dev/hfr_mem (major %d) - Run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
     return 0;
 }
 
