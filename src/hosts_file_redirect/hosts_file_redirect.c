@@ -8,6 +8,7 @@
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
+#include <ksyms.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -75,6 +76,13 @@ static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
 static put_task_struct_t put_task_struct_fn;
 
+#define lookup_sym(func) \
+    kfunc_lookup_name(func); \
+    if (!kfunc(func)) { \
+        kpm_err("Failed to resolve: " #func); \
+        return -EFAULT; \
+    }
+
 static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t size)
 {
     struct task_struct *task;
@@ -121,7 +129,6 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
 
 int handle_resolve_base(struct k_packet *pkt)
 {
-    /* mm->start_code not accessible without full mm_struct definition */
     pkt->status = STATUS_PAGE_WALK_FAIL;
     pkt->resolved_base = 0;
     return -ENOSYS;
@@ -245,6 +252,13 @@ static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
+    /* Resolve all kfunc symbols that KPM framework needs */
+    lookup_sym(kmalloc);
+    lookup_sym(__kmalloc);
+    lookup_sym(find_task_by_vpid);
+    lookup_sym(kfree);
+
+    /* Resolve other symbols via kallsyms directly */
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
