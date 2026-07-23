@@ -83,12 +83,16 @@ static bool validate_packet(const struct k_packet *pkt)
     return true;
 }
 
-static long kpm_memory_ctl0_handler(void __user *user_data, size_t user_size)
+/* APatch Compatible CTL0 Handler Signature */
+static long kpm_memory_ctl0_handler(const char *arg1, char *arg2, int arg3)
 {
     struct k_packet pkt;
     int ret = 0;
     struct mm_struct *mm = NULL;
     struct task_struct *task = NULL;
+    
+    void __user *user_data = (void __user *)arg1;
+    size_t user_size = (size_t)arg3;
     
     if (!user_data || user_size != sizeof(struct k_packet)) {
         kpm_err("Invalid CTL0 call - size: %zu\n", user_size);
