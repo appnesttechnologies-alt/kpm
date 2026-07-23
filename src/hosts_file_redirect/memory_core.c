@@ -8,10 +8,12 @@
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+#include <linux/mm_types.h>
 #include <linux/pid.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/version.h>
+#include <linux/rwsem.h>
 
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -105,7 +107,7 @@ int handle_memory_read(struct k_packet *pkt)
     
     unpin_user_pages(&ctx);
     
-    if (copy_to_user((void __user *)pkt->user_buffer, kernel_buffer, pkt->size)) {
+    if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         ret = -EFAULT;
     } else {
@@ -151,7 +153,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -ENOMEM;
     }
     
-    if (copy_from_user(kernel_buffer, (void __user *)pkt->user_buffer, pkt->size)) {
+    if (copy_from_user(kernel_buffer, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kernel_buffer);
         put_process_mm(mm);
@@ -207,8 +209,12 @@ int resolve_process_base(struct k_packet *pkt)
         return -EINTR;
     }
     
+#if defined(LINUX_VERSION_CODE) && defined(KERNEL_VERSION)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
     vma = mm->mmap;
+#else
+    vma = mm->mmap;
+#endif
 #else
     vma = mm->mmap;
 #endif
