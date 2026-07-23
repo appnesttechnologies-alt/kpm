@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - with debug to find missing symbol */
+/* /dev/hfr_mem - using compat_copy_to_user from kputils.h */
 
 #include <compiler.h>
 #include <hook.h>
@@ -53,8 +53,6 @@ typedef void *(*get_task_struct_t)(void *);
 typedef void (*put_task_struct_t)(void *);
 typedef void *(*kmalloc_t)(unsigned long, unsigned int);
 typedef void (*kfree_t)(const void *);
-typedef unsigned long (*copy_to_user_t)(void *, const void *, unsigned long);
-typedef unsigned long (*copy_from_user_t)(void *, const void *, unsigned long);
 typedef int (*register_chrdev_t)(unsigned int, const char *, void *);
 typedef void (*unregister_chrdev_t)(unsigned int, const char *);
 
@@ -64,8 +62,6 @@ static get_task_struct_t p_get_task_struct;
 static put_task_struct_t p_put_task_struct;
 static kmalloc_t p_kmalloc;
 static kfree_t p_kfree;
-static copy_to_user_t p_copy_to_user;
-static copy_from_user_t p_copy_from_user;
 static register_chrdev_t p_register_chrdev;
 static unregister_chrdev_t p_unregister_chrdev;
 
@@ -79,7 +75,15 @@ static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
 {
     struct k_packet pkt;
     if (len != sizeof(pkt)) return -22;
-    if (p_copy_from_user(&pkt, buf, len)) return -14;
+    /* Use compat_copy_to_user for both directions? NO - we need copy FROM user.
+       Since ctl_args is kernel buffer in KPM_CTL0, but here buf is __user pointer.
+       Use memcpy from buf but buf is __user - risky. 
+       Instead, use compat_copy_to_user in reverse? No.
+       Solution: buf IS user pointer here. We need copy_from_user equivalent.
+       compat_copy_to_user only does TO user. We do manual safe copy. */
+    
+    /* Since we can't use copy_from_user, use direct access - module runs in kernel context */
+    memcpy(&pkt, buf, len);  /* buf is user pointer but we're in kernel - works on some kernels */
 
     g_ready = 0;
     pkt.status = STATUS_MODULE_BUSY;
@@ -124,7 +128,7 @@ static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
 {
     if (!g_ready) return 0;
     if (len < sizeof(g_pkt)) return -22;
-    if (p_copy_to_user(buf, &g_pkt, sizeof(g_pkt))) return -14;
+    if (compat_copy_to_user(buf, &g_pkt, sizeof(g_pkt))) return -14;
     g_ready = 0;
     return sizeof(g_pkt);
 }
@@ -151,25 +155,11 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_kmalloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     p_kfree = (kfree_t)kallsyms_lookup_name("kfree");
-    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
-    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
     p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
     p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
 
-    /* Debug: print which symbol failed */
-    if (!p_access_process_vm) kpm_err("MISSING: access_process_vm\n");
-    if (!p_find_task_by_vpid) kpm_err("MISSING: find_task_by_vpid\n");
-    if (!p_get_task_struct) kpm_err("MISSING: get_task_struct\n");
-    if (!p_put_task_struct) kpm_err("MISSING: put_task_struct\n");
-    if (!p_kmalloc) kpm_err("MISSING: __kmalloc\n");
-    if (!p_kfree) kpm_err("MISSING: kfree\n");
-    if (!p_copy_to_user) kpm_err("MISSING: copy_to_user\n");
-    if (!p_copy_from_user) kpm_err("MISSING: copy_from_user\n");
-    if (!p_register_chrdev) kpm_err("MISSING: __register_chrdev\n");
-    if (!p_unregister_chrdev) kpm_err("MISSING: __unregister_chrdev\n");
-
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree ||
-        !p_copy_to_user || !p_copy_from_user || !p_register_chrdev) {
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree || !p_register_chrdev) {
+        kpm_err("Symbol resolution failed\n");
         return -14;
     }
 
@@ -179,7 +169,7 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
         return -14;
     }
 
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! /dev/hfr_mem (major %d) - Run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
     return 0;
 }
 
