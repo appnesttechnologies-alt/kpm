@@ -51,8 +51,8 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE_DATA];
 } __attribute__((aligned(8), packed));
 
-/* Self-contained memcpy - no external symbol needed */
-static void *my_memcpy(void *dest, const void *src, unsigned long n)
+/* Self-contained memcpy - provides the symbol the linker needs */
+void *memcpy(void *dest, const void *src, unsigned long n)
 {
     unsigned char *d = (unsigned char *)dest;
     const unsigned char *s = (const unsigned char *)src;
@@ -130,7 +130,7 @@ static ssize_t hfr_write(void *filp, const char __user *buf, size_t len, void *o
         p_put_task_struct(task);
 
         if (ret == pkt.size) {
-            my_memcpy(pkt.inline_data, kbuf, pkt.size);
+            memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
             pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
         } else {
@@ -163,7 +163,7 @@ static ssize_t hfr_write(void *filp, const char __user *buf, size_t len, void *o
     }
 
 done:
-    my_memcpy(&g_pkt, &pkt, sizeof(pkt));
+    memcpy(&g_pkt, &pkt, sizeof(pkt));
     g_ready = 1;
     return len;
 }
