@@ -40,7 +40,7 @@ extern int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size
 
 int memory_initialize(void)
 {
-    kpm_info("Memory core initialized successfully (Offset mode)\n");
+    kpm_info("Memory core initialized successfully (Fixed Mode)\n");
     return 0;
 }
 
@@ -59,7 +59,7 @@ int handle_memory_read(struct k_packet *pkt)
     
     if (pkt->size == 0 || pkt->size > MAX_TRANSFER_SIZE) {
         pkt->status = STATUS_INVALID_SIZE;
-        return -22; /* -EINVAL equivalent */
+        return -22;
     }
     
     ret = get_process_mm(pkt->target_pid, &mm, &task);
@@ -75,11 +75,11 @@ int handle_memory_read(struct k_packet *pkt)
         return ret;
     }
     
-    kernel_buffer = kmalloc(pkt->size, 0x000000dc); /* GFP_KERNEL safe fallback value if needed, else standard slab */
+    kernel_buffer = kmalloc(pkt->size, GFP_KERNEL);
     if (!kernel_buffer) {
         pkt->status = STATUS_MEM_ALLOC_FAIL;
         put_process_mm(mm);
-        return -12; /* -ENOMEM equivalent */
+        return -12;
     }
     
     memset(&ctx, 0, sizeof(ctx));
@@ -105,7 +105,7 @@ int handle_memory_read(struct k_packet *pkt)
     
     if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
-        ret = -14; /* -EFAULT equivalent */
+        ret = -14;
     } else {
         pkt->status = STATUS_SUCCESS;
         pkt->page_count = ctx.nr_pages;
@@ -142,7 +142,7 @@ int handle_memory_write(struct k_packet *pkt)
         return ret;
     }
     
-    kernel_buffer = kmalloc(pkt->size, 0x000000dc);
+    kernel_buffer = kmalloc(pkt->size, GFP_KERNEL);
     if (!kernel_buffer) {
         pkt->status = STATUS_MEM_ALLOC_FAIL;
         put_process_mm(mm);
