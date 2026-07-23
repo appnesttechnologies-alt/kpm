@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - direct panel communication via read/write */
+/* Undetectable memory r/w – string commands over KPM_CTL0 (syscall 449) */
 
 #include <compiler.h>
 #include <hook.h>
@@ -9,176 +9,155 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/kernel.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory read/write via /dev/hfr_mem");
+KPM_DESCRIPTION("Undetectable kernel memory r/w via KPM_CTL0");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_err(fmt, ...) pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+#define kpm_err(fmt, ...)  pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-#define GFP_KERNEL 0xcc0
-#define MAX_INLINE_DATA 256
+#define GFP_KERNEL  0xcc0
+#define MAX_DATA    256
 
-#define OP_READ_VM 0x2000
-#define OP_WRITE_VM 0x3000
+/* kallsyms function pointers */
+typedef int  (*access_process_vm_t)(void*, unsigned long, void*, int, int);
+typedef void* (*find_task_by_vpid_t)(int);
+typedef void* (*get_task_struct_t)(void*);
+typedef void  (*put_task_struct_t)(void*);
+typedef void* (*kmalloc_t)(unsigned long, unsigned int);
+typedef void  (*kfree_t)(const void*);
 
-#define STATUS_SUCCESS 0x0000
-#define STATUS_INVALID_PID 0x1001
-#define STATUS_PAGE_FAULT 0x1004
-#define STATUS_INVALID_SIZE 0x1005
-#define STATUS_MEM_ALLOC_FAIL 0x1008
+static access_process_vm_t  p_access_process_vm;
+static find_task_by_vpid_t  p_find_task_by_vpid;
+static get_task_struct_t    p_get_task_struct;
+static put_task_struct_t    p_put_task_struct;
+static kmalloc_t            p_kmalloc;
+static kfree_t              p_kfree;
 
-struct k_packet {
-    uint32_t op_code;
-    uint32_t target_pid;
-    uint64_t target_addr;
-    uint32_t size;
-    uint32_t status;
-    uint8_t inline_data[MAX_INLINE_DATA];
-} __attribute__((aligned(8), packed));
-
-typedef int (*access_process_vm_t)(void *, unsigned long, void *, int, int);
-typedef void *(*find_task_by_vpid_t)(int);
-typedef void *(*get_task_struct_t)(void *);
-typedef void (*put_task_struct_t)(void *);
-typedef void *(*kmalloc_t)(unsigned long, unsigned int);
-typedef void (*kfree_t)(const void *);
-typedef int (*register_chrdev_t)(unsigned int, const char *, void *);
-typedef void (*unregister_chrdev_t)(unsigned int, const char *);
-
-static access_process_vm_t p_access_process_vm;
-static find_task_by_vpid_t p_find_task_by_vpid;
-static get_task_struct_t p_get_task_struct;
-static put_task_struct_t p_put_task_struct;
-static kmalloc_t p_kmalloc;
-static kfree_t p_kfree;
-static register_chrdev_t p_register_chrdev;
-static unregister_chrdev_t p_unregister_chrdev;
-
-static struct k_packet g_pkt;
-static int g_ready = 0;
-static int g_major = -1;
-
-static int hfr_open(void *inode, void *filp) { return 0; }
-
-static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
+/* ---------- Control Handler (called by syscall 449) ---------- */
+static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 {
-    struct k_packet pkt;
-    if (len != sizeof(pkt)) return -22;
-    
-    /* Copy from user buffer - use loop since copy_from_user not available */
-    {
-        unsigned long i;
-        const char *src = buf;
-        unsigned char *dst = (unsigned char *)&pkt;
-        for (i = 0; i < len; i++) dst[i] = src[i];
+    char cmd;
+    int pid;
+    unsigned long addr;
+    unsigned int size;
+    unsigned int value = 0;
+    char resp[512];
+    int ret;
+
+    if (!ctl_args || outlen < 1) return -EINVAL;
+
+    kpm_info("cmd: %s\n", ctl_args);
+
+    // Parse: R,pid,addr,size  or  W,pid,addr,size,value
+    if (sscanf(ctl_args, "%c,%d,%lx,%u,%u", &cmd, &pid, &addr, &size, &value) < 4) {
+        snprintf(resp, sizeof(resp), "ERR: parse");
+        compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+        return -EINVAL;
     }
 
-    g_ready = 0;
-    pkt.status = STATUS_INVALID_PID;
-
-    if (pkt.op_code == OP_READ_VM) {
+    if (cmd == 'R' || cmd == 'r') {
         void *kbuf;
-        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; goto done; }
-        kbuf = p_kmalloc(pkt.size, GFP_KERNEL);
-        if (!kbuf) { pkt.status = STATUS_MEM_ALLOC_FAIL; goto done; }
+        if (size == 0 || size > MAX_DATA) {
+            snprintf(resp, sizeof(resp), "ERR: size");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+            return -EINVAL;
+        }
 
-        void *task = p_find_task_by_vpid(pkt.target_pid);
-        if (!task) { p_kfree(kbuf); goto done; }
+        kbuf = p_kmalloc(size, GFP_KERNEL);
+        if (!kbuf) {
+            snprintf(resp, sizeof(resp), "ERR: mem");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+            return -ENOMEM;
+        }
+
+        void *task = p_find_task_by_vpid(pid);
+        if (!task) {
+            p_kfree(kbuf);
+            snprintf(resp, sizeof(resp), "ERR: pid");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+            return -ESRCH;
+        }
 
         p_get_task_struct(task);
-        int ret = p_access_process_vm(task, pkt.target_addr, kbuf, pkt.size, 0);
+        ret = p_access_process_vm(task, addr, kbuf, size, 0);
         p_put_task_struct(task);
 
-        if (ret == pkt.size) {
-            unsigned long i;
-            unsigned char *s = (unsigned char *)kbuf;
-            for (i = 0; i < pkt.size; i++) pkt.inline_data[i] = s[i];
-            pkt.status = STATUS_SUCCESS;
-        } else pkt.status = STATUS_PAGE_FAULT;
+        if (ret == size) {
+            int off = snprintf(resp, sizeof(resp), "OK:");
+            unsigned char *data = (unsigned char *)kbuf;
+            for (int i = 0; i < size && off < sizeof(resp) - 3; i++)
+                off += snprintf(resp + off, sizeof(resp) - off, "%02X", data[i]);
+            compat_copy_to_user(out_msg, resp, off + 1);
+        } else {
+            snprintf(resp, sizeof(resp), "ERR: pagefault");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+        }
         p_kfree(kbuf);
+        return 0;
     }
-    else if (pkt.op_code == OP_WRITE_VM) {
-        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; goto done; }
-        void *task = p_find_task_by_vpid(pkt.target_pid);
-        if (!task) goto done;
+    else if (cmd == 'W' || cmd == 'w') {
+        if (size == 0 || size > 4) {
+            snprintf(resp, sizeof(resp), "ERR: size");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+            return -EINVAL;
+        }
+
+        void *task = p_find_task_by_vpid(pid);
+        if (!task) {
+            snprintf(resp, sizeof(resp), "ERR: pid");
+            compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+            return -ESRCH;
+        }
 
         p_get_task_struct(task);
-        int ret = p_access_process_vm(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
+        ret = p_access_process_vm(task, addr, &value, size, 1);
         p_put_task_struct(task);
-        pkt.status = (ret == pkt.size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
+
+        if (ret == size) {
+            snprintf(resp, sizeof(resp), "OK: wrote %u", value);
+        } else {
+            snprintf(resp, sizeof(resp), "ERR: pagefault");
+        }
+        compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+        return 0;
     }
 
-done:
-    {
-        unsigned long i;
-        unsigned char *s = (unsigned char *)&pkt;
-        unsigned char *d = (unsigned char *)&g_pkt;
-        for (i = 0; i < sizeof(pkt); i++) d[i] = s[i];
-    }
-    g_ready = 1;
-    return len;
+    snprintf(resp, sizeof(resp), "ERR: unknown cmd");
+    compat_copy_to_user(out_msg, resp, strlen(resp) + 1);
+    return -EINVAL;
 }
 
-static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
-{
-    if (!g_ready) return 0;
-    if (len < sizeof(g_pkt)) return -22;
-    if (compat_copy_to_user(buf, &g_pkt, sizeof(g_pkt))) return -14;
-    g_ready = 0;
-    return sizeof(g_pkt);
-}
-
-struct my_fops {
-    void *owner;
-    void *open;
-    void *read;
-    void *write;
-};
-
-static struct my_fops hfr_fops = {
-    .owner = 0,
-    .open = (void *)hfr_open,
-    .read = (void *)hfr_read,
-    .write = (void *)hfr_write,
-};
-
-static long hfr_memory_init(const char *args, const char *event, void *reserved)
+/* ---------- Init / Exit ---------- */
+static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     p_access_process_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
-    p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
-    p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    p_kmalloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
-    p_kfree = (kfree_t)kallsyms_lookup_name("kfree");
-    p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
-    p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
+    p_get_task_struct   = (get_task_struct_t)  kallsyms_lookup_name("get_task_struct");
+    p_put_task_struct   = (put_task_struct_t)  kallsyms_lookup_name("put_task_struct");
+    p_kmalloc           = (kmalloc_t)          kallsyms_lookup_name("__kmalloc");
+    p_kfree             = (kfree_t)            kallsyms_lookup_name("kfree");
 
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_register_chrdev) {
-        kpm_err("Symbol resolution failed\n");
-        return -14;
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree) {
+        kpm_err("symbol resolution failed\n");
+        return -EFAULT;
     }
 
-    g_major = p_register_chrdev(0, "hfr_mem", &hfr_fops);
-    if (g_major < 0) {
-        kpm_err("register_chrdev failed: %d\n", g_major);
-        return -14;
-    }
-
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! Commands: R,pid,addr,size / W,pid,addr,size,value\n");
     return 0;
 }
 
-static long hfr_memory_exit(void *reserved)
+static long hfr_memory_exit(void __user *reserved)
 {
-    if (g_major >= 0) p_unregister_chrdev(g_major, "hfr_mem");
     kpm_info("Unloaded!\n");
     return 0;
 }
 
 KPM_INIT(hfr_memory_init);
+KPM_CTL0(hfr_control0);
 KPM_EXIT(hfr_memory_exit);
