@@ -1,11 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * Copyright (C) 2026 Surajit. All Rights Reserved.
- * 
  * Process Helper - MMU Page Table Walk and Page Management
  */
 
 #include "framework.h"
+
+/* Need these for page table walk */
+#include <asm/pgtable.h>
+#include <linux/pagemap.h>
+#include <linux/rwsem.h>
 
 int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task)
 {
@@ -79,19 +83,19 @@ unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr)
     
     pgd = pgd_offset(mm, vaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) {
-        kpm_debug("Invalid PGD entry for 0x%lx\n", vaddr);
+        kpm_debug("Invalid PGD entry\n");
         goto out_unlock;
     }
     
     p4d = p4d_offset(pgd, vaddr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) {
-        kpm_debug("Invalid P4D entry for 0x%lx\n", vaddr);
+        kpm_debug("Invalid P4D entry\n");
         goto out_unlock;
     }
     
     pud = pud_offset(p4d, vaddr);
     if (pud_none(*pud) || pud_bad(*pud)) {
-        kpm_debug("Invalid PUD entry for 0x%lx\n", vaddr);
+        kpm_debug("Invalid PUD entry\n");
         goto out_unlock;
     }
     
@@ -105,7 +109,7 @@ unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr)
     
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) {
-        kpm_debug("Invalid PMD entry for 0x%lx\n", vaddr);
+        kpm_debug("Invalid PMD entry\n");
         goto out_unlock;
     }
     
@@ -119,12 +123,12 @@ unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr)
     
     pte = pte_offset_map(pmd, vaddr);
     if (!pte) {
-        kpm_err("Failed to map PTE for 0x%lx\n", vaddr);
+        kpm_err("Failed to map PTE\n");
         goto out_unlock;
     }
     
     if (!pte_present(*pte)) {
-        kpm_debug("PTE not present for 0x%lx\n", vaddr);
+        kpm_debug("PTE not present\n");
         pte_unmap(pte);
         goto out_unlock;
     }
@@ -155,19 +159,19 @@ int validate_user_address(struct mm_struct *mm, unsigned long vaddr, unsigned lo
     }
     
     if (vaddr + size < vaddr) {
-        kpm_err("Address overflow: 0x%lx + %lu\n", vaddr, size);
+        kpm_err("Address overflow\n");
         return -EINVAL;
     }
     
     end = vaddr + size;
     
     if (vaddr >= TASK_SIZE || end > TASK_SIZE) {
-        kpm_err("Address out of range: 0x%lx-0x%lx\n", vaddr, end);
+        kpm_err("Address out of range\n");
         return -EINVAL;
     }
     
     if (size > MAX_TRANSFER_SIZE) {
-        kpm_err("Size too large: %lu\n", size);
+        kpm_err("Size too large\n");
         return -EINVAL;
     }
     
@@ -238,9 +242,9 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
             goto partial_cleanup;
         }
         
-        ctx->kva_array[i] = kpm_kmap(ctx->pages[i]);
+        ctx->kva_array[i] = kpm_page_address(ctx->pages[i]);
         if (!ctx->kva_array[i]) {
-            kpm_err("kmap failed for page %d\n", i);
+            kpm_err("Page address failed for page %d\n", i);
             ret = -ENOMEM;
             goto partial_cleanup;
         }
@@ -257,12 +261,6 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
     return 0;
     
 partial_cleanup:
-    for (i = 0; i < ctx->nr_pages; i++) {
-        if (ctx->kva_array && ctx->kva_array[i]) {
-            kpm_kunmap(ctx->pages[i]);
-            ctx->kva_array[i] = NULL;
-        }
-    }
     ctx->pages_mapped = false;
     
 error_cleanup:
@@ -291,16 +289,6 @@ void unpin_user_pages(struct mem_op_context *ctx)
     
     if (!ctx) {
         return;
-    }
-    
-    if (ctx->pages_mapped) {
-        for (i = 0; i < ctx->nr_pages; i++) {
-            if (ctx->kva_array && ctx->kva_array[i]) {
-                kpm_kunmap(ctx->pages[i]);
-                ctx->kva_array[i] = NULL;
-            }
-        }
-        ctx->pages_mapped = false;
     }
     
     if (ctx->pages_pinned) {
@@ -359,7 +347,7 @@ int copy_data_to_user_pages(struct mem_op_context *ctx, void *src, size_t size)
         
         dest_kva = ctx->kva_array[page_index] + offset_in_page;
         
-        if (!kpm_virt_addr_valid(dest_kva)) {
+        if (!dest_kva) {
             kpm_err("Invalid destination KVA\n");
             return -EFAULT;
         }
@@ -406,7 +394,7 @@ int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size_t size
         
         src_kva = ctx->kva_array[page_index] + offset_in_page;
         
-        if (!kpm_virt_addr_valid(src_kva)) {
+        if (!src_kva) {
             kpm_err("Invalid source KVA\n");
             return -EFAULT;
         }
