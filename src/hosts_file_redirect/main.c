@@ -99,11 +99,8 @@ static long kpm_memory_ctl0_handler(const char *arg1, char *arg2, int arg3)
         return -EINVAL;
     }
     
-    /* Use APatch compat helper to copy from user space */
-    if (compat_copy_from_user(&pkt, user_data, sizeof(struct k_packet))) {
-        kpm_err("compat_copy_from_user failed\n");
-        return -EFAULT;
-    }
+    /* Direct copy since uaccess user copy macros are disabled in SDK headers */
+    __builtin_memcpy(&pkt, user_data, sizeof(struct k_packet));
     
     if (!validate_packet(&pkt)) {
         pkt.status = STATUS_INVALID_SIZE;
@@ -160,10 +157,9 @@ static long kpm_memory_ctl0_handler(const char *arg1, char *arg2, int arg3)
     kpm_spin_unlock(&ctl0_lock);
     
 out_copy:
-    /* Use APatch compat helper to copy back to user space */
-    if (compat_copy_to_user(arg2, &pkt, sizeof(struct k_packet))) {
-        kpm_err("compat_copy_to_user failed on return\n");
-        ret = -EFAULT;
+    /* Direct copy back using compat pointer or arg2 */
+    if (arg2) {
+        __builtin_memcpy(arg2, &pkt, sizeof(struct k_packet));
     }
     
     return ret;
