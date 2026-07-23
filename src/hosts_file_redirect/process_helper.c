@@ -10,14 +10,9 @@
 #include <linux/pid.h>
 #include <linux/pagemap.h>
 
-/* pgtable functions are available through linux/mm.h in APatch SDK */
-
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-/* Internal context structure */
 struct mem_op_context {
     struct mm_struct *target_mm;
     struct page **pages;
@@ -37,31 +32,33 @@ int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task)
         return -EINVAL;
     
     rcu_read_lock();
-    
-    t = pid_task(find_vpid(pid), PIDTYPE_PID);
+    t = find_task_by_vpid(pid);
+    if (!t) {
+        t = pid_task(find_vpid(pid), PIDTYPE_PID);
+    }
     if (!t) {
         rcu_read_unlock();
         return -ESRCH;
     }
     
-    m = t->mm;
+    get_task_struct(t);
+    rcu_read_unlock();
+    
+    m = get_task_mm(t);
     if (!m) {
-        rcu_read_unlock();
+        put_task_struct(t);
         return -EINVAL;
     }
     
-    mmgrab(m);
     *task = t;
     *mm = m;
-    
-    rcu_read_unlock();
     return 0;
 }
 
 void put_process_mm(struct mm_struct *mm)
 {
     if (mm)
-        mmdrop(mm);
+        mmput(mm);
 }
 
 unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr)
@@ -132,16 +129,8 @@ out:
 int validate_user_address(struct mm_struct *mm, unsigned long vaddr, unsigned long size)
 {
     unsigned long end = vaddr + size;
-    
-    if (!mm || size == 0)
+    if (!mm || size == 0 || end < vaddr || vaddr >= TASK_SIZE || end > TASK_SIZE || size > MAX_TRANSFER_SIZE)
         return -EINVAL;
-    if (end < vaddr)
-        return -EINVAL;
-    if (vaddr >= TASK_SIZE || end > TASK_SIZE)
-        return -EINVAL;
-    if (size > MAX_TRANSFER_SIZE)
-        return -EINVAL;
-    
     return 0;
 }
 
@@ -151,7 +140,7 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
 {
     unsigned long start_page, end_page;
     unsigned int gup_flags = FOLL_FORCE;
-    int i, ret;
+    int ret;
     
     if (!mm || !ctx || size == 0)
         return -EINVAL;
@@ -178,8 +167,10 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
     if (write)
         gup_flags |= FOLL_WRITE;
     
-    ret = get_user_pages_remote(mm, start_page, ctx->nr_pages,
-                                 gup_flags, ctx->pages, NULL);
+    // Safely calling GUP with mm context
+    mmap_read_lock(mm);
+    ret = get_user_pages_remote(mm, start_page, ctx->nr_pages, gup_flags, ctx->pages, NULL);
+    mmap_read_unlock(mm);
     
     if (ret <= 0) {
         kfree(ctx->kva_array);
@@ -189,11 +180,11 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
     
     ctx->nr_pages = ret;
     
-    for (i = 0; i < ctx->nr_pages; i++) {
+    for (int i = 0; i < ctx->nr_pages; i++) {
         ctx->kva_array[i] = page_address(ctx->pages[i]);
         if (!ctx->kva_array[i]) {
-            for (i--; i >= 0; i--)
-                put_page(ctx->pages[i]);
+            for (int j = i - 1; j >= 0; j--)
+                put_page(ctx->pages[j]);
             kfree(ctx->kva_array);
             kfree(ctx->pages);
             return -ENOMEM;
@@ -209,12 +200,10 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
 
 void unpin_user_pages(struct mem_op_context *ctx)
 {
-    int i;
-    
     if (!ctx)
         return;
     
-    for (i = 0; i < ctx->nr_pages; i++) {
+    for (int i = 0; i < ctx->nr_pages; i++) {
         if (ctx->write_mode)
             set_page_dirty_lock(ctx->pages[i]);
         put_page(ctx->pages[i]);
@@ -228,7 +217,6 @@ void unpin_user_pages(struct mem_op_context *ctx)
 int copy_data_to_user_pages(struct mem_op_context *ctx, void *src, size_t size)
 {
     size_t copied = 0;
-    
     if (!ctx || !src || size == 0)
         return -EINVAL;
     
@@ -241,22 +229,19 @@ int copy_data_to_user_pages(struct mem_op_context *ctx, void *src, size_t size)
         
         if (size - copied < chunk)
             chunk = size - copied;
-        
         if (page_idx >= ctx->nr_pages)
             return -EFAULT;
         
-        dest = ctx->kva_array[page_idx] + offset;
-        memcpy(dest, src + copied, chunk);
+        dest = (void *)((char *)ctx->kva_array[page_idx] + offset);
+        memcpy(dest, (char *)src + copied, chunk);
         copied += chunk;
     }
-    
     return 0;
 }
 
 int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size_t size)
 {
     size_t copied = 0;
-    
     if (!ctx || !dst || size == 0)
         return -EINVAL;
     
@@ -265,18 +250,16 @@ int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size_t size
         int page_idx = (addr - (ctx->start_addr & PAGE_MASK)) >> PAGE_SHIFT;
         unsigned long offset = addr & (PAGE_SIZE - 1);
         size_t chunk = PAGE_SIZE - offset;
-        void *src;
+        void *src_ptr;
         
         if (size - copied < chunk)
             chunk = size - copied;
-        
         if (page_idx >= ctx->nr_pages)
             return -EFAULT;
         
-        src = ctx->kva_array[page_idx] + offset;
-        memcpy(dst + copied, src, chunk);
+        src_ptr = (void *)((char *)ctx->kva_array[page_idx] + offset);
+        memcpy((char *)dst + copied, src_ptr, chunk);
         copied += chunk;
     }
-    
     return 0;
 }
