@@ -13,7 +13,8 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
-#include <linux/errno.h>
+#include <linux/gfp.h>
+#include <linux/uaccess.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -64,11 +65,19 @@ struct k_packet {
     uint32_t reserved;
 } __attribute__((aligned(8), packed));
 
-/* Kernel function pointers */
+/* ---------- Kernel function pointers ---------- */
 typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
                                    void *buf, int len, int write);
+typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
+typedef void (*put_task_struct_t)(struct task_struct *t);
+typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *task);
+typedef void (*mmput_t)(struct mm_struct *);
 
 static access_process_vm_t access_process_vm_fn;
+static get_task_struct_t get_task_struct_fn;
+static put_task_struct_t put_task_struct_fn;
+static get_task_mm_t get_task_mm_fn;
+static mmput_t mmput_fn;
 
 /* ---------- Core memory operations ---------- */
 
@@ -84,9 +93,9 @@ static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t 
     if (!task)
         return -ESRCH;
 
-    get_task_struct(task);
+    get_task_struct_fn(task);
     ret = access_process_vm_fn(task, addr, buf, size, 0);
-    put_task_struct(task);
+    put_task_struct_fn(task);
 
     if (ret == 0)
         return -EFAULT;
@@ -110,9 +119,9 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
     if (!task)
         return -ESRCH;
 
-    get_task_struct(task);
+    get_task_struct_fn(task);
     ret = access_process_vm_fn(task, addr, (void *)buf, size, 1);
-    put_task_struct(task);
+    put_task_struct_fn(task);
 
     if (ret == 0)
         return -EFAULT;
@@ -137,17 +146,17 @@ int handle_resolve_base(struct k_packet *pkt)
         return -ESRCH;
     }
 
-    get_task_struct(task);
-    mm = get_task_mm(task);
+    get_task_struct_fn(task);
+    mm = get_task_mm_fn(task);
     if (!mm) {
         pkt->status = STATUS_INVALID_PID;
-        put_task_struct(task);
+        put_task_struct_fn(task);
         return -ESRCH;
     }
 
     pkt->resolved_base = mm->start_code;
-    mmput(mm);
-    put_task_struct(task);
+    mmput_fn(mm);
+    put_task_struct_fn(task);
     pkt->status = STATUS_SUCCESS;
     return 0;
 }
@@ -281,8 +290,14 @@ static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
-    if (!access_process_vm_fn) {
-        kpm_err("Failed to resolve access_process_vm\n");
+    get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
+    put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
+    get_task_mm_fn = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
+    mmput_fn = (mmput_t)kallsyms_lookup_name("mmput");
+
+    if (!access_process_vm_fn || !get_task_struct_fn ||
+        !put_task_struct_fn || !get_task_mm_fn || !mmput_fn) {
+        kpm_err("Failed to resolve required kernel symbols\n");
         return -EFAULT;
     }
 
