@@ -15,15 +15,28 @@
 #include <kpm_utils.h>
 
 /* Module details for APatch framework */
-KPM_NAME("surajit_memory_debugger");
-KPM_VERSION("1.0.9");
+KPM_NAME("hosts_file_redirect");
+KPM_VERSION("1.1.8");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
 KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.");
 
-#define KPM_PREFIX             "SURAJIT_MEM"
+#define KPM_PREFIX             "HFR_MEM"
 #define kpm_info(fmt, ...)     pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)      pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+
+/* Explicit kernel definitions & macros for NDK compilation compatibility */
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0
+#endif
+
+#ifndef __user
+#define __user
+#endif
+
+/* Clean forward declarations for user-space data copying if needed */
+extern unsigned long copy_to_user(void *to, const void *from, unsigned long n);
+extern unsigned long copy_from_user(void *to, const void *from, unsigned long n);
 
 /* Operation Codes */
 #define OP_RESOLVE_BASE    0x1000
@@ -75,7 +88,7 @@ struct mem_op_context {
     int write_mode;
 };
 
-/* External kernel helpers / stubs handled cleanly */
+/* External kernel helpers */
 extern int get_process_mm(pid_t pid, void **mm, struct task_struct **task);
 extern void put_process_mm(void *mm);
 extern unsigned long virtual_to_physical(void *mm, unsigned long vaddr);
@@ -119,7 +132,7 @@ int handle_memory_read(struct k_packet *pkt)
         return -12;
     }
     
-    memset(&ctx, 0, sizeof(ctx));
+    __builtin_memset(&ctx, 0, sizeof(ctx));
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 0, &ctx);
     if (ret < 0) {
@@ -140,7 +153,7 @@ int handle_memory_read(struct k_packet *pkt)
     
     unpin_user_pages(&ctx);
     
-    if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
+    if (copy_to_user((void *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         ret = -14;
     } else {
@@ -186,14 +199,14 @@ int handle_memory_write(struct k_packet *pkt)
         return -12;
     }
     
-    if (copy_from_user(kernel_buffer, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
+    if (copy_from_user(kernel_buffer, (void *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kernel_buffer);
         put_process_mm(mm);
         return -14;
     }
     
-    memset(&ctx, 0, sizeof(ctx));
+    __builtin_memset(&ctx, 0, sizeof(ctx));
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 1, &ctx);
     if (ret < 0) {
@@ -223,20 +236,18 @@ int handle_memory_write(struct k_packet *pkt)
 }
 
 /* Module Entry & Exit Hooks */
-static long surajit_memory_init(const char *args, const char *event, void *__user reserved)
+static long hfr_memory_init(const char *args, const char *event, void *__user reserved)
 {
-    kpm_info("========================================\n");
-    kpm_info("SURAJIT MEMORY DEBUGGER INITIALIZED Successfully!\n");
-    kpm_info("========================================\n");
+    kpm_info("HFR Memory Debugger Module Loaded Successfully!\n");
     return 0;
 }
 
-static long surajit_memory_exit(void *__user reserved)
+static long hfr_memory_exit(void *__user reserved)
 {
-    kpm_info("SURAJIT MEMORY DEBUGGER UNLOADED Safely!\n");
+    kpm_info("HFR Memory Debugger Module Unloaded Safely!\n");
     return 0;
 }
 
 /* Register APatch Framework Hooks */
-KPM_INIT(surajit_memory_init);
-KPM_EXIT(surajit_memory_exit);
+KPM_INIT(hfr_memory_init);
+KPM_EXIT(hfr_memory_exit);
