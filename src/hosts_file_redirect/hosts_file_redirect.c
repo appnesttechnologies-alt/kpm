@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright (C) 2026 Surajit. All Rights Reserved.
- * Single-File Self-Contained KPM Memory Debugger Module
- * Creates /proc/hfr_mem node for direct panel communication
+ * /dev/hfr_mem via register_chrdev - fully kallsyms resolved
  */
 
 #include <compiler.h>
@@ -13,14 +12,12 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/proc_fs.h>
-#include <linux/uaccess.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.");
+KPM_DESCRIPTION("Kernel memory read/write via /dev/hfr_mem");
 
 #define KPM_PREFIX             "HFR_MEM"
 #define kpm_info(fmt, ...)     pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -31,17 +28,14 @@ KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.")
 #define MAX_TRANSFER_SIZE     0x100000
 #define MAX_INLINE_DATA       256
 
-#define OP_RESOLVE_BASE       0x1000
 #define OP_READ_VM            0x2000
 #define OP_WRITE_VM           0x3000
-#define OP_QUERY_PHYS         0x4000
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_PID    0x1001
 #define STATUS_PAGE_FAULT     0x1004
 #define STATUS_INVALID_SIZE   0x1005
 #define STATUS_MEM_ALLOC_FAIL 0x1008
-#define STATUS_COPY_FAIL      0x1009
 #define STATUS_MODULE_BUSY    0x1010
 
 struct k_packet {
@@ -57,14 +51,21 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE_DATA];
 } __attribute__((aligned(8), packed));
 
-/* Function pointers */
-typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
-                                   void *buf, int len, int write);
-typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
-typedef void (*put_task_struct_t)(struct task_struct *t);
-typedef struct task_struct *(*find_task_by_vpid_t)(pid_t nr);
-typedef void *(*kmalloc_t)(unsigned long size, unsigned int flags);
-typedef void (*kfree_t)(const void *objp);
+/* All via kallsyms */
+typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, int);
+typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
+typedef void (*put_task_struct_t)(struct task_struct *);
+typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
+typedef void *(*kmalloc_t)(unsigned long, unsigned int);
+typedef void (*kfree_t)(const void *);
+typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
+typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
+typedef int (*register_chrdev_t)(unsigned int, const char *, const void *);
+typedef void (*unregister_chrdev_t)(unsigned int, const char *);
+typedef struct class *(*class_create_t)(const void *, const char *);
+typedef void (*class_destroy_t)(struct class *);
+typedef struct device *(*device_create_t)(struct class *, struct device *, dev_t, void *, const char *, ...);
+typedef void (*device_destroy_t)(struct class *, dev_t);
 
 static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
@@ -72,20 +73,34 @@ static put_task_struct_t put_task_struct_fn;
 static find_task_by_vpid_t find_task_by_vpid_fn;
 static kmalloc_t kmalloc_fn;
 static kfree_t kfree_fn;
+static copy_to_user_t copy_to_user_fn;
+static copy_from_user_t copy_from_user_fn;
+static register_chrdev_t register_chrdev_fn;
+static unregister_chrdev_t unregister_chrdev_fn;
+static class_create_t class_create_fn;
+static class_destroy_t class_destroy_fn;
+static device_create_t device_create_fn;
+static device_destroy_t device_destroy_fn;
 
-static struct proc_dir_entry *proc_entry;
 static struct k_packet g_pkt;
 static bool g_ready = false;
+static int g_major;
+static struct class *g_class;
+static struct device *g_device;
 
-/* /proc/hfr_mem write handler - receive packet from panel */
-static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t len, loff_t *off)
+static DEFINE_MUTEX(g_lock);
+
+static int hfr_dev_open(struct inode *inode, struct file *filp) { return 0; }
+
+static ssize_t hfr_dev_write(struct file *filp, const char __user *buf, size_t len, loff_t *off)
 {
     struct k_packet pkt;
     int ret;
 
     if (len != sizeof(struct k_packet)) return -EINVAL;
-    if (copy_from_user(&pkt, buf, len)) return -EFAULT;
+    if (copy_from_user_fn(&pkt, buf, len)) return -EFAULT;
 
+    mutex_lock(&g_lock);
     g_ready = false;
 
     switch (pkt.op_code) {
@@ -108,7 +123,6 @@ static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t 
         if (ret == pkt.size) {
             memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
-            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
         } else {
             pkt.status = STATUS_PAGE_FAULT;
         }
@@ -120,7 +134,6 @@ static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t 
             pkt.status = STATUS_INVALID_SIZE;
             break;
         }
-
         struct task_struct *task = find_task_by_vpid_fn(pkt.target_pid);
         if (!task) { pkt.status = STATUS_INVALID_PID; break; }
 
@@ -128,12 +141,7 @@ static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t 
         ret = access_process_vm_fn(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
         put_task_struct_fn(task);
 
-        if (ret == pkt.size) {
-            pkt.status = STATUS_SUCCESS;
-            pkt.page_count = (pkt.size + PAGE_SIZE - 1) / PAGE_SIZE;
-        } else {
-            pkt.status = STATUS_PAGE_FAULT;
-        }
+        pkt.status = (ret == pkt.size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
         break;
     }
     default:
@@ -143,55 +151,91 @@ static ssize_t hfr_proc_write(struct file *file, const char __user *buf, size_t 
 
     g_pkt = pkt;
     g_ready = true;
+    mutex_unlock(&g_lock);
     return len;
 }
 
-/* /proc/hfr_mem read handler - return result to panel */
-static ssize_t hfr_proc_read(struct file *file, char __user *buf, size_t len, loff_t *off)
+static ssize_t hfr_dev_read(struct file *filp, char __user *buf, size_t len, loff_t *off)
 {
     if (!g_ready) return 0;
     if (len < sizeof(struct k_packet)) return -EINVAL;
-    if (copy_to_user(buf, &g_pkt, sizeof(struct k_packet))) return -EFAULT;
+
+    mutex_lock(&g_lock);
+    if (copy_to_user_fn(buf, &g_pkt, sizeof(struct k_packet))) {
+        mutex_unlock(&g_lock);
+        return -EFAULT;
+    }
     g_ready = false;
+    mutex_unlock(&g_lock);
     return sizeof(struct k_packet);
 }
 
-static const struct proc_ops hfr_proc_ops = {
-    .proc_read = hfr_proc_read,
-    .proc_write = hfr_proc_write,
+static struct file_operations hfr_fops = {
+    .owner = THIS_MODULE,
+    .open = hfr_dev_open,
+    .read = hfr_dev_read,
+    .write = hfr_dev_write,
 };
 
 /* ---------- Init & Exit ---------- */
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
+    /* Resolve all functions */
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     find_task_by_vpid_fn = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     kmalloc_fn = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     kfree_fn = (kfree_t)kallsyms_lookup_name("kfree");
+    copy_to_user_fn = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
+    copy_from_user_fn = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
+    register_chrdev_fn = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
+    unregister_chrdev_fn = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
+    class_create_fn = (class_create_t)kallsyms_lookup_name("class_create");
+    class_destroy_fn = (class_destroy_t)kallsyms_lookup_name("class_destroy");
+    device_create_fn = (device_create_t)kallsyms_lookup_name("device_create");
+    device_destroy_fn = (device_destroy_t)kallsyms_lookup_name("device_destroy");
 
-    if (!access_process_vm_fn || !get_task_struct_fn || !put_task_struct_fn ||
-        !find_task_by_vpid_fn || !kmalloc_fn || !kfree_fn) {
-        kpm_err("Failed to resolve required kernel symbols\n");
+    if (!access_process_vm_fn || !find_task_by_vpid_fn || !kmalloc_fn || !kfree_fn ||
+        !copy_to_user_fn || !copy_from_user_fn || !register_chrdev_fn || !class_create_fn || !device_create_fn) {
+        kpm_err("Failed to resolve symbols\n");
         return -EFAULT;
     }
 
-    proc_entry = proc_create("hfr_mem", 0666, NULL, &hfr_proc_ops);
-    if (!proc_entry) {
-        kpm_err("Failed to create /proc/hfr_mem\n");
+    /* Register char device */
+    g_major = register_chrdev_fn(0, "hfr_mem", &hfr_fops);
+    if (g_major < 0) {
+        kpm_err("register_chrdev failed\n");
         return -EFAULT;
     }
 
-    kpm_info("HFR Memory Debugger Module Loaded! Node: /proc/hfr_mem\n");
+    /* Create device node */
+    g_class = class_create_fn(THIS_MODULE, "hfr_mem");
+    if (IS_ERR(g_class)) {
+        unregister_chrdev_fn(g_major, "hfr_mem");
+        kpm_err("class_create failed\n");
+        return -EFAULT;
+    }
+
+    g_device = device_create_fn(g_class, NULL, MKDEV(g_major, 0), NULL, "hfr_mem");
+    if (IS_ERR(g_device)) {
+        class_destroy_fn(g_class);
+        unregister_chrdev_fn(g_major, "hfr_mem");
+        kpm_err("device_create failed\n");
+        return -EFAULT;
+    }
+
+    kpm_info("Loaded! /dev/hfr_mem (major %d)\n", g_major);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    if (proc_entry) proc_remove(proc_entry);
-    kpm_info("HFR Memory Debugger Module Unloaded!\n");
+    if (g_device) device_destroy_fn(g_class, MKDEV(g_major, 0));
+    if (g_class) class_destroy_fn(g_class);
+    if (g_major >= 0) unregister_chrdev_fn(g_major, "hfr_mem");
+    kpm_info("Unloaded!\n");
     return 0;
 }
 
