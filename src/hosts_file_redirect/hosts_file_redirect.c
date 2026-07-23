@@ -10,7 +10,7 @@
 #include <linux/gfp.h>         /* GFP_KERNEL */
 #include <linux/mm.h>          /* struct page, get_page, put_page, vm_area_struct */
 #include <linux/mm_types.h>    /* mm_struct, pgd_t, p4d_t, pud_t, pmd_t, pte_t */
-#include <linux/pgtable.h>     /* pgd_offset, p4d_offset, pud_offset, pmd_offset, pte_offset_map */
+#include <pgtable.h>     /* pgd_offset, p4d_offset, pud_offset, pmd_offset, pte_offset_map */
 #include <linux/sched.h>       /* struct task_struct (partial) */
 #include <linux/pid.h>         /* pid_t */
 #include <linux/kallsyms.h>    /* kallsyms_lookup_name */
