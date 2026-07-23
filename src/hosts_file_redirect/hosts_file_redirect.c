@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - minimal, no mutex, no THIS_MODULE */
+/* /dev/hfr_mem - ALL symbols via kallsyms including memcpy */
 
 #include <compiler.h>
 #include <hook.h>
@@ -55,6 +55,7 @@ typedef unsigned long (*copy_to_user_t)(void *, const void *, unsigned long);
 typedef unsigned long (*copy_from_user_t)(void *, const void *, unsigned long);
 typedef int (*register_chrdev_t)(unsigned int, const char *, void *);
 typedef void (*unregister_chrdev_t)(unsigned int, const char *);
+typedef void *(*memcpy_t)(void *, const void *, unsigned long);
 
 static access_process_vm_t p_access_process_vm;
 static find_task_by_vpid_t p_find_task_by_vpid;
@@ -66,13 +67,11 @@ static copy_to_user_t p_copy_to_user;
 static copy_from_user_t p_copy_from_user;
 static register_chrdev_t p_register_chrdev;
 static unregister_chrdev_t p_unregister_chrdev;
+static memcpy_t p_memcpy;
 
 static struct k_packet g_pkt;
 static int g_ready = 0;
 static int g_major = -1;
-
-/* Simple file ops - just function pointers */
-static int (*dev_open)(void *, void *) = 0;
 
 static int hfr_open(void *inode, void *filp) { return 0; }
 
@@ -99,7 +98,7 @@ static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
         p_put_task_struct(task);
 
         if (ret == pkt.size) {
-            __builtin_memcpy(pkt.inline_data, kbuf, pkt.size);
+            p_memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
         } else pkt.status = STATUS_PAGE_FAULT;
         p_kfree(kbuf);
@@ -130,7 +129,6 @@ static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
     return sizeof(g_pkt);
 }
 
-/* Minimal fops struct */
 struct my_fops {
     void *owner;
     void *open;
@@ -157,20 +155,21 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
     p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
     p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
+    p_memcpy = (memcpy_t)kallsyms_lookup_name("memcpy");
 
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree ||
-        !p_copy_to_user || !p_copy_from_user || !p_register_chrdev) {
+        !p_copy_to_user || !p_copy_from_user || !p_register_chrdev || !p_memcpy) {
         kpm_err("Symbol resolution failed\n");
         return -14;
     }
 
     g_major = p_register_chrdev(0, "hfr_mem", &hfr_fops);
     if (g_major < 0) {
-        kpm_err("register_chrdev failed: %d\n", g_major);
+        kpm_err("register_chrdev failed\n");
         return -14;
     }
 
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - create: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! /dev/hfr_mem (major %d) - run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
     return 0;
 }
 
