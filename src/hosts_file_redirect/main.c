@@ -14,7 +14,6 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <linux/pagemap.h>
 #include <kpm_utils.h>
 
 /* Logging macros */
