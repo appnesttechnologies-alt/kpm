@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * Copyright (C) 2026 Surajit. All Rights Reserved.
- * 
  * Core Memory Operations
  */
 
@@ -148,7 +147,7 @@ int handle_memory_write(struct k_packet *pkt)
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 1, &ctx);
     if (ret < 0) {
-        kpm_err("Failed to pin user pages: %d\n", ret);
+        kpm_err("Failed to pin user pages for write: %d\n", ret);
         pkt->status = STATUS_PAGE_FAULT;
         goto cleanup;
     }
@@ -203,16 +202,20 @@ int resolve_process_base(struct k_packet *pkt)
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (vma->vm_flags & VM_EXEC) {
             base_addr = vma->vm_start;
+            kpm_debug("Found executable VMA: 0x%lx-0x%lx\n",
+                      vma->vm_start, vma->vm_end);
             break;
         }
     }
     
     if (!base_addr && mm->start_code) {
         base_addr = mm->start_code;
+        kpm_debug("Using start_code: 0x%lx\n", base_addr);
     }
     
     if (!base_addr && mm->mmap) {
         base_addr = mm->mmap->vm_start;
+        kpm_debug("Using first VMA: 0x%lx\n", base_addr);
     }
     
     up_read(&mm->mmap_lock);
