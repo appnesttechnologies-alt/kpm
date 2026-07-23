@@ -3,6 +3,7 @@
  * Copyright (C) 2026 Surajit. All Rights Reserved.
  * Single-File Self-Contained KPM Memory Debugger Module
  * All functions resolved via kallsyms_lookup_name - no kfunc macros.
+ * Control interface: receives k_packet via ctl_args, returns via out_msg.
  */
 
 #include <compiler.h>
@@ -72,6 +73,7 @@ typedef void (*put_task_struct_t)(struct task_struct *t);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t nr);
 typedef void *(*kmalloc_t)(unsigned long size, unsigned int flags);
 typedef void (*kfree_t)(const void *objp);
+typedef unsigned long (*copy_from_user_t)(void *to, const void __user *from, unsigned long n);
 
 static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
@@ -79,6 +81,7 @@ static put_task_struct_t put_task_struct_fn;
 static find_task_by_vpid_t find_task_by_vpid_fn;
 static kmalloc_t kmalloc_fn;
 static kfree_t kfree_fn;
+static copy_from_user_t copy_from_user_fn;
 
 /* ---------- Core memory operations ---------- */
 
@@ -160,6 +163,7 @@ int handle_memory_read(struct k_packet *pkt)
         return ret;
     }
 
+    /* Copy read data TO user's buffer */
     if (compat_copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree_fn(kbuf);
@@ -188,7 +192,8 @@ int handle_memory_write(struct k_packet *pkt)
         return -ENOMEM;
     }
 
-    if (compat_copy_to_user(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
+    /* Copy data FROM user's buffer using resolved copy_from_user */
+    if (copy_from_user_fn(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree_fn(kbuf);
         return -EFAULT;
@@ -220,35 +225,41 @@ int handle_query_phys(struct k_packet *pkt)
 
 static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 {
-    struct k_packet *pkt;
+    struct k_packet pkt;
     int ret = 0;
 
-    if (!ctl_args || outlen < sizeof(struct k_packet))
+    if (!ctl_args || outlen < sizeof(struct k_packet)) {
+        kpm_err("control: invalid args, outlen=%d\n", outlen);
         return -EINVAL;
+    }
 
-    pkt = (struct k_packet *)ctl_args;
+    /* Copy packet from ctl_args (sent by userspace app) */
+    memcpy(&pkt, ctl_args, sizeof(struct k_packet));
 
-    switch (pkt->op_code) {
+    switch (pkt.op_code) {
     case OP_RESOLVE_BASE:
-        ret = handle_resolve_base(pkt);
+        ret = handle_resolve_base(&pkt);
         break;
     case OP_READ_VM:
-        ret = handle_memory_read(pkt);
+        ret = handle_memory_read(&pkt);
         break;
     case OP_WRITE_VM:
-        ret = handle_memory_write(pkt);
+        ret = handle_memory_write(&pkt);
         break;
     case OP_QUERY_PHYS:
-        ret = handle_query_phys(pkt);
+        ret = handle_query_phys(&pkt);
         break;
     default:
-        pkt->status = STATUS_MODULE_BUSY;
+        pkt.status = STATUS_MODULE_BUSY;
         ret = -EINVAL;
         break;
     }
 
-    if (compat_copy_to_user(out_msg, pkt, sizeof(struct k_packet)))
+    /* Copy result packet back to out_msg (returned to userspace app) */
+    if (compat_copy_to_user(out_msg, &pkt, sizeof(struct k_packet))) {
+        kpm_err("control: failed to copy result to user\n");
         return -EFAULT;
+    }
 
     return ret;
 }
@@ -257,23 +268,18 @@ static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    /* Resolve ALL functions via kallsyms_lookup_name - no kfunc macros */
+    /* Resolve ALL functions via kallsyms_lookup_name */
     access_process_vm_fn = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     get_task_struct_fn = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     put_task_struct_fn = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     find_task_by_vpid_fn = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     kmalloc_fn = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     kfree_fn = (kfree_t)kallsyms_lookup_name("kfree");
+    copy_from_user_fn = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
 
     if (!access_process_vm_fn || !get_task_struct_fn || !put_task_struct_fn ||
-        !find_task_by_vpid_fn || !kmalloc_fn || !kfree_fn) {
+        !find_task_by_vpid_fn || !kmalloc_fn || !kfree_fn || !copy_from_user_fn) {
         kpm_err("Failed to resolve required kernel symbols\n");
-        kpm_err("access_process_vm: %p\n", access_process_vm_fn);
-        kpm_err("get_task_struct: %p\n", get_task_struct_fn);
-        kpm_err("put_task_struct: %p\n", put_task_struct_fn);
-        kpm_err("find_task_by_vpid: %p\n", find_task_by_vpid_fn);
-        kpm_err("__kmalloc: %p\n", kmalloc_fn);
-        kpm_err("kfree: %p\n", kfree_fn);
         return -EFAULT;
     }
 
