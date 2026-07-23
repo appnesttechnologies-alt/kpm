@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - memcpy from string.h, no redefinition */
+/* /dev/hfr_mem - with debug to find missing symbol */
 
 #include <compiler.h>
 #include <hook.h>
@@ -156,19 +156,30 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
     p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
     p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
 
+    /* Debug: print which symbol failed */
+    if (!p_access_process_vm) kpm_err("MISSING: access_process_vm\n");
+    if (!p_find_task_by_vpid) kpm_err("MISSING: find_task_by_vpid\n");
+    if (!p_get_task_struct) kpm_err("MISSING: get_task_struct\n");
+    if (!p_put_task_struct) kpm_err("MISSING: put_task_struct\n");
+    if (!p_kmalloc) kpm_err("MISSING: __kmalloc\n");
+    if (!p_kfree) kpm_err("MISSING: kfree\n");
+    if (!p_copy_to_user) kpm_err("MISSING: copy_to_user\n");
+    if (!p_copy_from_user) kpm_err("MISSING: copy_from_user\n");
+    if (!p_register_chrdev) kpm_err("MISSING: __register_chrdev\n");
+    if (!p_unregister_chrdev) kpm_err("MISSING: __unregister_chrdev\n");
+
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree ||
         !p_copy_to_user || !p_copy_from_user || !p_register_chrdev) {
-        kpm_err("Symbol resolution failed\n");
         return -14;
     }
 
     g_major = p_register_chrdev(0, "hfr_mem", &hfr_fops);
     if (g_major < 0) {
-        kpm_err("register_chrdev failed\n");
+        kpm_err("register_chrdev failed: %d\n", g_major);
         return -14;
     }
 
-    kpm_info("Loaded! /dev/hfr_mem (major %d)\n", g_major);
+    kpm_info("Loaded! /dev/hfr_mem (major %d) - mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
     return 0;
 }
 
