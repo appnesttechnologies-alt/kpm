@@ -40,7 +40,7 @@ extern int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size
 
 int memory_initialize(void)
 {
-    kpm_info("Memory core initialized successfully (Fixed Mode)\n");
+    kpm_info("Memory core initialized successfully (Clean Offset Mode)\n");
     return 0;
 }
 
