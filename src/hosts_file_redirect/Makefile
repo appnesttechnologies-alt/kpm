@@ -33,7 +33,7 @@ INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include l
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-objs := hosts_file_redirect.o
+objs := main.o memory_core.o process_helper.o
 
 all: hosts_file_redirect_$(HFR_VERSION).kpm
 
