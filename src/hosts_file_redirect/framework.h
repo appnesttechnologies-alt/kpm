@@ -4,28 +4,25 @@
  * 
  * Cross-Process Memory Debugger Framework Header
  * Direct memory bridge for system profiling on ARM64
+ * Compatible with APatch/KernelPatch SDK
  */
 
 #ifndef _KPM_MEMORY_FRAMEWORK_H
 #define _KPM_MEMORY_FRAMEWORK_H
 
+/* Only include headers available in APatch SDK */
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/highmem.h>
 #include <linux/pagemap.h>
-#include <linux/mutex.h>
-#include <linux/delay.h>
 #include <linux/version.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/atomic.h>
 #include <linux/rwsem.h>
-#include <linux/mm_types.h>
-#include <linux/rmap.h>
 #include <asm/pgtable.h>
 #include <kpm_utils.h>
 
@@ -54,25 +51,6 @@
 #define STATUS_COPY_FAIL        0x1009  /* copy_to/from_user failed */
 #define STATUS_MODULE_BUSY      0x1010  /* Module is busy with another operation */
 
-/* 
- * ARM64 Architecture Constants
- * 4-level page table walk parameters
- */
-#define ARM64_PAGE_SHIFT       12
-#define ARM64_PAGE_SIZE        (1UL << ARM64_PAGE_SHIFT)
-#define ARM64_PAGE_MASK        (~(ARM64_PAGE_SIZE - 1))
-#define ARM64_PGD_SHIFT        39
-#define ARM64_PUD_SHIFT        30
-#define ARM64_PMD_SHIFT        21
-#define ARM64_PGD_MASK         0x1FF
-#define ARM64_PUD_MASK         0x1FF
-#define ARM64_PMD_MASK         0x1FF
-#define ARM64_PTE_MASK         0x1FF
-#define ARM64_PTRS_PER_PGD     512
-#define ARM64_PTRS_PER_PUD     512
-#define ARM64_PTRS_PER_PMD     512
-#define ARM64_PTRS_PER_PTE     512
-
 /* Safety limits */
 #define MAX_TRANSFER_SIZE      0x100000   /* 1MB maximum per operation */
 #define MAX_PAGES_PER_OP       256        /* Maximum pages to pin at once */
@@ -89,19 +67,6 @@
  * 
  * This structure MUST be 8-byte aligned for ARM64 compatibility.
  * All fields are explicitly sized for cross-architecture consistency.
- * 
- * Layout:
- * - op_code: Operation to perform
- * - target_pid: Target process identifier
- * - user_buffer: Userspace data buffer pointer
- * - target_addr: Virtual address to operate on
- * - target_addr_end: End address for range operations
- * - size: Transfer size in bytes
- * - status: Operation result status
- * - physical_addr: Resolved physical address (output)
- * - resolved_base: Resolved module base address (output)
- * - page_count: Number of pages processed (output)
- * - reserved: Padding for future expansion
  */
 struct k_packet {
     uint32_t op_code;            /* [IN]  Operation code */
@@ -119,30 +84,24 @@ struct k_packet {
 
 /**
  * struct mem_op_context - Internal memory operation state
- * 
- * Holds all state for a single memory operation including
- * pinned pages and their kernel mappings.
  */
 struct mem_op_context {
-    struct mm_struct *target_mm;      /* Target process mm_struct */
-    struct task_struct *target_task;   /* Target task_struct */
-    struct page **pages;              /* Array of pinned pages */
-    void **kva_array;                 /* Kernel virtual addresses */
-    unsigned long start_addr;         /* Start virtual address */
-    unsigned long end_addr;           /* End virtual address */
-    int nr_pages;                     /* Number of pinned pages */
-    int write_mode;                   /* Non-zero if write operation */
-    bool pages_pinned;                /* Track pin state */
-    bool pages_mapped;                /* Track map state */
+    struct mm_struct *target_mm;
+    struct task_struct *target_task;
+    struct page **pages;
+    void **kva_array;
+    unsigned long start_addr;
+    unsigned long end_addr;
+    int nr_pages;
+    int write_mode;
+    bool pages_pinned;
+    bool pages_mapped;
 };
 
 /* 
  * Function Declarations
  * Cross-file references for modular compilation
  */
-
-/* main.c - Module lifecycle */
-extern struct mutex ctl0_lock;
 
 /* memory_core.c - Core memory operations */
 int memory_initialize(void);
@@ -161,5 +120,29 @@ int pin_user_pages_for_transfer(struct mm_struct *mm, unsigned long vaddr,
 void unpin_user_pages(struct mem_op_context *ctx);
 int copy_data_to_user_pages(struct mem_op_context *ctx, void *src, size_t size);
 int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size_t size);
+
+/* Helper functions reimplemented for APatch environment */
+static inline void *kpm_kmap(struct page *page)
+{
+    return page ? page_address(page) : NULL;
+}
+
+static inline void kpm_kunmap(struct page *page)
+{
+    /* No-op in APatch environment */
+}
+
+static inline bool kpm_virt_addr_valid(const void *addr)
+{
+    return addr != NULL;
+}
+
+static inline void kpm_set_page_dirty(struct page *page)
+{
+    if (page) {
+        /* Mark page as dirty for writeback */
+        set_page_dirty(page);
+    }
+}
 
 #endif /* _KPM_MEMORY_FRAMEWORK_H */
