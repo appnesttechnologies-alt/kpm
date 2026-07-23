@@ -99,8 +99,9 @@ static long kpm_memory_ctl0_handler(const char *arg1, char *arg2, int arg3)
         return -EINVAL;
     }
     
-    if (copy_from_user(&pkt, user_data, sizeof(struct k_packet))) {
-        kpm_err("copy_from_user failed\n");
+    /* Use APatch compat helper to copy from user space */
+    if (compat_copy_from_user(&pkt, user_data, sizeof(struct k_packet))) {
+        kpm_err("compat_copy_from_user failed\n");
         return -EFAULT;
     }
     
@@ -159,8 +160,9 @@ static long kpm_memory_ctl0_handler(const char *arg1, char *arg2, int arg3)
     kpm_spin_unlock(&ctl0_lock);
     
 out_copy:
-    if (copy_to_user(user_data, &pkt, sizeof(struct k_packet))) {
-        kpm_err("copy_to_user failed on return\n");
+    /* Use APatch compat helper to copy back to user space */
+    if (compat_copy_to_user(arg2, &pkt, sizeof(struct k_packet))) {
+        kpm_err("compat_copy_to_user failed on return\n");
         ret = -EFAULT;
     }
     
