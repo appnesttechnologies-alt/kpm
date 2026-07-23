@@ -40,13 +40,13 @@ extern int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size
 
 int memory_initialize(void)
 {
-    kpm_info("Memory core initialized\n");
+    kpm_info("Memory core initialized successfully\n");
     return 0;
 }
 
 void memory_cleanup(void)
 {
-    kpm_info("Memory core cleaned\n");
+    kpm_info("Memory core cleaned up safely\n");
 }
 
 int handle_memory_read(struct k_packet *pkt)
@@ -199,9 +199,20 @@ int resolve_process_base(struct k_packet *pkt)
         return ret;
     }
     
-    down_read(&mm->mmap_lock);
+    if (down_read_killable(&mm->mmap_lock)) {
+        pkt->status = STATUS_MMAP_LOCK_FAIL;
+        put_process_mm(mm);
+        return -EINTR;
+    }
     
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    // For newer kernel versions where mm->mmap structure might be wrapped or accessed differently
+    vma = mm->mmap;
+#else
+    vma = mm->mmap;
+#endif
+
+    for (; vma; vma = vma->vm_next) {
         if (vma->vm_flags & VM_EXEC) {
             base_addr = vma->vm_start;
             break;
@@ -210,8 +221,6 @@ int resolve_process_base(struct k_packet *pkt)
     
     if (!base_addr && mm->start_code)
         base_addr = mm->start_code;
-    if (!base_addr && mm->mmap)
-        base_addr = mm->mmap->vm_start;
     
     up_read(&mm->mmap_lock);
     
@@ -225,7 +234,7 @@ int resolve_process_base(struct k_packet *pkt)
     pkt->resolved_base = base_addr;
     pkt->status = STATUS_SUCCESS;
     
-    kpm_info("Base: PID=%u VA=0x%llX PA=0x%llX\n",
+    kpm_info("Base resolved: PID=%u VA=0x%llX PA=0x%llX\n",
              pkt->target_pid, pkt->resolved_base, pkt->physical_addr);
     
     put_process_mm(mm);
