@@ -2,21 +2,33 @@
 /*
  * Copyright (C) 2026 Surajit. All Rights Reserved.
  * Single-File Self-Contained KPM Memory Debugger Module
- * Uses only access_process_vm and kallsyms – no page table types needed.
+ * Uses access_process_vm, kallsyms, and manual definitions.
  */
 
 #include <string.h>               /* strlen() for kpm_utils.h */
 #include <linux/printk.h>         /* pr_info, pr_err */
 #include <linux/slab.h>           /* kmalloc, kfree */
-#include <linux/gfp.h>            /* GFP_KERNEL */
-#include <linux/mm.h>             /* PAGE_SIZE, struct vm_area_struct (not used) */
-#include <linux/mm_types.h>       /* struct mm_struct (for start_code) */
+#include <linux/mm.h>             /* struct page? not used directly */
+#include <linux/mm_types.h>       /* struct mm_struct (opaque) */
 #include <linux/sched.h>          /* task_struct (partial) */
 #include <linux/pid.h>            /* pid_t */
 #include <linux/kallsyms.h>       /* kallsyms_lookup_name */
 #include <linux/errno.h>          /* EFAULT, ESRCH, EINVAL, ENOMEM, ENOSYS */
 #include <linux/stddef.h>         /* NULL */
 #include <kpm_utils.h>            /* KPM macros */
+
+/* ---------- Manual definitions for missing constants ---------- */
+#ifndef GFP_KERNEL
+#define GFP_KERNEL  0xcc0
+#endif
+
+#ifndef PAGE_SIZE
+#define PAGE_SIZE   (1UL << 12)    /* 4 KiB, standard for ARM64 */
+#endif
+
+#ifndef __user
+#define __user
+#endif
 
 /* Module details for APatch framework */
 KPM_NAME("hosts_file_redirect");
@@ -76,6 +88,8 @@ typedef struct mm_struct   *(*get_task_mm_t)(struct task_struct *task);
 typedef void                (*mmput_t)(struct mm_struct *);
 typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
                                    void *buf, int len, int write);
+typedef unsigned long (*copy_to_user_t)(void __user *to, const void *from, unsigned long n);
+typedef unsigned long (*copy_from_user_t)(void *to, const void __user *from, unsigned long n);
 
 static find_task_by_vpid_t   find_task_by_vpid_fn;
 static get_task_struct_t     get_task_struct_fn;
@@ -83,6 +97,8 @@ static put_task_struct_t     put_task_struct_fn;
 static get_task_mm_t         get_task_mm_fn;
 static mmput_t               mmput_fn;
 static access_process_vm_t   access_process_vm_fn;
+static copy_to_user_t        copy_to_user_fn;
+static copy_from_user_t      copy_from_user_fn;
 
 /* ---------- Initialization ---------- */
 static int init_kallsyms_pointers(void)
@@ -99,10 +115,15 @@ static int init_kallsyms_pointers(void)
         kallsyms_lookup_name("mmput");
     access_process_vm_fn = (access_process_vm_t)
         kallsyms_lookup_name("access_process_vm");
+    copy_to_user_fn = (copy_to_user_t)
+        kallsyms_lookup_name("copy_to_user");
+    copy_from_user_fn = (copy_from_user_t)
+        kallsyms_lookup_name("copy_from_user");
 
     if (!find_task_by_vpid_fn || !get_task_struct_fn ||
         !put_task_struct_fn || !get_task_mm_fn ||
-        !mmput_fn || !access_process_vm_fn) {
+        !mmput_fn || !access_process_vm_fn ||
+        !copy_to_user_fn || !copy_from_user_fn) {
         kpm_err("Failed to resolve all required kernel symbols\n");
         return -EFAULT;
     }
@@ -171,44 +192,14 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
     return 0;
 }
 
-/**
- * resolve_base_address – returns mm->start_code.
- */
-static int resolve_base_address(pid_t pid, unsigned long *base)
-{
-    struct task_struct *task;
-    struct mm_struct *mm;
-
-    task = find_task_by_vpid_fn(pid);
-    if (!task)
-        return -ESRCH;
-
-    get_task_struct_fn(task);
-    mm = get_task_mm_fn(task);
-    if (!mm) {
-        put_task_struct_fn(task);
-        return -ESRCH;
-    }
-
-    *base = mm->start_code;
-    mmput_fn(mm);
-    put_task_struct_fn(task);
-    return 0;
-}
-
 /* ---------- Handlers for each opcode ---------- */
 
 int handle_resolve_base(struct k_packet *pkt)
 {
-    unsigned long base = 0;
-    int ret = resolve_base_address(pkt->target_pid, &base);
-    if (ret < 0) {
-        pkt->status = (ret == -ESRCH) ? STATUS_INVALID_PID : STATUS_ACCESS_DENIED;
-        return ret;
-    }
-    pkt->resolved_base = base;
-    pkt->status = STATUS_SUCCESS;
-    return 0;
+    /* mm->start_code not accessible in this environment; stub */
+    pkt->status = STATUS_PAGE_WALK_FAIL;
+    pkt->resolved_base = 0;
+    return -ENOSYS;
 }
 
 int handle_memory_read(struct k_packet *pkt)
@@ -239,8 +230,8 @@ int handle_memory_read(struct k_packet *pkt)
         return ret;
     }
 
-    /* Copy to userspace buffer (caller's context) */
-    if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
+    /* Copy to caller's user-space buffer */
+    if (copy_to_user_fn((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kbuf);
         return -EFAULT;
@@ -269,7 +260,7 @@ int handle_memory_write(struct k_packet *pkt)
     }
 
     /* Get data from caller's buffer */
-    if (copy_from_user(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
+    if (copy_from_user_fn(kbuf, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kbuf);
         return -EFAULT;
@@ -295,7 +286,7 @@ int handle_memory_write(struct k_packet *pkt)
 
 int handle_query_phys(struct k_packet *pkt)
 {
-    /* Physical address translation requires pgtable_t types we can't safely use here */
+    /* Physical address query not supported without pgtable types */
     pkt->status = STATUS_PAGE_WALK_FAIL;
     pkt->physical_addr = 0;
     return -ENOSYS;
