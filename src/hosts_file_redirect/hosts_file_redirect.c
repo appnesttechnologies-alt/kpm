@@ -2,21 +2,21 @@
 /*
  * Copyright (C) 2026 Surajit. All Rights Reserved.
  * Single-File Self-Contained KPM Memory Debugger Module
- * Real implementation using page-table walk, kmap, and kallsyms.
+ * Uses only access_process_vm and kallsyms – no page table types needed.
  */
 
-#include <linux/printk.h>      /* pr_info, pr_err */
-#include <linux/slab.h>        /* kmalloc, kfree */
-#include <linux/gfp.h>         /* GFP_KERNEL */
-#include <linux/mm.h>          /* struct page, get_page, put_page, vm_area_struct */
-#include <linux/mm_types.h>    /* mm_struct, pgd_t, p4d_t, pud_t, pmd_t, pte_t */
-#include <pgtable.h>     /* pgd_offset, p4d_offset, pud_offset, pmd_offset, pte_offset_map */
-#include <linux/sched.h>       /* struct task_struct (partial) */
-#include <linux/pid.h>         /* pid_t */
-#include <linux/kallsyms.h>    /* kallsyms_lookup_name */
-#include <linux/err.h>         /* IS_ERR, PTR_ERR */
-#include <linux/stddef.h>      /* offsetof */
-#include <kpm_utils.h>         /* KPM macros, maybe kpm_utils.h or kpmodule.h – adjust if needed */
+#include <string.h>               /* strlen() for kpm_utils.h */
+#include <linux/printk.h>         /* pr_info, pr_err */
+#include <linux/slab.h>           /* kmalloc, kfree */
+#include <linux/gfp.h>            /* GFP_KERNEL */
+#include <linux/mm.h>             /* PAGE_SIZE, struct vm_area_struct (not used) */
+#include <linux/mm_types.h>       /* struct mm_struct (for start_code) */
+#include <linux/sched.h>          /* task_struct (partial) */
+#include <linux/pid.h>            /* pid_t */
+#include <linux/kallsyms.h>       /* kallsyms_lookup_name */
+#include <linux/errno.h>          /* EFAULT, ESRCH, EINVAL, ENOMEM, ENOSYS */
+#include <linux/stddef.h>         /* NULL */
+#include <kpm_utils.h>            /* KPM macros */
 
 /* Module details for APatch framework */
 KPM_NAME("hosts_file_redirect");
@@ -68,311 +68,135 @@ struct k_packet {
     uint32_t reserved;
 } __attribute__((aligned(8), packed));
 
-/* ---------- Kernel function pointers obtained via kallsyms ---------- */
+/* ---------- Kernel function pointers resolved via kallsyms ---------- */
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t nr);
+typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
+typedef void                (*put_task_struct_t)(struct task_struct *t);
 typedef struct mm_struct   *(*get_task_mm_t)(struct task_struct *task);
 typedef void                (*mmput_t)(struct mm_struct *);
-typedef void                (*mmap_read_lock_t)(struct mm_struct *);
-typedef void                (*mmap_read_unlock_t)(struct mm_struct *);
-typedef struct vm_area_struct *(*find_vma_t)(struct mm_struct *, unsigned long addr);
-typedef void                (*set_page_dirty_t)(struct page *page);
-typedef void                (*flush_dcache_page_t)(struct page *page);
+typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
+                                   void *buf, int len, int write);
 
 static find_task_by_vpid_t   find_task_by_vpid_fn;
+static get_task_struct_t     get_task_struct_fn;
+static put_task_struct_t     put_task_struct_fn;
 static get_task_mm_t         get_task_mm_fn;
 static mmput_t               mmput_fn;
-static mmap_read_lock_t      mmap_read_lock_fn;
-static mmap_read_unlock_t    mmap_read_unlock_fn;
-static find_vma_t            find_vma_fn;
-static set_page_dirty_t      set_page_dirty_fn;
-static flush_dcache_page_t   flush_dcache_page_fn;
+static access_process_vm_t   access_process_vm_fn;
 
-/* ---------- Internal helpers ---------- */
-
-/**
- * init_kallsyms_pointers - resolve all needed kernel symbols at init.
- */
+/* ---------- Initialization ---------- */
 static int init_kallsyms_pointers(void)
 {
     find_task_by_vpid_fn = (find_task_by_vpid_t)
         kallsyms_lookup_name("find_task_by_vpid");
+    get_task_struct_fn = (get_task_struct_t)
+        kallsyms_lookup_name("get_task_struct");
+    put_task_struct_fn = (put_task_struct_t)
+        kallsyms_lookup_name("put_task_struct");
     get_task_mm_fn = (get_task_mm_t)
         kallsyms_lookup_name("get_task_mm");
     mmput_fn = (mmput_t)
         kallsyms_lookup_name("mmput");
-    mmap_read_lock_fn = (mmap_read_lock_t)
-        kallsyms_lookup_name("mmap_read_lock");
-    mmap_read_unlock_fn = (mmap_read_unlock_t)
-        kallsyms_lookup_name("mmap_read_unlock");
-    find_vma_fn = (find_vma_t)
-        kallsyms_lookup_name("find_vma");
-    set_page_dirty_fn = (set_page_dirty_t)
-        kallsyms_lookup_name("set_page_dirty");
-    flush_dcache_page_fn = (flush_dcache_page_t)
-        kallsyms_lookup_name("flush_dcache_page");
+    access_process_vm_fn = (access_process_vm_t)
+        kallsyms_lookup_name("access_process_vm");
 
-    if (!find_task_by_vpid_fn || !get_task_mm_fn || !mmput_fn ||
-        !mmap_read_lock_fn || !mmap_read_unlock_fn || !find_vma_fn ||
-        !set_page_dirty_fn || !flush_dcache_page_fn) {
+    if (!find_task_by_vpid_fn || !get_task_struct_fn ||
+        !put_task_struct_fn || !get_task_mm_fn ||
+        !mmput_fn || !access_process_vm_fn) {
         kpm_err("Failed to resolve all required kernel symbols\n");
         return -EFAULT;
     }
     return 0;
 }
 
-/**
- * get_process_mm - obtain mm and task references for a pid.
- * Returns 0 on success, -ESRCH if not found.
- */
-static int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task)
-{
-    struct task_struct *t;
-
-    t = find_task_by_vpid_fn(pid);
-    if (!t)
-        return -ESRCH;
-
-    get_task_struct(t);   /* we still need the built-in get_task_struct */
-    *task = t;
-
-    *mm = get_task_mm_fn(t);
-    if (!*mm) {
-        put_task_struct(t);
-        return -ESRCH;
-    }
-    return 0;
-}
-
-static void put_process_mm(struct mm_struct *mm)
-{
-    mmput_fn(mm);
-}
-
-static void put_process_task(struct task_struct *task)
-{
-    put_task_struct(task);
-}
+/* ---------- Core memory operations ---------- */
 
 /**
- * validate_user_address - check that the whole [addr, addr+size) lies inside a
- * single user VMA and is accessible.
- * Returns 0 if valid, -EFAULT otherwise.
+ * read_process_memory – read remote memory using access_process_vm.
+ * Returns 0 on success, -ESRCH, -EFAULT, etc.
  */
-static int validate_user_address(struct mm_struct *mm, unsigned long addr, size_t size)
-{
-    struct vm_area_struct *vma;
-    unsigned long end = addr + size;
-
-    if (addr >= TASK_SIZE || end > TASK_SIZE || end < addr)
-        return -EFAULT;
-
-    mmap_read_lock_fn(mm);
-    vma = find_vma_fn(mm, addr);
-    if (!vma || vma->vm_start > addr || addr + size > vma->vm_end) {
-        mmap_read_unlock_fn(mm);
-        return -EFAULT;
-    }
-    mmap_read_unlock_fn(mm);
-    return 0;
-}
-
-/**
- * walk_and_access_memory – read or write memory in a remote mm using kmap.
- * @mm:      target mm (must already be locked with mmap_read_lock)
- * @vaddr:   user virtual address in target
- * @buf:     kernel buffer (src for write, dst for read)
- * @size:    bytes to transfer
- * @write:   1 for write, 0 for read
- * Returns 0 on success, -EFAULT on error.
- *
- * CAUTION: mmap_read_lock() must be held by the caller.
- */
-static int walk_and_access_memory(struct mm_struct *mm, unsigned long vaddr,
-                                  void *buf, size_t size, int write)
-{
-    unsigned long offset = vaddr & ~PAGE_MASK;
-    unsigned long remaining = size;
-    unsigned char *kern_buf = buf;
-
-    while (remaining > 0) {
-        pgd_t *pgd;
-        p4d_t *p4d;
-        pud_t *pud;
-        pmd_t *pmd;
-        pte_t *pte;
-        struct page *page;
-        void *kaddr;
-        unsigned long chunk = min(remaining, PAGE_SIZE - offset);
-
-        /* Walk the page tables */
-        pgd = pgd_offset(mm, vaddr);
-        if (pgd_none(*pgd) || pgd_bad(*pgd))
-            return -EFAULT;
-        p4d = p4d_offset(pgd, vaddr);
-        if (p4d_none(*p4d) || p4d_bad(*p4d))
-            return -EFAULT;
-        pud = pud_offset(p4d, vaddr);
-        if (pud_none(*pud) || pud_bad(*pud))
-            return -EFAULT;
-        pmd = pmd_offset(pud, vaddr);
-        if (pmd_none(*pmd) || pmd_bad(*pmd))
-            return -EFAULT;
-        pte = pte_offset_map(pmd, vaddr);
-        if (!pte || !pte_present(*pte)) {
-            if (pte)
-                pte_unmap(pte);
-            return -EFAULT;
-        }
-
-        page = pte_page(*pte);
-        get_page(page);   /* pin it */
-
-        kaddr = kmap(page);
-        if (!kaddr) {
-            put_page(page);
-            pte_unmap(pte);
-            return -EFAULT;
-        }
-
-        if (write) {
-            memcpy(kaddr + offset, kern_buf, chunk);
-            flush_dcache_page_fn(page);
-            set_page_dirty_fn(page);
-        } else {
-            memcpy(kern_buf, kaddr + offset, chunk);
-        }
-
-        kunmap(page);
-        put_page(page);
-        pte_unmap(pte);
-
-        kern_buf += chunk;
-        vaddr += chunk;
-        remaining -= chunk;
-        offset = 0;  /* after the first chunk we are page-aligned */
-    }
-    return 0;
-}
-
-/**
- * memory_read_write – high-level read or write from a remote process.
- * @pid:   target process id
- * @addr:  user virtual address in target
- * @buf:   kernel buffer
- * @size:  bytes
- * @write: 1 for write, 0 for read
- * Returns 0 or negative error.
- */
-static int memory_read_write(pid_t pid, unsigned long addr, void *buf,
-                             size_t size, int write)
-{
-    struct task_struct *task;
-    struct mm_struct *mm;
-    int ret;
-
-    ret = get_process_mm(pid, &mm, &task);
-    if (ret < 0)
-        return ret;
-
-    if (size == 0 || size > MAX_TRANSFER_SIZE) {
-        ret = -EINVAL;
-        goto out_put;
-    }
-
-    ret = validate_user_address(mm, addr, size);
-    if (ret < 0)
-        goto out_put;
-
-    mmap_read_lock_fn(mm);
-    ret = walk_and_access_memory(mm, addr, buf, size, write);
-    mmap_read_unlock_fn(mm);
-
-out_put:
-    put_process_mm(mm);
-    put_process_task(task);
-    return ret;
-}
-
 static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t size)
 {
-    return memory_read_write(pid, addr, buf, size, 0);
-}
+    struct task_struct *task;
+    int ret;
 
-static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, size_t size)
-{
-    return memory_read_write(pid, addr, (void *)buf, size, 1);
+    if (!buf || size == 0 || size > MAX_TRANSFER_SIZE)
+        return -EINVAL;
+
+    task = find_task_by_vpid_fn(pid);
+    if (!task)
+        return -ESRCH;
+
+    get_task_struct_fn(task);
+    ret = access_process_vm_fn(task, addr, buf, size, 0); /* 0 = read */
+    put_task_struct_fn(task);
+
+    if (ret == 0)
+        return -EFAULT;   /* complete failure */
+    if (ret < 0)
+        return ret;
+    if (ret != size)
+        return -EFAULT;   /* partial read */
+
+    return 0;
 }
 
 /**
- * resolve_base_address – returns the code segment start (start_code).
+ * write_process_memory – write remote memory using access_process_vm.
+ * Returns 0 on success.
+ */
+static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, size_t size)
+{
+    struct task_struct *task;
+    int ret;
+
+    if (!buf || size == 0 || size > MAX_TRANSFER_SIZE)
+        return -EINVAL;
+
+    task = find_task_by_vpid_fn(pid);
+    if (!task)
+        return -ESRCH;
+
+    get_task_struct_fn(task);
+    ret = access_process_vm_fn(task, addr, (void *)buf, size, 1); /* 1 = write */
+    put_task_struct_fn(task);
+
+    if (ret == 0)
+        return -EFAULT;
+    if (ret < 0)
+        return ret;
+    if (ret != size)
+        return -EFAULT;
+
+    return 0;
+}
+
+/**
+ * resolve_base_address – returns mm->start_code.
  */
 static int resolve_base_address(pid_t pid, unsigned long *base)
 {
     struct task_struct *task;
     struct mm_struct *mm;
-    int ret;
 
-    ret = get_process_mm(pid, &mm, &task);
-    if (ret < 0)
-        return ret;
+    task = find_task_by_vpid_fn(pid);
+    if (!task)
+        return -ESRCH;
+
+    get_task_struct_fn(task);
+    mm = get_task_mm_fn(task);
+    if (!mm) {
+        put_task_struct_fn(task);
+        return -ESRCH;
+    }
+
     *base = mm->start_code;
-    put_process_mm(mm);
-    put_process_task(task);
+    mmput_fn(mm);
+    put_task_struct_fn(task);
     return 0;
 }
 
-/**
- * virtual_to_physical – obtain the physical address behind a user virtual address.
- */
-static int virtual_to_physical(pid_t pid, unsigned long vaddr, unsigned long *phys)
-{
-    struct task_struct *task;
-    struct mm_struct *mm;
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-    int ret = -EFAULT;
-
-    ret = get_process_mm(pid, &mm, &task);
-    if (ret < 0)
-        return ret;
-
-    ret = validate_user_address(mm, vaddr, 1);
-    if (ret < 0)
-        goto out_put;
-
-    mmap_read_lock_fn(mm);
-    pgd = pgd_offset(mm, vaddr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd))
-        goto unlock;
-    p4d = p4d_offset(pgd, vaddr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d))
-        goto unlock;
-    pud = pud_offset(p4d, vaddr);
-    if (pud_none(*pud) || pud_bad(*pud))
-        goto unlock;
-    pmd = pmd_offset(pud, vaddr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd))
-        goto unlock;
-    pte = pte_offset_map(pmd, vaddr);
-    if (!pte || !pte_present(*pte)) {
-        if (pte) pte_unmap(pte);
-        goto unlock;
-    }
-    *phys = (pte_pfn(*pte) << PAGE_SHIFT) + (vaddr & ~PAGE_MASK);
-    pte_unmap(pte);
-    ret = 0;
-unlock:
-    mmap_read_unlock_fn(mm);
-out_put:
-    put_process_mm(mm);
-    put_process_task(task);
-    return ret;
-}
-
-/* ---------- Handler functions (called by the APatch framework) ---------- */
+/* ---------- Handlers for each opcode ---------- */
 
 int handle_resolve_base(struct k_packet *pkt)
 {
@@ -415,7 +239,7 @@ int handle_memory_read(struct k_packet *pkt)
         return ret;
     }
 
-    /* Copy to userspace buffer (provided by the APatch caller – already in user context) */
+    /* Copy to userspace buffer (caller's context) */
     if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kbuf, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kbuf);
@@ -471,18 +295,10 @@ int handle_memory_write(struct k_packet *pkt)
 
 int handle_query_phys(struct k_packet *pkt)
 {
-    unsigned long phys = 0;
-    int ret = virtual_to_physical(pkt->target_pid, pkt->target_addr, &phys);
-    if (ret < 0) {
-        if (ret == -ESRCH)
-            pkt->status = STATUS_INVALID_PID;
-        else
-            pkt->status = STATUS_PAGE_FAULT;
-        return ret;
-    }
-    pkt->physical_addr = phys;
-    pkt->status = STATUS_SUCCESS;
-    return 0;
+    /* Physical address translation requires pgtable_t types we can't safely use here */
+    pkt->status = STATUS_PAGE_WALK_FAIL;
+    pkt->physical_addr = 0;
+    return -ENOSYS;
 }
 
 /* ---------- KPM Init & Exit ---------- */
@@ -504,6 +320,5 @@ static long hfr_memory_exit(void __user *reserved)
     return 0;
 }
 
-/* Register with APatch framework */
 KPM_INIT(hfr_memory_init);
 KPM_EXIT(hfr_memory_exit);
