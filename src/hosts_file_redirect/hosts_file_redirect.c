@@ -8,13 +8,13 @@
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <linux/printk.h>
-#include <linux/sched.h>
-#include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <linux/gfp.h>
-#include <linux/uaccess.h>
+#include <printk.h>
+#include <sched.h>
+#include <string.h>
+#include <slab.h>
+#include <mm.h>
+#include <gfp.h>
+#include <uaccess.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
