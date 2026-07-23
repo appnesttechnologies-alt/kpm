@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * Copyright (C) 2026 Surajit. All Rights Reserved.
- * 
  * KPM Memory Debugger - Main Module Entry Point
  */
 
@@ -12,10 +11,10 @@ KPM_NAME("kpm_memory_debugger");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Cross-Process Memory Debugger with MMU Page Table Walk and R/W Handlers");
+KPM_DESCRIPTION("Cross-Process Memory Debugger with MMU Page Table Walk");
 
-/* Global synchronization */
-static DEFINE_MUTEX(ctl0_lock);
+/* Global state */
+static DEFINE_KPM_MUTEX(ctl0_lock);
 static atomic_t module_refcount = ATOMIC_INIT(0);
 static bool module_initialized = false;
 
@@ -84,7 +83,7 @@ static long kpm_memory_ctl0_handler(void __user *user_data, size_t user_size)
     kpm_info("Request: OP=0x%04X PID=%u ADDR=0x%llX SIZE=%u\n",
              pkt->op_code, pkt->target_pid, pkt->target_addr, pkt->size);
     
-    mutex_lock(&ctl0_lock);
+    kpm_mutex_lock(&ctl0_lock);
     
     switch (pkt->op_code) {
     case OP_RESOLVE_BASE:
@@ -106,6 +105,7 @@ static long kpm_memory_ctl0_handler(void __user *user_data, size_t user_size)
         ret = get_process_mm(pkt->target_pid, &mm, &task);
         if (ret < 0) {
             pkt->status = STATUS_INVALID_PID;
+            kpm_err("Cannot get process MM for PID %u\n", pkt->target_pid);
         } else {
             pkt->physical_addr = virtual_to_physical(mm, pkt->target_addr);
             if (pkt->physical_addr) {
@@ -114,6 +114,7 @@ static long kpm_memory_ctl0_handler(void __user *user_data, size_t user_size)
                          pkt->target_addr, pkt->physical_addr);
             } else {
                 pkt->status = STATUS_PAGE_WALK_FAIL;
+                kpm_err("Page walk failed for VA=0x%llX\n", pkt->target_addr);
                 ret = -EINVAL;
             }
             put_process_mm(mm);
@@ -128,7 +129,7 @@ static long kpm_memory_ctl0_handler(void __user *user_data, size_t user_size)
         break;
     }
     
-    mutex_unlock(&ctl0_lock);
+    kpm_mutex_unlock(&ctl0_lock);
     
     if (ret == 0) {
         kpm_debug("Operation completed successfully\n");
@@ -208,7 +209,6 @@ static long kpm_memory_exit(void *__user reserved)
             kpm_info("Waiting for %d active operations...\n",
                      atomic_read(&module_refcount));
         }
-        msleep(50);
         wait_count++;
     }
     
