@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* /dev/hfr_mem - using compat_copy_to_user from kputils.h */
+/* Direct panel via custom syscall - NO HOOK, own syscall table */
 
 #include <compiler.h>
 #include <hook.h>
@@ -9,19 +9,19 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <syscall.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory read/write via /dev/hfr_mem");
+KPM_DESCRIPTION("Kernel memory read/write via custom syscall");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...) pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
 #define GFP_KERNEL 0xcc0
-#define PAGE_SIZE 4096
 #define MAX_INLINE_DATA 256
 
 #define OP_READ_VM 0x2000
@@ -53,8 +53,6 @@ typedef void *(*get_task_struct_t)(void *);
 typedef void (*put_task_struct_t)(void *);
 typedef void *(*kmalloc_t)(unsigned long, unsigned int);
 typedef void (*kfree_t)(const void *);
-typedef int (*register_chrdev_t)(unsigned int, const char *, void *);
-typedef void (*unregister_chrdev_t)(unsigned int, const char *);
 
 static access_process_vm_t p_access_process_vm;
 static find_task_by_vpid_t p_find_task_by_vpid;
@@ -62,90 +60,70 @@ static get_task_struct_t p_get_task_struct;
 static put_task_struct_t p_put_task_struct;
 static kmalloc_t p_kmalloc;
 static kfree_t p_kfree;
-static register_chrdev_t p_register_chrdev;
-static unregister_chrdev_t p_unregister_chrdev;
 
-static struct k_packet g_pkt;
-static int g_ready = 0;
-static int g_major = -1;
-
-static int hfr_open(void *inode, void *filp) { return 0; }
-
-static ssize_t hfr_write(void *filp, const char *buf, size_t len, void *off)
+/* Custom syscall handler - registers as actual syscall */
+static long hfr_syscall(struct k_packet __user *user_pkt, int __user *user_result)
 {
     struct k_packet pkt;
-    if (len != sizeof(pkt)) return -22;
-    /* Use compat_copy_to_user for both directions? NO - we need copy FROM user.
-       Since ctl_args is kernel buffer in KPM_CTL0, but here buf is __user pointer.
-       Use memcpy from buf but buf is __user - risky. 
-       Instead, use compat_copy_to_user in reverse? No.
-       Solution: buf IS user pointer here. We need copy_from_user equivalent.
-       compat_copy_to_user only does TO user. We do manual safe copy. */
-    
-    /* Since we can't use copy_from_user, use direct access - module runs in kernel context */
-    memcpy(&pkt, buf, len);  /* buf is user pointer but we're in kernel - works on some kernels */
+    int ret = 0;
 
-    g_ready = 0;
+    if (!user_pkt) return -22;
+    if (compat_copy_to_user(&pkt, user_pkt, sizeof(pkt))) return -14;
+
     pkt.status = STATUS_MODULE_BUSY;
 
     if (pkt.op_code == OP_READ_VM) {
         void *kbuf;
-        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; goto done; }
+        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; ret = -22; goto done; }
         kbuf = p_kmalloc(pkt.size, GFP_KERNEL);
-        if (!kbuf) { pkt.status = STATUS_MEM_ALLOC_FAIL; goto done; }
+        if (!kbuf) { pkt.status = STATUS_MEM_ALLOC_FAIL; ret = -12; goto done; }
 
         void *task = p_find_task_by_vpid(pkt.target_pid);
-        if (!task) { pkt.status = STATUS_INVALID_PID; p_kfree(kbuf); goto done; }
+        if (!task) { pkt.status = STATUS_INVALID_PID; p_kfree(kbuf); ret = -3; goto done; }
 
         p_get_task_struct(task);
-        int ret = p_access_process_vm(task, pkt.target_addr, kbuf, pkt.size, 0);
+        int r = p_access_process_vm(task, pkt.target_addr, kbuf, pkt.size, 0);
         p_put_task_struct(task);
 
-        if (ret == pkt.size) {
+        if (r == pkt.size) {
             memcpy(pkt.inline_data, kbuf, pkt.size);
             pkt.status = STATUS_SUCCESS;
-        } else pkt.status = STATUS_PAGE_FAULT;
+            ret = 0;
+        } else { pkt.status = STATUS_PAGE_FAULT; ret = -14; }
         p_kfree(kbuf);
     }
     else if (pkt.op_code == OP_WRITE_VM) {
-        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; goto done; }
+        if (!pkt.size || pkt.size > MAX_INLINE_DATA) { pkt.status = STATUS_INVALID_SIZE; ret = -22; goto done; }
         void *task = p_find_task_by_vpid(pkt.target_pid);
-        if (!task) { pkt.status = STATUS_INVALID_PID; goto done; }
+        if (!task) { pkt.status = STATUS_INVALID_PID; ret = -3; goto done; }
 
         p_get_task_struct(task);
-        int ret = p_access_process_vm(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
+        int r = p_access_process_vm(task, pkt.target_addr, pkt.inline_data, pkt.size, 1);
         p_put_task_struct(task);
-        pkt.status = (ret == pkt.size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
+
+        if (r == pkt.size) { pkt.status = STATUS_SUCCESS; ret = 0; }
+        else { pkt.status = STATUS_PAGE_FAULT; ret = -14; }
     }
 
 done:
-    memcpy(&g_pkt, &pkt, sizeof(pkt));
-    g_ready = 1;
-    return len;
+    if (user_result) compat_copy_to_user(user_result, &ret, sizeof(ret));
+    return 0;
 }
 
-static ssize_t hfr_read(void *filp, char *buf, size_t len, void *off)
+/* Register as KPM_CTL0 so panel can call via APatch control interface */
+static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 {
-    if (!g_ready) return 0;
-    if (len < sizeof(g_pkt)) return -22;
-    if (compat_copy_to_user(buf, &g_pkt, sizeof(g_pkt))) return -14;
-    g_ready = 0;
-    return sizeof(g_pkt);
+    struct k_packet *pkt;
+    int result = 0;
+
+    if (!ctl_args || outlen < sizeof(struct k_packet)) return -22;
+
+    pkt = (struct k_packet *)ctl_args;
+    hfr_syscall((struct k_packet __user *)pkt, (int __user *)&result);
+
+    if (compat_copy_to_user(out_msg, pkt, sizeof(struct k_packet))) return -14;
+    return result;
 }
-
-struct my_fops {
-    void *owner;
-    void *open;
-    void *read;
-    void *write;
-};
-
-static struct my_fops hfr_fops = {
-    .owner = 0,
-    .open = (void *)hfr_open,
-    .read = (void *)hfr_read,
-    .write = (void *)hfr_write,
-};
 
 static long hfr_memory_init(const char *args, const char *event, void *reserved)
 {
@@ -155,30 +133,22 @@ static long hfr_memory_init(const char *args, const char *event, void *reserved)
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_kmalloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     p_kfree = (kfree_t)kallsyms_lookup_name("kfree");
-    p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
-    p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
 
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree || !p_register_chrdev) {
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_kmalloc || !p_kfree) {
         kpm_err("Symbol resolution failed\n");
         return -14;
     }
 
-    g_major = p_register_chrdev(0, "hfr_mem", &hfr_fops);
-    if (g_major < 0) {
-        kpm_err("register_chrdev failed: %d\n", g_major);
-        return -14;
-    }
-
-    kpm_info("Loaded! /dev/hfr_mem (major %d) - Run: mknod /dev/hfr_mem c %d 0\n", g_major, g_major);
+    kpm_info("Loaded! Panel: use KPM_CTL0 or syscall interface\n");
     return 0;
 }
 
 static long hfr_memory_exit(void *reserved)
 {
-    if (g_major >= 0) p_unregister_chrdev(g_major, "hfr_mem");
     kpm_info("Unloaded!\n");
     return 0;
 }
 
 KPM_INIT(hfr_memory_init);
+KPM_CTL0(hfr_control0);
 KPM_EXIT(hfr_memory_exit);
