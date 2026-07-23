@@ -2,25 +2,23 @@
 /* Copyright (C) 2026 Surajit. All Rights Reserved. */
 
 #include "framework.h"
-#include <linux/printk.h>
-#include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/sched.h>
-#include <linux/mm.h>
-#include <linux/pid.h>
-#include <linux/version.h>
 
-#define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+/* Explicit kernel definitions & function prototypes for standalone NDK compilation */
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0
+#endif
+
+/* Forward declarations for kernel memory and user-access functions */
+extern void *kmalloc(size_t size, unsigned int flags);
+extern void kfree(const void *objp);
+extern unsigned long __must_check copy_to_user(void __user *to, const void *from, unsigned long n);
+extern unsigned long __must_check copy_from_user(void *to, const void __user *from, unsigned long n);
 
 /* Internal context structure */
 struct mem_op_context {
     void *target_mm;
-    struct page **pages;
-    void **kva_array;
+    void *pages;
+    void *kva_array;
     unsigned long start_addr;
     unsigned long end_addr;
     int nr_pages;
@@ -28,7 +26,7 @@ struct mem_op_context {
 };
 
 /* External helper declarations */
-extern int get_process_mm(pid_t pid, void **mm, struct task_struct **task);
+extern int get_process_mm(unsigned int pid, void **mm, void *task);
 extern void put_process_mm(void *mm);
 extern unsigned long virtual_to_physical(void *mm, unsigned long vaddr);
 extern int validate_user_address(void *mm, unsigned long vaddr, unsigned long size);
@@ -40,19 +38,16 @@ extern int copy_data_from_user_pages(struct mem_op_context *ctx, void *dst, size
 
 int memory_initialize(void)
 {
-    kpm_info("Memory core initialized successfully (Clean Offset Mode)\n");
     return 0;
 }
 
 void memory_cleanup(void)
 {
-    kpm_info("Memory core cleaned up safely\n");
 }
 
 int handle_memory_read(struct k_packet *pkt)
 {
     void *mm = NULL;
-    struct task_struct *task = NULL;
     struct mem_op_context ctx;
     void *kernel_buffer = NULL;
     int ret = 0;
@@ -62,7 +57,7 @@ int handle_memory_read(struct k_packet *pkt)
         return -22;
     }
     
-    ret = get_process_mm(pkt->target_pid, &mm, &task);
+    ret = get_process_mm(pkt->target_pid, &mm, NULL);
     if (ret < 0) {
         pkt->status = STATUS_INVALID_PID;
         return ret;
@@ -82,7 +77,8 @@ int handle_memory_read(struct k_packet *pkt)
         return -12;
     }
     
-    memset(&ctx, 0, sizeof(ctx));
+    /* Safely clear context */
+    __builtin_memset(&ctx, 0, sizeof(ctx));
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 0, &ctx);
     if (ret < 0) {
@@ -119,7 +115,6 @@ int handle_memory_read(struct k_packet *pkt)
 int handle_memory_write(struct k_packet *pkt)
 {
     void *mm = NULL;
-    struct task_struct *task = NULL;
     struct mem_op_context ctx;
     void *kernel_buffer = NULL;
     int ret = 0;
@@ -129,7 +124,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -22;
     }
     
-    ret = get_process_mm(pkt->target_pid, &mm, &task);
+    ret = get_process_mm(pkt->target_pid, &mm, NULL);
     if (ret < 0) {
         pkt->status = STATUS_INVALID_PID;
         return ret;
@@ -156,7 +151,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -14;
     }
     
-    memset(&ctx, 0, sizeof(ctx));
+    __builtin_memset(&ctx, 0, sizeof(ctx));
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 1, &ctx);
     if (ret < 0) {
@@ -188,11 +183,10 @@ int handle_memory_write(struct k_packet *pkt)
 int resolve_process_base(struct k_packet *pkt)
 {
     void *mm = NULL;
-    struct task_struct *task = NULL;
     int ret;
     unsigned long base_addr = 0;
     
-    ret = get_process_mm(pkt->target_pid, &mm, &task);
+    ret = get_process_mm(pkt->target_pid, &mm, NULL);
     if (ret < 0) {
         pkt->status = STATUS_INVALID_PID;
         return ret;
@@ -203,8 +197,6 @@ int resolve_process_base(struct k_packet *pkt)
     pkt->physical_addr = base_addr;
     pkt->resolved_base = pkt->target_addr;
     pkt->status = STATUS_SUCCESS;
-    
-    kpm_info("Base resolved cleanly for PID=%u\n", pkt->target_pid);
     
     put_process_mm(mm);
     return 0;
