@@ -9,7 +9,7 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <linux/pagemap.h>
+/* #include <linux/pagemap.h> */  /* Removed to fix missing header error in APatch SDK */
 
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -206,7 +206,6 @@ int resolve_process_base(struct k_packet *pkt)
     }
     
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-    // For newer kernel versions where mm->mmap structure might be wrapped or accessed differently
     vma = mm->mmap;
 #else
     vma = mm->mmap;
