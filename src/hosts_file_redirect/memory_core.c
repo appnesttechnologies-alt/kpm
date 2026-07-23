@@ -3,16 +3,24 @@
 
 #include "framework.h"
 
-/* Explicit kernel definitions & function prototypes for standalone NDK compilation */
+/* Explicit kernel definitions & macros for standalone NDK compilation */
 #ifndef GFP_KERNEL
 #define GFP_KERNEL 0xcc0
 #endif
 
-/* Forward declarations for kernel memory and user-access functions */
+#ifndef __user
+#define __user
+#endif
+
+#ifndef __must_check
+#define __must_check
+#endif
+
+/* Clean forward declarations without macro conflicts */
 extern void *kmalloc(size_t size, unsigned int flags);
 extern void kfree(const void *objp);
-extern unsigned long __must_check copy_to_user(void __user *to, const void *from, unsigned long n);
-extern unsigned long __must_check copy_from_user(void *to, const void __user *from, unsigned long n);
+extern unsigned long copy_to_user(void *to, const void *from, unsigned long n);
+extern unsigned long copy_from_user(void *to, const void *from, unsigned long n);
 
 /* Internal context structure */
 struct mem_op_context {
@@ -77,7 +85,6 @@ int handle_memory_read(struct k_packet *pkt)
         return -12;
     }
     
-    /* Safely clear context */
     __builtin_memset(&ctx, 0, sizeof(ctx));
     
     ret = pin_user_pages_for_transfer(mm, pkt->target_addr, pkt->size, 0, &ctx);
@@ -99,7 +106,7 @@ int handle_memory_read(struct k_packet *pkt)
     
     unpin_user_pages(&ctx);
     
-    if (copy_to_user((void __user *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
+    if (copy_to_user((void *)(unsigned long)pkt->user_buffer, kernel_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         ret = -14;
     } else {
@@ -144,7 +151,7 @@ int handle_memory_write(struct k_packet *pkt)
         return -12;
     }
     
-    if (copy_from_user(kernel_buffer, (void __user *)(unsigned long)pkt->user_buffer, pkt->size)) {
+    if (copy_from_user(kernel_buffer, (void *)(unsigned long)pkt->user_buffer, pkt->size)) {
         pkt->status = STATUS_COPY_FAIL;
         kfree(kernel_buffer);
         put_process_mm(mm);
