@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 HFR_VERSION := 1.1.8
 
 ifndef KP_DIR
@@ -27,17 +28,21 @@ CC ?= gcc
 LD ?= ld
 STRIP ?= strip
 
-CFLAGS = -Wall -O3 -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector -fno-common -DHFR_VERSION=\"$(HFR_VERSION)\"
+CFLAGS = -Wall -O3 -fno-PIC -fno-asynchronous-unwind-tables \
+         -fno-stack-protector -fno-common \
+         -DHFR_VERSION=\"$(HFR_VERSION)\"
 
-INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include kpm/include
+INCLUDE_DIRS := . include patch/include linux/include \
+                linux/arch/arm64/include linux/tools/arch/arm64/include \
+                kpm/include
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
 objs := main.o memory_core.o process_helper.o
 
-all: hosts_file_redirect_$(HFR_VERSION).kpm
+all: kpm_memory_debugger_$(HFR_VERSION).kpm
 
-hosts_file_redirect_$(HFR_VERSION).kpm: ${objs}
+kpm_memory_debugger_$(HFR_VERSION).kpm: ${objs}
 	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -r -o $@ $^
 	${STRIP} -g --strip-unneeded $@
 
@@ -46,5 +51,5 @@ hosts_file_redirect_$(HFR_VERSION).kpm: ${objs}
 
 .PHONY: clean
 clean:
-	rm -f *.kpm
-	find . -name "*.o" | xargs rm -f
+    rm -f *.kpm
+    find . -name "*.o" | xargs rm -f
