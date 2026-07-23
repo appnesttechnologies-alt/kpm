@@ -9,6 +9,7 @@
 #include <kpmodule.h>
 #include <kputils.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
@@ -24,12 +25,12 @@ KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.")
 #define kpm_info(fmt, ...)     pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)      pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-/* Manual defines - not available from KPM headers */
+/* Manual defines */
 #define GFP_KERNEL  0xcc0
 #define PAGE_SIZE   4096
 
 /* Safety limits */
-#define MAX_TRANSFER_SIZE     0x100000   /* 1 MiB */
+#define MAX_TRANSFER_SIZE     0x100000
 
 /* Operation Codes */
 #define OP_RESOLVE_BASE       0x1000
@@ -50,9 +51,6 @@ KPM_DESCRIPTION("Single-file self-contained kernel memory read/write debugger.")
 #define STATUS_COPY_FAIL      0x1009
 #define STATUS_MODULE_BUSY    0x1010
 
-/**
- * struct k_packet - Universal Data Packet
- */
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
@@ -67,7 +65,7 @@ struct k_packet {
     uint32_t reserved;
 } __attribute__((aligned(8), packed));
 
-/* ---------- Kernel function pointers resolved via kallsyms ---------- */
+/* Kernel function pointers */
 typedef int (*access_process_vm_t)(struct task_struct *tsk, unsigned long addr,
                                    void *buf, int len, int write);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *t);
@@ -76,8 +74,6 @@ typedef void (*put_task_struct_t)(struct task_struct *t);
 static access_process_vm_t access_process_vm_fn;
 static get_task_struct_t get_task_struct_fn;
 static put_task_struct_t put_task_struct_fn;
-
-/* ---------- Core memory operations ---------- */
 
 static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t size)
 {
@@ -95,13 +91,9 @@ static int read_process_memory(pid_t pid, unsigned long addr, void *buf, size_t 
     ret = access_process_vm_fn(task, addr, buf, size, 0);
     put_task_struct_fn(task);
 
-    if (ret == 0)
-        return -EFAULT;
-    if (ret < 0)
-        return ret;
-    if (ret != size)
-        return -EFAULT;
-
+    if (ret == 0) return -EFAULT;
+    if (ret < 0) return ret;
+    if (ret != size) return -EFAULT;
     return 0;
 }
 
@@ -121,42 +113,18 @@ static int write_process_memory(pid_t pid, unsigned long addr, const void *buf, 
     ret = access_process_vm_fn(task, addr, (void *)buf, size, 1);
     put_task_struct_fn(task);
 
-    if (ret == 0)
-        return -EFAULT;
-    if (ret < 0)
-        return ret;
-    if (ret != size)
-        return -EFAULT;
-
+    if (ret == 0) return -EFAULT;
+    if (ret < 0) return ret;
+    if (ret != size) return -EFAULT;
     return 0;
 }
 
-/* ---------- Handlers for each opcode ---------- */
-
 int handle_resolve_base(struct k_packet *pkt)
 {
-    struct task_struct *task;
-    struct mm_struct *mm;
-
-    task = find_task_by_vpid(pkt->target_pid);
-    if (!task) {
-        pkt->status = STATUS_INVALID_PID;
-        return -ESRCH;
-    }
-
-    get_task_struct_fn(task);
-    mm = get_task_mm(task);
-    if (!mm) {
-        pkt->status = STATUS_INVALID_PID;
-        put_task_struct_fn(task);
-        return -ESRCH;
-    }
-
-    pkt->resolved_base = mm->start_code;
-    mmput(mm);
-    put_task_struct_fn(task);
-    pkt->status = STATUS_SUCCESS;
-    return 0;
+    /* mm->start_code not accessible without full mm_struct definition */
+    pkt->status = STATUS_PAGE_WALK_FAIL;
+    pkt->resolved_base = 0;
+    return -ENOSYS;
 }
 
 int handle_memory_read(struct k_packet *pkt)
@@ -177,12 +145,9 @@ int handle_memory_read(struct k_packet *pkt)
 
     ret = read_process_memory(pkt->target_pid, pkt->target_addr, kbuf, pkt->size);
     if (ret < 0) {
-        if (ret == -ESRCH)
-            pkt->status = STATUS_INVALID_PID;
-        else if (ret == -EFAULT)
-            pkt->status = STATUS_PAGE_FAULT;
-        else
-            pkt->status = STATUS_ACCESS_DENIED;
+        if (ret == -ESRCH) pkt->status = STATUS_INVALID_PID;
+        else if (ret == -EFAULT) pkt->status = STATUS_PAGE_FAULT;
+        else pkt->status = STATUS_ACCESS_DENIED;
         kfree(kbuf);
         return ret;
     }
@@ -225,12 +190,9 @@ int handle_memory_write(struct k_packet *pkt)
     kfree(kbuf);
 
     if (ret < 0) {
-        if (ret == -ESRCH)
-            pkt->status = STATUS_INVALID_PID;
-        else if (ret == -EFAULT)
-            pkt->status = STATUS_PAGE_FAULT;
-        else
-            pkt->status = STATUS_ACCESS_DENIED;
+        if (ret == -ESRCH) pkt->status = STATUS_INVALID_PID;
+        else if (ret == -EFAULT) pkt->status = STATUS_PAGE_FAULT;
+        else pkt->status = STATUS_ACCESS_DENIED;
         return ret;
     }
 
@@ -245,8 +207,6 @@ int handle_query_phys(struct k_packet *pkt)
     pkt->physical_addr = 0;
     return -ENOSYS;
 }
-
-/* ---------- Control interface ---------- */
 
 static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 {
@@ -282,8 +242,6 @@ static long hfr_control0(const char *ctl_args, char __user *out_msg, int outlen)
 
     return ret;
 }
-
-/* ---------- KPM Init & Exit ---------- */
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
