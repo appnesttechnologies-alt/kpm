@@ -5,19 +5,19 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/slab.h>
-#include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <asm/pgtable.h>
 #include <linux/pagemap.h>
-#include <linux/rwsem.h>
+
+/* pgtable functions are available through linux/mm.h in APatch SDK */
 
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
+/* Internal context structure */
 struct mem_op_context {
     struct mm_struct *target_mm;
     struct page **pages;
