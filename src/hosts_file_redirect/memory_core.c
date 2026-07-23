@@ -9,7 +9,9 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-/* #include <linux/pagemap.h> */  /* Removed to fix missing header error in APatch SDK */
+#include <linux/errno.h>
+#include <linux/gfp.h>
+#include <linux/version.h>
 
 #define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
