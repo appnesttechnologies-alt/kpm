@@ -1,12 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * Copyright (C) 2026 Surajit. All Rights Reserved.
- * KPM Memory Debugger - Main Module
+ * KPM Memory Debugger - Main Module Entry Point
  */
 
 #include "framework.h"
 
-/* APatch required includes */
+/* Kernel headers - use exactly what APatch SDK provides */
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/slab.h>
@@ -14,24 +14,23 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <asm/pgtable.h>
 #include <linux/pagemap.h>
-#include <linux/rwsem.h>
 #include <kpm_utils.h>
+
+/* Logging macros */
+#define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+#define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+#define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
+#define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
 /* APatch Module Metadata */
 KPM_NAME("kpm_memory_debugger");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Cross-Process Memory Debugger with MMU Page Table Walk and R/W");
+KPM_DESCRIPTION("Cross-Process Memory Debugger with MMU Page Table Walk and R/W Handlers");
 
-#define kpm_info(fmt, ...)  pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_err(fmt, ...)   pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_debug(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-#define kpm_warn(fmt, ...)  pr_warn(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
-
-/* Simple spinlock for synchronization */
+/* Simple spinlock using compiler builtins */
 struct kpm_spinlock {
     int locked;
 };
@@ -52,12 +51,15 @@ static struct kpm_spinlock ctl0_lock = {0};
 static int module_refcount = 0;
 static bool module_initialized = false;
 
-/* Forward declarations */
-int memory_initialize(void);
-void memory_cleanup(void);
-int handle_memory_read(struct k_packet *pkt);
-int handle_memory_write(struct k_packet *pkt);
-int resolve_process_base(struct k_packet *pkt);
+/* External function declarations from other modules */
+extern int memory_initialize(void);
+extern void memory_cleanup(void);
+extern int handle_memory_read(struct k_packet *pkt);
+extern int handle_memory_write(struct k_packet *pkt);
+extern int resolve_process_base(struct k_packet *pkt);
+extern int get_process_mm(pid_t pid, struct mm_struct **mm, struct task_struct **task);
+extern void put_process_mm(struct mm_struct *mm);
+extern unsigned long virtual_to_physical(struct mm_struct *mm, unsigned long vaddr);
 
 static bool validate_packet(const struct k_packet *pkt)
 {
