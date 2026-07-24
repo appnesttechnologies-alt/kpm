@@ -3,7 +3,6 @@
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <err.h>
 #include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
@@ -305,7 +304,9 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     
     worker_thread = p_kthread_create(hfr_socket_worker, NULL, -1, "kpm_hfr_pro");
     
-    /* FIX: Direct pointer casting ensures compatibility without needing IS_ERR macro mappings */
     if (worker_thread && ((unsigned long)worker_thread < (unsigned long)-4095)) {
         p_wake_up_process(worker_thread);
     } else {
+        server_running = 0;
+        if (listen_sock) {
+            p_sock_release(listen_sock);
