@@ -8,7 +8,6 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/sched.h>
-#include <linux/sched/signal.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
@@ -17,7 +16,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Volatile Proc Engine");
+KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -69,14 +68,18 @@ struct proc_ops {
                                             unsigned long);
 };
 
+/* Function Typedefs for KPM Dynamic Resolution */
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
 typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
+
+/* Exact signatures fetched from your full kernel source */
 typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
+typedef pid_t (*task_pid_vnr_t)(struct task_struct *);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -86,6 +89,7 @@ static access_process_vm_t   p_access_process_vm;
 static find_task_by_vpid_t   p_find_task_by_vpid;
 static get_task_mm_t         p_get_task_mm;
 static mmput_t               p_mmput;
+static task_pid_vnr_t        p_task_pid_vnr;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -164,8 +168,7 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
         return -EFAULT;
 
-    // Use current_task_struct or direct task_pid_vnr via current task accessor
-    caller_pid = task_pid_vnr(current_task());
+    caller_pid = p_task_pid_vnr(current);
 
     process_packet(&local_pkt, caller_pid);
 
@@ -190,13 +193,16 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_remove_proc_entry  = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user     = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
     p_copy_to_user       = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+    
+    /* Dynamically resolving full kernel source symbols for KPM framework */
     p_access_process_vm  = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find_task_by_vpid  = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get_task_mm        = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
     p_mmput              = (mmput_t)kallsyms_lookup_name("mmput");
+    p_task_pid_vnr       = (task_pid_vnr_t)kallsyms_lookup_name("task_pid_vnr");
 
-    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid) {
-        kpm_err("Core symbol resolution failed\n");
+    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || !p_task_pid_vnr) {
+        kpm_err("Core dynamic symbol resolution failed\n");
         return -EFAULT;
     }
 
@@ -206,7 +212,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("Proc Synchronous Bridge initialized safely!\n");
+    kpm_info("KPM Fully Resolved Dynamic Memory Bridge initialized successfully!\n");
     return 0;
 }
 
