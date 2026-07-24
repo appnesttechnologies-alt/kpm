@@ -79,7 +79,6 @@ typedef void (*mmput_t)(struct mm_struct *);
 typedef pid_t (*task_pid_vnr_t)(struct task_struct *);
 typedef struct task_struct *(*get_current_t)(void);
 
-/* RCU Dynamic Typedefs */
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
 
@@ -176,7 +175,6 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (count < sizeof(struct k_packet))
         return -EINVAL;
 
-    if (p_copy_from_user(&local_pid_check_dummy_or_copy_here, buffer, sizeof(struct k_packet)) == 0) // handled via p_copy_from_user below correctly
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
         return -EFAULT;
 
