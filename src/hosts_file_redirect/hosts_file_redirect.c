@@ -8,7 +8,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/sched.h>
-#include <linux/sched/task.h>
+#include <linux/sched/signal.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
@@ -164,8 +164,8 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
         return -EFAULT;
 
-    // Use get_current() safely to fetch current task_struct pointer
-    caller_pid = task_pid_vnr(get_current());
+    // Use current_task_struct or direct task_pid_vnr via current task accessor
+    caller_pid = task_pid_vnr(current_task());
 
     process_packet(&local_pkt, caller_pid);
 
