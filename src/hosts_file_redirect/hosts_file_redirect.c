@@ -1,20 +1,22 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* File socket version - creates actual socket file */
 
 #include <compiler.h>
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
 #include <linux/sched.h>
+#include <linux/sched/task.h> // Custom Header Included safely
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/rcupdate.h>   // Crash control ke liye mandatory features
+#include <linux/delay.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Unix socket (file socket)");
+KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -30,17 +32,9 @@ KPM_DESCRIPTION("Kernel memory r/w via Unix socket (file socket)");
 #define STATUS_INVALID_SIZE  0x1005
 #define STATUS_MEM_ALLOC_FAIL 0x1008
 
-/* 
- * FIX: Switched to /dev/ to bypass Android's rigid /data/ partition 
- * multi-user sandbox constraints during file creation.
- */
-#define HFR_SOCKET_PATH "/dev/hfr_socket"
-
 #define AF_UNIX 1
 #define SOCK_STREAM 1
-#define MSG_DONTWAIT 0x40
 
-// Force strict alignment attributes to match target Linux ARM64 kernel layouts
 struct sockaddr_un {
     unsigned short sun_family;
     char sun_path[108];
@@ -73,7 +67,6 @@ struct k_packet {
 typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
-typedef void (*put_task_struct_t)(void *);
 typedef void *(*kmalloc_t)(unsigned long, unsigned int);
 typedef void (*kfree_t)(const void *);
 typedef int (*sock_create_t)(int, int, int, void **);
@@ -87,7 +80,6 @@ typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
 static get_task_struct_t    p_get;
-static put_task_struct_t    p_put;
 static kmalloc_t            p_malloc;
 static kfree_t              p_free;
 static sock_create_t   p_sock_create;
@@ -100,6 +92,7 @@ static sock_recvmsg_t  p_sock_recvmsg;
 
 static void *listen_sock = NULL;
 static int server_running = 0;
+static pid_t thread_pid = -1;
 
 static void cp(void *d, const void *s, unsigned long n) {
     unsigned char *dd = d; const unsigned char *ss = s;
@@ -118,26 +111,84 @@ static void process_packet(struct k_packet *pkt)
         if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
         void *kbuf = p_malloc(pkt->size, GFP_KERNEL);
         if (!kbuf) { pkt->status = STATUS_MEM_ALLOC_FAIL; return; }
+        
+        rcu_read_lock(); // FIX: Multi-threading protection to secure internal data layouts
         void *task = p_find(pkt->target_pid);
-        if (!task) { p_free(kbuf); return; }
+        if (!task) { rcu_read_unlock(); p_free(kbuf); return; }
         p_get(task);
+        rcu_read_unlock();
+        
         int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
-        p_put(task);
+        __put_task_struct(task); // USE: Framework ka inline direct task hook execute ho raha hai yahan
+        
         if (r == pkt->size) { cp(pkt->inline_data, kbuf, pkt->size); pkt->status = STATUS_SUCCESS; }
         else pkt->status = STATUS_PAGE_FAULT;
         p_free(kbuf);
     }
     else if (pkt->op_code == OP_WRITE_VM) {
         if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
+        
+        rcu_read_lock();
         void *task = p_find(pkt->target_pid);
-        if (!task) return;
+        if (!task) { rcu_read_unlock(); return; }
         p_get(task);
+        rcu_read_unlock();
+        
         int r = p_vm(task, pkt->target_addr, pkt->inline_data, pkt->size, 1);
-        p_put(task);
+        __put_task_struct(task); // USE: Inline call via project task.h dependency
         pkt->status = (r == pkt->size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
     }
 }
 
+static void handle_client(void *client_sock)
+{
+    struct k_packet pkt;
+    struct iovec iov;
+    struct msghdr msg;
+    int ret;
+
+    while (server_running) {
+        cz(&pkt, sizeof(pkt));
+        cz(&iov, sizeof(iov));
+        cz(&msg, sizeof(msg));
+
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        ret = p_sock_recvmsg(client_sock, &msg, 0); 
+        if (ret <= 0) break; 
+
+        process_packet(&pkt);
+
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        p_sock_sendmsg(client_sock, &msg); 
+    }
+    p_sock_release(client_sock);
+}
+
+// Background thread loop function
+static int socket_server_worker(void *data)
+{
+    void *client_sock = NULL;
+    int ret;
+
+    while (server_running) {
+        ret = p_kernel_accept(listen_sock, &client_sock, 0);
+        if (ret < 0) {
+            if (server_running) msleep(50); // Prevent CPU spinlock spike on socket errors
+            continue;
+        }
+        if (client_sock) {
+            handle_client(client_sock);
+        }
+    }
+    return 0;
+}
 
 static int start_socket_server(void)
 {
@@ -145,38 +196,21 @@ static int start_socket_server(void)
     int ret;
     
     ret = p_sock_create(AF_UNIX, SOCK_STREAM, 0, &listen_sock);
-    if (ret < 0 || !listen_sock) { 
-        kpm_err("sock_create failed\n"); 
-        return ret; 
-    }
+    if (ret < 0 || !listen_sock) { kpm_err("sock_create failed\n"); return ret; }
     
-    // Explicitly zero out every single byte inside the structure frame
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    addr.sun_path[0] = '\0'; // Initialize clean anchor boundary 
     
-    // Force index 0 to be a single clean NUL byte to explicitly invoke abstract namespace
-    addr.sun_path[0] = '\0';
-    
-    // Hardcode a short, non-clashing name directly into the character indices
-    // This bypasses alignment shifting
-    addr.sun_path[1] = 'h';
-    addr.sun_path[2] = 'f';
-    addr.sun_path[3] = 'r';
-    addr.sun_path[4] = '_';
-    addr.sun_path[5] = 'm';
-    addr.sun_path[6] = 'e';
-    addr.sun_path[7] = 'm';
-    addr.sun_path[8] = '\0';
+    addr.sun_path[1] = 'h'; addr.sun_path[2] = 'f'; addr.sun_path[3] = 'r';
+    addr.sun_path[4] = '_'; addr.sun_path[5] = 'm'; addr.sun_path[6] = 'e';
+    addr.sun_path[7] = 'm'; addr.sun_path[8] = '\0';
 
-    /* 
-     * CRITICAL LENGTH METRIC FOR ABSTRACT PATHS:
-     * Size of family descriptor (2 bytes) + 1 byte for leading '\0' + strlen("hfr_mem") (7 bytes)
-     */
-    int un_len = 2 + 1 + 7;
+    int un_len = 2 + 1 + 7; 
     
     ret = p_kernel_bind(listen_sock, &addr, un_len);
     if (ret < 0) { 
-        kpm_err("bind failed with error code: %d\n", ret); 
+        kpm_err("bind failed: %d\n", ret); 
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
         return ret; 
@@ -190,19 +224,15 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    kpm_info("Abstract Memory socket stabilized successfully!\n");
+    kpm_info("Abstract Memory socket bound successfully!\n");
     return 0;
 }
-
-
-
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     p_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
-    p_put = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_malloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     p_free = (kfree_t)kallsyms_lookup_name("kfree");
     p_sock_create = (sock_create_t)kallsyms_lookup_name("sock_create");
@@ -218,17 +248,35 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
     
-    if (start_socket_server() < 0) { kpm_err("Socket server failed\n"); return -EFAULT; }
+    if (start_socket_server() < 0) { kpm_err("Socket server initialization failed\n"); return -EFAULT; }
+    
     server_running = 1;
-    kpm_info("Module loaded - socket: %s\n", HFR_SOCKET_PATH);
+    
+    // USE: Framework's native kernel_thread helper from your header definition file!
+    thread_pid = kernel_thread(socket_server_worker, NULL, 0);
+    if (thread_pid < 0) {
+        kpm_err("Failed to spawn kernel background execution loop\n");
+        server_running = 0;
+        if (listen_sock) { p_sock_release(listen_sock); listen_sock = NULL; }
+        return -EFAULT;
+    }
+
+    kpm_info("Module stabilized via dynamic execution loop\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
     server_running = 0;
-    if (listen_sock) { p_sock_release(listen_sock); listen_sock = NULL; }
-    kpm_info("Unloaded!\n");
+    
+    // We force release the core listening socket interface to drop out of blocking operations instantly
+    if (listen_sock) { 
+        p_sock_release(listen_sock); 
+        listen_sock = NULL; 
+    }
+    
+    msleep(100); // Give background context worker space to safely terminate loop frames
+    kpm_info("Unloaded and abstract memory cleared safely!\n");
     return 0;
 }
 
