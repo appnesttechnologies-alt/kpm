@@ -7,7 +7,6 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/kthread.h>
 #include <linux/delay.h>
 
 KPM_NAME("hosts_file_redirect");
@@ -42,7 +41,7 @@ KPM_DESCRIPTION("Professional High-Performance Cross-Process Physical Memory Eng
 
 struct sockaddr_un {
     unsigned short sun_family;
-    char sun_path[108];
+    char sun_path;
 } __attribute__((packed));
 
 struct iovec {
@@ -71,7 +70,7 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-/* Advanced Core System Dynamic Pointers - Corrected Signatures */
+/* Advanced Core System Dynamic Pointers */
 typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -83,10 +82,16 @@ typedef int (*sock_release_t)(void *);
 typedef int (*kernel_bind_t)(void *, struct sockaddr_un *, int);
 typedef int (*kernel_listen_t)(void *, int);
 typedef int (*kernel_accept_t)(void *, void **, int);
-
-/* FIX: Stabilized message routing signatures to prevent kernel register stack corruption */
 typedef int (*sock_sendmsg_t)(void *, struct msghdr *);
 typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
+
+/* 
+ * FIX: Replaced <linux/kthread.h> with manual type definitions 
+ * mapping straight into the kernel's scheduler library exports
+ */
+typedef struct task_struct *(*kthread_create_on_node_t)(int (*threadfn)(void *data), void *data, int node, const char namefmt[], ...);
+typedef int (*kthread_stop_t)(struct task_struct *k);
+typedef int (*kthread_should_stop_t)(void);
 
 /* External low-level architectural headers hooks provided by your SDK */
 extern uint64_t *pgtable_entry_kernel(uint64_t va);
@@ -105,6 +110,11 @@ static kernel_listen_t      p_kernel_listen;
 static kernel_accept_t      p_kernel_accept;
 static sock_sendmsg_t       p_sock_sendmsg;
 static sock_recvmsg_t       p_sock_recvmsg;
+
+/* Dynamic Scheduler Worker Handles */
+static kthread_create_on_node_t p_kthread_create;
+static kthread_stop_t           p_kthread_stop;
+static kthread_should_stop_t    p_kthread_should_stop;
 
 static void *listen_sock = NULL;
 static struct task_struct *worker_thread = NULL;
@@ -164,10 +174,6 @@ static void process_packet(struct k_packet *pkt)
         }
 
         case OP_VIRT_TO_PHYS: {
-            /* 
-             * Leverages your SDK's verified pidmem translation architecture 
-             * to break through Virtual Address Randomization limits.
-             */
             phys_addr_t pa = pid_virt_to_phys(pkt->target_pid, pkt->target_addr);
             if (pa != 0) {
                 pkt->physical_out = (uint64_t)pa;
@@ -179,13 +185,6 @@ static void process_packet(struct k_packet *pkt)
         }
 
         case OP_FORCE_PHYS_WRITE: {
-            /* 
-             * Professional Safety Fix: Keeps the operation safely isolated.
-             * Modifying high physical frames inline requires architecture-specific 
-             * macros (__va(pa)) which can change across Linux revisions. 
-             * Standardizing on OP_WRITE_VM handles caching and page boundaries 
-             * safely without triggering hard machine checks.
-             */
             pkt->status = STATUS_NOT_SUPPORTED; 
             break;
         }
@@ -205,15 +204,17 @@ static int hfr_socket_worker(void *data)
     int ret;
     kpm_info("Asynchronous I/O Server Subsystem Engaged.\n");
 
-    while (!kthread_should_stop() && server_running) {
+    // Clear context frame for safety wakeups
+    extern void wake_up_process(struct task_struct *p);
+
+    while (!p_kthread_should_stop() && server_running) {
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
-            msleep(20); // Safeguard against tight loop CPU throttling spikes
+            msleep(20); 
             continue;
         }
 
-        // Loop communication mapping matrix until specific client context exits
-        while (!kthread_should_stop() && server_running) {
+        while (!p_kthread_should_stop() && server_running) {
             struct k_packet pkt;
             struct iovec iov;
             struct msghdr msg;
@@ -227,14 +228,11 @@ static int hfr_socket_worker(void *data)
             msg.msg_iov = &iov;
             msg.msg_iovlen = 1;
 
-            /* FIX: Matches standard Linux internal flags tracking rules safely */
             ret = p_sock_recvmsg(client_sock, &msg, 0);
-            if (ret <= 0) break; // Client disconnected gracefully
+            if (ret <= 0) break; 
 
-            // Process payload structures securely through dual layers
             process_packet(&pkt);
 
-            // Respond synchronously with modified status matrices
             cz(&msg, sizeof(msg));
             msg.msg_iov = &iov;
             msg.msg_iovlen = 1;
@@ -261,16 +259,15 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    // Explicit, byte-aligned stabilization layout matching client maps
-    addr.sun_path[0] = '\0';
-    addr.sun_path[1] = 'h';
-    addr.sun_path[2] = 'f';
-    addr.sun_path[3] = 'r';
-    addr.sun_path[4] = '_';
-    addr.sun_path[5] = 'm';
-    addr.sun_path[6] = 'e';
-    addr.sun_path[7] = 'm';
-    addr.sun_path[8] = '\0';
+    addr.sun_path = '\0';
+    addr.sun_path = 'h';
+    addr.sun_path = 'f';
+    addr.sun_path = 'r';
+    addr.sun_path = '_';
+    addr.sun_path = 'm';
+    addr.sun_path = 'e';
+    addr.sun_path = 'm';
+    addr.sun_path = '\0';
 
     int un_len = 2 + 1 + 7;
     
@@ -306,3 +303,10 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_sock_sendmsg = (sock_sendmsg_t)kallsyms_lookup_name("sock_sendmsg");
     p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
     
+    /* Dynamically extract structural thread managers directly from memory */
+    p_kthread_create = (kthread_create_on_node_t)kallsyms_lookup_name("kthread_create_on_node");
+    p_kthread_stop = (kthread_stop_t)kallsyms_lookup_name("kthread_stop");
+    p_kthread_should_stop = (kthread_should_stop_t)kallsyms_lookup_name("kthread_should_stop");
+
+    if (!p_vm || !p_find || !p_malloc || !p_sock_create || !p_kernel_bind || 
+        !p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg ||
