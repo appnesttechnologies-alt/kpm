@@ -29,7 +29,7 @@ KPM_DESCRIPTION("Kernel memory r/w via Unix socket (file socket)");
 #define STATUS_PAGE_FAULT    0x1004
 #define STATUS_INVALID_SIZE  0x1005
 #define STATUS_MEM_ALLOC_FAIL 0x1008
-#define HFR_SOCKET_PATH "/data/local/tmp/hfr_socket"
+#define HFR_SOCKET_PATH "hfr_sock"
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define MSG_DONTWAIT 0x40
