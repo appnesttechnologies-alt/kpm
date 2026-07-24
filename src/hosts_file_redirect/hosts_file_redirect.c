@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Linux Asynchronous Callback Engine");
+KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Production Final");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -34,7 +34,7 @@ KPM_DESCRIPTION("Kernel memory r/w via Linux Asynchronous Callback Engine");
 
 struct sockaddr_un {
     unsigned short sun_family;
-    char sun_path[108]; 
+    char sun_path[108]; // Restored full layout dimension size safely
 } __attribute__((packed));
 
 struct iovec {
@@ -61,13 +61,6 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-// Complete mapping of kernel network structures internal layout pointers
-struct my_sock {
-    void *sk_common;
-    // Callback event offset simulation hooks
-    void (*sk_data_ready)(void *sk);
-};
-
 typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -81,6 +74,7 @@ typedef int (*kernel_listen_t)(void *, int);
 typedef int (*kernel_accept_t)(void *, void **, int);
 typedef int (*sock_sendmsg_t)(void *, struct msghdr *);
 typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
+typedef pid_t (*kernel_thread_t)(int (*fn)(void *), void *arg, unsigned long flags);
 
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
@@ -95,14 +89,19 @@ static kernel_listen_t p_kernel_listen;
 static kernel_accept_t p_kernel_accept;
 static sock_sendmsg_t  p_sock_sendmsg;
 static sock_recvmsg_t  p_sock_recvmsg;
+static kernel_thread_t p_kernel_thread;
 
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
 static rcu_read_lock_t   p_rcu_lock;
 static rcu_read_unlock_t p_rcu_unlock;
 
+typedef void (*msleep_t)(unsigned int);
+static msleep_t p_msleep;
+
 static void *listen_sock = NULL;
-static void (*old_data_ready)(void *sk) = NULL;
+static int server_running = 0; // FIX: Declared variable correctly globally
+static pid_t thread_pid = -1;
 
 static void cp(void *d, const void *s, unsigned long n) {
     unsigned char *dd = d; const unsigned char *ss = s;
@@ -150,35 +149,26 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
-// ASYNCHRONOUS INTERRUPT HANDLER: Yeh tabhi chalega jab client sach me data bhejega!
-static void hfr_data_ready(void *sk)
+static void handle_client(void *client_sock)
 {
-    void *client_sock = NULL;
     struct k_packet pkt;
     struct iovec iov;
     struct msghdr msg;
     int ret;
 
-    // Trigger original handler logic safely to clear subsystem network states
-    if (old_data_ready) old_data_ready(sk);
+    while (server_running) {
+        cz(&pkt, sizeof(pkt));
+        cz(&iov, sizeof(iov));
+        cz(&msg, sizeof(msg));
 
-    // Synchronous immediate client pipeline resolution
-    ret = p_kernel_accept(listen_sock, &client_sock, 0);
-    if (ret < 0 || !client_sock) return;
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
 
-    kpm_info("Asynchronous callback matched! Direct parsing engaged.\n");
+        ret = p_sock_recvmsg(client_sock, &msg, 0); 
+        if (ret <= 0) break; 
 
-    cz(&pkt, sizeof(pkt));
-    cz(&iov, sizeof(iov));
-    cz(&msg, sizeof(msg));
-
-    iov.iov_base = &pkt;
-    iov.iov_len = sizeof(pkt);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    ret = p_sock_recvmsg(client_sock, &msg, 0); 
-    if (ret > 0) {
         process_packet(&pkt);
 
         iov.iov_base = &pkt;
@@ -187,8 +177,28 @@ static void hfr_data_ready(void *sk)
         msg.msg_iovlen = 1;
         p_sock_sendmsg(client_sock, &msg); 
     }
-    
     p_sock_release(client_sock);
+}
+
+static int socket_server_worker(void *data)
+{
+    void *client_sock = NULL;
+    int ret;
+
+    kpm_info("Active worker context pipeline initialized safely.\n");
+
+    while (server_running) {
+        client_sock = NULL;
+        ret = p_kernel_accept(listen_sock, &client_sock, 0); // Synchronous processing line
+        if (ret < 0) {
+            if (server_running && p_msleep) p_msleep(10); 
+            continue;
+        }
+        if (client_sock) {
+            handle_client(client_sock);
+        }
+    }
+    return 0;
 }
 
 static int start_socket_server(void)
@@ -202,8 +212,7 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    // Explicit clean setting of standard character bounds sequence
-    addr.sun_path[0] = '\0'; 
+    addr.sun_path[0] = '\0'; // Abstract anchor allocation explicitly back-passed
     addr.sun_path[1] = 'h'; addr.sun_path[2] = 'f'; addr.sun_path[3] = 'r';
     addr.sun_path[4] = '_'; addr.sun_path[5] = 'm'; addr.sun_path[6] = 'e';
     addr.sun_path[7] = 'm'; addr.sun_path[8] = '\0';
@@ -225,18 +234,8 @@ static int start_socket_server(void)
         listen_sock = NULL; 
         return ret; 
     }
-
-    // HOOK INTERRUPT CALLBACK ROUTINE DIRECTLY INTO THE SOCKET INTERFACE LAYOUT
-    // (listen_sock -> socket -> sk layout parsing configuration)
-    void **socket_ptr = (void **)listen_sock;
-    struct my_sock *sk = (struct my_sock *)socket_ptr[4]; // Offset structure resolution inside Linux sockets
     
-    if (sk) {
-        old_data_ready = sk->sk_data_ready;
-        sk->sk_data_ready = hfr_data_ready;
-        kpm_info("Asynchronous socket event injection completed successfully!\n");
-    }
-    
+    kpm_info("Abstract Memory socket bound successfully!\n");
     return 0;
 }
 
@@ -255,37 +254,41 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_kernel_accept = (kernel_accept_t)kallsyms_lookup_name("kernel_accept");
     p_sock_sendmsg = (sock_sendmsg_t)kallsyms_lookup_name("sock_sendmsg");
     p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
+    p_kernel_thread = (kernel_thread_t)kallsyms_lookup_name("kernel_thread");
     
     p_rcu_lock = (rcu_read_lock_t)kallsyms_lookup_name("rcu_read_lock");
     p_rcu_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("rcu_read_unlock");
+    p_msleep = (msleep_t)kallsyms_lookup_name("msleep");
     
-    if (!p_vm || !p_find || !p_malloc || !p_sock_create || !p_kernel_bind || !p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg) {
+    if (!p_vm || !p_find || !p_malloc || !p_sock_create || !p_kernel_bind || !p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg || !p_kernel_thread) {
         kpm_err("Core symbol resolution failed\n");
         return -EFAULT;
     }
     
-    if (start_socket_server() < 0) { kpm_err("Socket server configuration failed\n"); return -EFAULT; }
+    if (start_socket_server() < 0) { kpm_err("Socket server initialization failed\n"); return -EFAULT; }
     
     server_running = 1;
-    kpm_info("Asynchronous engine locked in framework memory layout\n");
+    thread_pid = p_kernel_thread(socket_server_worker, NULL, 0);
+    if (thread_pid < 0) {
+        kpm_err("Failed to spawn background thread loop\n");
+        server_running = 0;
+        if (listen_sock) { p_sock_release(listen_sock); listen_sock = NULL; }
+        return -EFAULT;
+    }
+
+    kpm_info("Module stabilized flawlessly\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
     server_running = 0;
-    
-    // Restore original network subsystem socket configurations before cleanup frame routines
-    if (listen_sock) {
-        void **socket_ptr = (void **)listen_sock;
-        struct my_sock *sk = (struct my_sock *)socket_ptr[4];
-        if (sk && old_data_ready) {
-            sk->sk_data_ready = old_data_ready;
-        }
+    if (listen_sock) { 
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
     }
-    kpm_info("Unloaded and unhooked safely!\n");
+    if (p_msleep) p_msleep(50); 
+    kpm_info("Unloaded safely!\n");
     return 0;
 }
 
