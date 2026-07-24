@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Production");
+KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Final Fix");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -31,12 +31,11 @@ KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Productio
 
 #define AF_UNIX 1
 #define SOCK_STREAM 1
-#define MSG_DONTWAIT 0x40
+#define O_NONBLOCK 00004000 // Octal for non-blocking flags inside kernel sockets
 
-// FIX 1: Exact layout boundary alignment matching POSIX expectations explicitly
 struct sockaddr_un {
     unsigned short sun_family;
-    char sun_path[108];
+    char sun_path[108]; // Restored safe boundary size explicitly
 } __attribute__((packed));
 
 struct iovec {
@@ -188,14 +187,15 @@ static int socket_server_worker(void *data)
     int ret;
 
     while (server_running) {
-        // FIX 2: Clear client registration reference structure explicitly inside each cycle run
         client_sock = NULL;
-        ret = p_kernel_accept(listen_sock, &client_sock, 0);
+        // FIX: Added O_NONBLOCK flag parameter so kernel execution layout does not sleep infinitely
+        ret = p_kernel_accept(listen_sock, &client_sock, O_NONBLOCK);
         if (ret < 0) {
-            if (server_running && p_msleep) p_msleep(10); 
+            if (server_running && p_msleep) p_msleep(20); // Balanced scheduling window
             continue;
         }
         if (client_sock) {
+            kpm_info("Processing inbound user-space payload...\n");
             handle_client(client_sock);
         }
     }
@@ -213,7 +213,7 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    // FIX 3: Index mapping structure strictly defined to avoid char pointer confusion
+    // Explicit clean setup for abstract namespace array indices
     addr.sun_path[0] = '\0'; 
     addr.sun_path[1] = 'h'; addr.sun_path[2] = 'f'; addr.sun_path[3] = 'r';
     addr.sun_path[4] = '_'; addr.sun_path[5] = 'm'; addr.sun_path[6] = 'e';
@@ -237,7 +237,7 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    kpm_info("Abstract Memory socket stabilized successfully!\n");
+    kpm_info("Abstract Memory socket bound successfully!\n");
     return 0;
 }
 
