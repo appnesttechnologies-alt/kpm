@@ -1,35 +1,49 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * self_mem_kpm.c
+ *
+ * A minimal KPM demonstrating a userspace <-> kernel module proc interface.
+ * The module exposes ONLY its own internal buffer for read/write via a
+ * proc file. There is no PID targeting, no access_process_vm, and no
+ * cross-process memory access of any kind.
+ *
+ * Purpose: learn the proc_ops + copy_from_user/copy_to_user mechanics
+ * safely, without touching memory you don't own.
+ */
 
 #include <compiler.h>
 #include <hook.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
 
-KPM_NAME("hosts_file_redirect");
-KPM_VERSION(HFR_VERSION);
+KPM_NAME("self_mem_kpm");
+KPM_VERSION("1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Volatile Proc Engine");
+KPM_DESCRIPTION("Safe self-contained proc interface: read/write module's own memory only");
 
-#define KPM_PREFIX "HFR_MEM"
+#define KPM_PREFIX "SELF_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)  pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-#define GFP_KERNEL 0xcc0
-#define MAX_INLINE 256
-#define OP_READ_VM  0x2000
-#define OP_WRITE_VM 0x3000
+#define MAX_INLINE     256
+#define SELF_BUF_SIZE  4096
 
-#define STATUS_SUCCESS       0x0000
-#define STATUS_INVALID_PID   0x1001
-#define STATUS_PAGE_FAULT    0x1004
-#define STATUS_INVALID_SIZE  0x1005
-#define STATUS_MEM_ALLOC_FAIL 0x1008
+#define OP_READ_SELF   0x2000
+#define OP_WRITE_SELF  0x3000
 
+#define STATUS_SUCCESS        0x0000
+#define STATUS_INVALID_SIZE   0x1005
+#define STATUS_OUT_OF_RANGE   0x1006
+#define STATUS_BAD_OPCODE     0x1007
+
+/* ---- proc_ops layout must match this kernel's include/linux/proc_fs.h ----
+ * Verify field order against your target kernel version before building.
+ * Kernels >= 5.6 use proc_ops; older kernels use file_operations instead.
+ */
 struct file { void *private_data; };
 
 struct proc_ops {
@@ -44,103 +58,71 @@ struct proc_ops {
 
 struct k_packet {
     uint32_t op_code;
-    uint32_t target_pid;
-    uint64_t target_addr;
+    uint32_t target_offset;   /* offset into self_buffer, NOT a raw address */
     uint32_t size;
     uint32_t status;
-    uint8_t inline_data[MAX_INLINE];
+    uint8_t  inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
-
-typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
-typedef void *(*find_task_by_vpid_t)(int);
-typedef void *(*get_task_struct_t)(void *);
-typedef void (*put_task_struct_t)(void *);
-typedef void *(*kmalloc_t)(unsigned long, unsigned int);
-typedef void (*kfree_t)(const void *);
 
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void (*remove_proc_entry_t)(const char *, void *);
+typedef unsigned long (*copy_from_user_t)(void *to, const void __user *from, unsigned long n);
+typedef unsigned long (*copy_to_user_t)(void __user *to, const void *from, unsigned long n);
 
-static access_process_vm_t p_vm;
-static find_task_by_vpid_t  p_find;
-static get_task_struct_t    p_get;
-static put_task_struct_t    p_put;
-static kmalloc_t            p_malloc;
-static kfree_t              p_free;
 static proc_create_data_t   p_proc_create_data;
 static remove_proc_entry_t  p_remove_proc_entry;
+static copy_from_user_t     p_copy_from_user;
+static copy_to_user_t       p_copy_to_user;
 
-typedef void (*rcu_read_lock_t)(void);
-typedef void (*rcu_read_unlock_t)(void);
-static rcu_read_lock_t   p_rcu_lock;
-static rcu_read_unlock_t p_rcu_unlock;
-
-static const char *proc_filename = "hfr_mem";
+static const char *proc_filename = "self_mem_kpm";
 static void *proc_entry = NULL;
 
-// MASTER FIX 1: Enforcing absolute volatile boundaries to block Clang from generating implicit 'memcpy' calls
-__attribute__((optimize("no-tree-loop-distribute-patterns")))
-static void strict_cp(void *d, const void *s, unsigned long n) {
-    volatile unsigned char *dd = (volatile unsigned char *)d; 
-    const volatile unsigned char *ss = (const volatile unsigned char *)s;
-    unsigned long i;
-    for (i = 0; i < n; i++) {
-        dd[i] = ss[i];
-    }
-}
+/* The module's own memory. This is the ONLY memory this module ever touches. */
+static uint8_t self_buffer[SELF_BUF_SIZE];
 
 static void process_packet(struct k_packet *pkt)
 {
-    pkt->status = STATUS_INVALID_PID;
-    if (pkt->op_code == OP_READ_VM) {
-        if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
-        void *kbuf = p_malloc(pkt->size, GFP_KERNEL);
-        if (!kbuf) { pkt->status = STATUS_MEM_ALLOC_FAIL; return; }
-        
-        if (p_rcu_lock) p_rcu_lock();
-        void *task = p_find(pkt->target_pid);
-        if (!task) { if (p_rcu_unlock) p_rcu_unlock(); p_free(kbuf); return; }
-        p_get(task);
-        if (p_rcu_unlock) p_rcu_unlock();
-        
-        int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
-        p_put(task);
-        
-        if (r == pkt->size) {
-            strict_cp(pkt->inline_data, kbuf, pkt->size);
-            pkt->status = STATUS_SUCCESS;
-        }
-        else pkt->status = STATUS_PAGE_FAULT;
-        p_free(kbuf);
+    if (pkt->op_code != OP_READ_SELF && pkt->op_code != OP_WRITE_SELF) {
+        pkt->status = STATUS_BAD_OPCODE;
+        return;
     }
-    else if (pkt->op_code == OP_WRITE_VM) {
-        if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
-        
-        if (p_rcu_lock) p_rcu_lock();
-        void *task = p_find(pkt->target_pid);
-        if (!task) { if (p_rcu_unlock) p_rcu_unlock(); return; }
-        p_get(task);
-        if (p_rcu_unlock) p_rcu_unlock();
-        
-        int r = p_vm(task, pkt->target_addr, pkt->inline_data, pkt->size, 1);
-        p_put(task);
-        pkt->status = (r == pkt->size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
+
+    if (!pkt->size || pkt->size > MAX_INLINE) {
+        pkt->status = STATUS_INVALID_SIZE;
+        return;
+    }
+
+    /* Bounds check against our own buffer - reject anything out of range */
+    if ((uint64_t)pkt->target_offset + pkt->size > SELF_BUF_SIZE) {
+        pkt->status = STATUS_OUT_OF_RANGE;
+        return;
+    }
+
+    if (pkt->op_code == OP_READ_SELF) {
+        memcpy(pkt->inline_data, self_buffer + pkt->target_offset, pkt->size);
+        pkt->status = STATUS_SUCCESS;
+    } else { /* OP_WRITE_SELF */
+        memcpy(self_buffer + pkt->target_offset, pkt->inline_data, pkt->size);
+        pkt->status = STATUS_SUCCESS;
     }
 }
 
-__attribute__((optimize("no-tree-loop-distribute-patterns")))
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
 
-    if (count < sizeof(struct k_packet)) return -EINVAL;
+    if (count < sizeof(struct k_packet))
+        return -EINVAL;
 
-    // Strict non-optimized loop copy execution
-    strict_cp(&local_pkt, (const void *)buffer, sizeof(struct k_packet));
+    /* Proper user-copy in: never dereference __user pointers directly */
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
+        return -EFAULT;
 
     process_packet(&local_pkt);
 
-    strict_cp((void *)buffer, &local_pkt, sizeof(struct k_packet));
+    /* Proper user-copy out */
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)))
+        return -EFAULT;
 
     return count;
 }
@@ -154,44 +136,43 @@ static const struct proc_ops p_ops = {
     .proc_release = NULL,
 };
 
-static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
+static long self_mem_init(const char *args, const char *event, void __user *reserved)
 {
-    p_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
-    p_find = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
-    p_get = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
-    p_put = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    p_malloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
-    p_free = (kfree_t)kallsyms_lookup_name("kfree");
-    
-    p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
+    p_proc_create_data  = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
-    
-    p_rcu_lock = (rcu_read_lock_t)kallsyms_lookup_name("rcu_read_lock");
-    p_rcu_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("rcu_read_unlock");
-    
-    if (!p_vm || !p_find || !p_malloc || !p_proc_create_data) {
-        kpm_err("Core symbol resolution failed\n");
+    p_copy_from_user    = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    p_copy_to_user      = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+
+    if (!p_proc_create_data || !p_remove_proc_entry) {
+        kpm_err("Failed to resolve proc_fs symbols\n");
         return -EFAULT;
     }
-    
-    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
-    if (!proc_entry) {
-        kpm_err("Proc registration node failure.\n");
+    if (!p_copy_from_user || !p_copy_to_user) {
+        kpm_err("Failed to resolve user-copy symbols\n");
         return -EFAULT;
     }
 
-    kpm_info("Proc Synchronous Bridge initialized safely without implicit optimizations!\n");
+    memset(self_buffer, 0, SELF_BUF_SIZE);
+
+    /* 0660: owner/group only, not world-writable */
+    proc_entry = p_proc_create_data(proc_filename, 0660, NULL, &p_ops, NULL);
+    if (!proc_entry) {
+        kpm_err("Proc registration failed\n");
+        return -EFAULT;
+    }
+
+    kpm_info("Initialized. Proc file: /proc/%s\n", proc_filename);
     return 0;
 }
 
-static long hfr_memory_exit(void __user *reserved)
+static long self_mem_exit(void __user *reserved)
 {
     if (proc_entry && p_remove_proc_entry) {
         p_remove_proc_entry(proc_filename, NULL);
     }
-    kpm_info("Proc pipeline unlinked safely!\n");
+    kpm_info("Unloaded, proc entry removed.\n");
     return 0;
 }
 
-KPM_INIT(hfr_memory_init);
-KPM_EXIT(hfr_memory_exit);
+KPM_INIT(self_mem_init);
+KPM_EXIT(self_mem_exit);
