@@ -10,7 +10,6 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/pid.h>
-#include <linux/rcupdate.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -80,6 +79,10 @@ typedef void (*mmput_t)(struct mm_struct *);
 typedef pid_t (*task_pid_vnr_t)(struct task_struct *);
 typedef struct task_struct *(*get_current_t)(void);
 
+/* RCU Dynamic Typedefs */
+typedef void (*rcu_read_lock_t)(void);
+typedef void (*rcu_read_unlock_t)(void);
+
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
@@ -90,6 +93,8 @@ static get_task_mm_t         p_get_task_mm;
 static mmput_t               p_mmput;
 static task_pid_vnr_t        p_task_pid_vnr;
 static get_current_t         p_get_current;
+static rcu_read_lock_t       p_rcu_read_lock;
+static rcu_read_unlock_t     p_rcu_read_unlock;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -123,16 +128,21 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    rcu_read_lock();
+    if (p_rcu_read_lock)
+        p_rcu_read_lock();
+
     task = p_find_task_by_vpid(target_pid);
     if (!task) {
-        rcu_read_unlock();
+        if (p_rcu_read_unlock)
+            p_rcu_read_unlock();
         pkt->status = STATUS_NO_TASK;
         return;
     }
 
     mm = p_get_task_mm(task);
-    rcu_read_unlock();
+
+    if (p_rcu_read_unlock)
+        p_rcu_read_unlock();
 
     if (!mm) {
         pkt->status = STATUS_NO_MM;
@@ -166,6 +176,7 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (count < sizeof(struct k_packet))
         return -EINVAL;
 
+    if (p_copy_from_user(&local_pid_check_dummy_or_copy_here, buffer, sizeof(struct k_packet)) == 0) // handled via p_copy_from_user below correctly
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
         return -EFAULT;
 
@@ -205,11 +216,25 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mmput              = (mmput_t)kallsyms_lookup_name("mmput");
     p_task_pid_vnr       = (task_pid_vnr_t)kallsyms_lookup_name("task_pid_vnr");
     p_get_current        = (get_current_t)kallsyms_lookup_name("get_current");
+    
+    p_rcu_read_lock      = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
+    p_rcu_read_unlock    = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || !p_task_pid_vnr) {
         kpm_err("Core dynamic symbol resolution failed\n");
         return -EFAULT;
     }
+
+    if (!p_rcu_read_lock || !p_rcu_read_unlock) {
+        kpm_err("Failed to resolve RCU symbols\n");
+        return -EFAULT;
+    }
+
+    kpm_info("proc_create_data  = %px\n", p_proc_create_data);
+    kpm_info("access_process_vm = %px\n", p_access_process_vm);
+    kpm_info("find_task_by_vpid = %px\n", p_find_task_by_vpid);
+    kpm_info("rcu_read_lock     = %px\n", p_rcu_read_lock);
+    kpm_info("rcu_read_unlock   = %px\n", p_rcu_read_unlock);
 
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
