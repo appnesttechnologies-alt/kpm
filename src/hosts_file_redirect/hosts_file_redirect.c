@@ -68,18 +68,17 @@ struct proc_ops {
                                             unsigned long);
 };
 
-/* Function Typedefs for KPM Dynamic Resolution */
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
 typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
 
-/* Exact signatures fetched from your full kernel source */
 typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
 typedef pid_t (*task_pid_vnr_t)(struct task_struct *);
+typedef struct task_struct *(*get_current_t)(void);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -90,6 +89,7 @@ static find_task_by_vpid_t   p_find_task_by_vpid;
 static get_task_mm_t         p_get_task_mm;
 static mmput_t               p_mmput;
 static task_pid_vnr_t        p_task_pid_vnr;
+static get_current_t         p_get_current;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -161,6 +161,7 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
 {
     struct k_packet local_pkt;
     pid_t           caller_pid;
+    struct task_struct *curr_task;
 
     if (count < sizeof(struct k_packet))
         return -EINVAL;
@@ -168,7 +169,11 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
         return -EFAULT;
 
-    caller_pid = p_task_pid_vnr(current);
+    curr_task = p_get_current ? p_get_current() : NULL;
+    if (!curr_task)
+        return -ESRCH;
+
+    caller_pid = p_task_pid_vnr(curr_task);
 
     process_packet(&local_pkt, caller_pid);
 
@@ -194,12 +199,12 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_copy_from_user     = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
     p_copy_to_user       = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
     
-    /* Dynamically resolving full kernel source symbols for KPM framework */
     p_access_process_vm  = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find_task_by_vpid  = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get_task_mm        = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
     p_mmput              = (mmput_t)kallsyms_lookup_name("mmput");
     p_task_pid_vnr       = (task_pid_vnr_t)kallsyms_lookup_name("task_pid_vnr");
+    p_get_current        = (get_current_t)kallsyms_lookup_name("get_current");
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || !p_task_pid_vnr) {
         kpm_err("Core dynamic symbol resolution failed\n");
