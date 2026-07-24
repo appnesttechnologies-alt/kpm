@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Master Fix");
+KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Master Verified");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -32,6 +32,7 @@ KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Master Fi
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 
+// MASTER FIX 1: Explicitly defining full standard size mapping to align with user-space memory layout
 struct sockaddr_un {
     unsigned short sun_family;
     char sun_path[108]; 
@@ -149,29 +150,16 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
-// Thread loop function
-static int socket_server_worker(void *data)
+static void handle_client(void *client_sock)
 {
-    void *client_sock = NULL;
     struct k_packet pkt;
     struct iovec iov;
     struct msghdr msg;
     int ret;
 
-    kpm_info("Worker execution cycle engaged securely.\n");
+    kpm_info("Processing inbound user-space payload dynamic transfer...\n");
 
     while (server_running) {
-        client_sock = NULL;
-        // PURE BLOCKING MODE: scheduling synchronization handles thread awake triggers perfectly
-        ret = p_kernel_accept(listen_sock, &client_sock, 0);
-        if (ret < 0 || !client_sock) {
-            if (p_msleep) p_msleep(10);
-            continue;
-        }
-
-        kpm_info("Client payload channel connected successfully!\n");
-
-        // Single cycle payload execution block without sub-loop lockups
         cz(&pkt, sizeof(pkt));
         cz(&iov, sizeof(iov));
         cz(&msg, sizeof(msg));
@@ -182,17 +170,35 @@ static int socket_server_worker(void *data)
         msg.msg_iovlen = 1;
 
         ret = p_sock_recvmsg(client_sock, &msg, 0); 
-        if (ret > 0) {
-            process_packet(&pkt);
+        if (ret <= 0) break; 
 
-            iov.iov_base = &pkt;
-            iov.iov_len = sizeof(pkt);
-            msg.msg_iov = &iov;
-            msg.msg_iovlen = 1;
-            p_sock_sendmsg(client_sock, &msg); 
+        process_packet(&pkt);
+
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        p_sock_sendmsg(client_sock, &msg); 
+    }
+    p_sock_release(client_sock);
+}
+
+static int socket_server_worker(void *data)
+{
+    void *client_sock = NULL;
+    int ret;
+
+    while (server_running) {
+        client_sock = NULL;
+        // Standard blocking state allows proper kernel context awake routines
+        ret = p_kernel_accept(listen_sock, &client_sock, 0);
+        if (ret < 0) {
+            if (server_running && p_msleep) p_msleep(20); 
+            continue;
         }
-        
-        p_sock_release(client_sock);
+        if (client_sock) {
+            handle_client(client_sock);
+        }
     }
     return 0;
 }
@@ -208,13 +214,14 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    // Exact matching sequence index boundary
+    // MASTER FIX 2: Correct multi-character array literal mappings matching POSIX bounds
     addr.sun_path[0] = '\0'; 
     addr.sun_path[1] = 'h'; addr.sun_path[2] = 'f'; addr.sun_path[3] = 'r';
     addr.sun_path[4] = '_'; addr.sun_path[5] = 'm'; addr.sun_path[6] = 'e';
     addr.sun_path[7] = 'm'; addr.sun_path[8] = '\0';
 
-    int un_len = sizeof(short) + 1 + 7;
+    // MASTER FIX 3: Correct standard length parameter layout calculation formula
+    int un_len = sizeof(addr.sun_family) + 1 + 7;
     
     ret = p_kernel_bind(listen_sock, &addr, un_len);
     if (ret < 0) { 
