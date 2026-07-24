@@ -19,7 +19,7 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
 KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
 
-//#define HFR_DEBUG  // UNCOMMENT FOR DEBUG, COMMENT FOR STEALTH
+#define HFR_DEBUG  // UNCOMMENT FOR DEBUG, COMMENT FOR STEALTH
 #ifdef HFR_DEBUG
 #define kpm_info(fmt, ...) pr_info("HFR: " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)  pr_err("HFR: " fmt, ##__VA_ARGS__)
