@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Verified Proc Create Engine");
+KPM_DESCRIPTION("Kernel memory r/w via Verified Proc Engine Production");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -32,7 +32,7 @@ KPM_DESCRIPTION("Kernel memory r/w via Verified Proc Create Engine");
 
 struct file { void *private_data; };
 
-// Strict standard modern GKI struct layout for proc handlers
+// Modern standard structure configuration matching exact GKI criteria layouts
 struct proc_ops {
     unsigned int proc_flags;
     int (*proc_open)(struct inode *, struct file *);
@@ -59,7 +59,6 @@ typedef void (*put_task_struct_t)(void *);
 typedef void *(*kmalloc_t)(unsigned long, unsigned int);
 typedef void (*kfree_t)(const void *);
 
-// Exact verified native signatures matching your /proc/kallsyms log frame
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void (*remove_proc_entry_t)(const char *, void *);
 
@@ -80,11 +79,6 @@ static rcu_read_unlock_t p_rcu_unlock;
 static const char *proc_filename = "hfr_mem";
 static void *proc_entry = NULL;
 
-static void cp(void *d, const void *s, unsigned long n) {
-    unsigned char *dd = d; const unsigned char *ss = s;
-    for (unsigned long i = 0; i < n; i++) dd[i] = ss[i];
-}
-
 static void process_packet(struct k_packet *pkt)
 {
     pkt->status = STATUS_INVALID_PID;
@@ -102,7 +96,13 @@ static void process_packet(struct k_packet *pkt)
         int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
         p_put(task);
         
-        if (r == pkt->size) { cp(pkt->inline_data, kbuf, pkt->size); pkt->status = STATUS_SUCCESS; }
+        if (r == pkt->size) {
+            // FIX: Manual safe loop copy block to bypass hidden compiler 'memcpy' expansions completely
+            unsigned char *d = (unsigned char *)pkt->inline_data;
+            const unsigned char *s = (const unsigned char *)kbuf;
+            for (uint32_t i = 0; i < pkt->size; i++) d[i] = s[i];
+            pkt->status = STATUS_SUCCESS;
+        }
         else pkt->status = STATUS_PAGE_FAULT;
         p_free(kbuf);
     }
@@ -121,21 +121,29 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
-// Synchronous Transaction Interface Pipeline Handler via write pipeline
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
+    unsigned char *dest;
+    const unsigned char *src;
 
     if (count < sizeof(struct k_packet)) return -EINVAL;
 
-    // Secure copy frame array mapping directly
-    cp(&local_pkt, (const void *)buffer, sizeof(struct k_packet));
+    // FIX 2: Byte-by-byte direct incremental transfer mapping loop to avoid memory overlap dependencies
+    dest = (unsigned char *)&local_pkt;
+    src = (const unsigned char *)buffer;
+    for (unsigned long i = 0; i < sizeof(struct k_packet); i++) {
+        dest[i] = src[i];
+    }
 
-    // Execute reading / writing routine block instantly
     process_packet(&local_pkt);
 
-    // Swap modified packet frame back directly onto the user-space boundary context buffer
-    cp((void *)buffer, &local_pkt, sizeof(struct k_packet));
+    // Feed back frame blocks transaction layers
+    dest = (unsigned char *)buffer;
+    src = (const unsigned char *)&local_pkt;
+    for (unsigned long i = 0; i < sizeof(struct k_packet); i++) {
+        dest[i] = src[i];
+    }
 
     return count;
 }
@@ -158,7 +166,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_malloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     p_free = (kfree_t)kallsyms_lookup_name("kfree");
     
-    // Exact matching lookups verified from your kallsyms environment frame sequence
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     
@@ -170,14 +177,13 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
     
-    // Inject node registration frame directly inside /proc scope table
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
         kpm_err("Proc registration node failure.\n");
         return -EFAULT;
     }
 
-    kpm_info("Proc Synchronous Bridge initialized successfully!\n");
+    kpm_info("Proc Synchronous Bridge operational successfully!\n");
     return 0;
 }
 
