@@ -220,25 +220,28 @@ static int start_socket_server(void)
     int ret;
     
     ret = p_sock_create(AF_UNIX, SOCK_STREAM, 0, &listen_sock);
-    if (ret < 0 || !listen_sock) return ret;
+    if (ret < 0 || !listen_sock) {
+        kpm_err("sock_create failed with error: %d\n", ret);
+        return ret;
+    }
     
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    addr.sun_path = '\0';
-    addr.sun_path = 'h';
-    addr.sun_path = 'f';
-    addr.sun_path = 'r';
-    addr.sun_path = '_';
-    addr.sun_path = 'm';
-    addr.sun_path = 'e';
-    addr.sun_path = 'm';
-    addr.sun_path = '\0';
+    addr.sun_path[0] = '\0';
+    addr.sun_path[1] = 'h';
+    addr.sun_path[2] = 'f';
+    addr.sun_path[3] = 'r';
+    addr.sun_path[4] = '_';
+    addr.sun_path[5] = 'm';
+    addr.sun_path[6] = 'e';
+    addr.sun_path[7] = 'm';
 
     int un_len = 2 + 1 + 7;
     
     ret = p_kernel_bind(listen_sock, &addr, un_len);
     if (ret < 0) { 
+        kpm_err("kernel_bind failed with error: %d\n", ret);
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
         return ret; 
@@ -246,12 +249,96 @@ static int start_socket_server(void)
     
     ret = p_kernel_listen(listen_sock, 5);
     if (ret < 0) { 
+        kpm_err("kernel_listen failed with error: %d\n", ret);
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
         return ret; 
     }
     return 0;
 }
+
+static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
+{
+    void *client_sock = NULL;
+    int ret;
+
+    p_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
+    p_find = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
+    p_get = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
+    p_put = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
+    p_malloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
+    p_free = (kfree_t)kallsyms_lookup_name("kfree");
+    p_sock_create = (sock_create_t)kallsyms_lookup_name("sock_create");
+    p_sock_release = (sock_release_t)kallsyms_lookup_name("sock_release");
+    p_kernel_bind = (kernel_bind_t)kallsyms_lookup_name("kernel_bind");
+    p_kernel_listen = (kernel_listen_t)kallsyms_lookup_name("kernel_listen");
+    p_kernel_accept = (kernel_accept_t)kallsyms_lookup_name("kernel_accept");
+    p_sock_sendmsg = (sock_sendmsg_t)kallsyms_lookup_name("sock_sendmsg");
+    p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
+    
+    if (!p_vm || !p_find || !p_malloc) { kpm_err("Symbol resolution group 1 failed\n"); return -EFAULT; }
+    if (!p_sock_create || !p_sock_release || !p_kernel_bind) { kpm_err("Symbol resolution group 2 failed\n"); return -EFAULT; }
+    if (!p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg) { kpm_err("Symbol resolution group 3 failed\n"); return -EFAULT; }
+    
+    ret = start_socket_server();
+    if (ret < 0) {
+        kpm_err("start_socket_server wrapper failed with code: %d\n", ret);
+        return -EFAULT;
+    }
+    
+    kpm_info("Server configuration complete. Allocating client container...\n");
+    
+    ret = p_sock_create(AF_UNIX, SOCK_STREAM, 0, &client_sock);
+    if (ret < 0) {
+        kpm_err("Client sock_create failed with error: %d\n", ret);
+        p_sock_release(listen_sock);
+        return -EFAULT;
+    }
+
+    kpm_info("Entering blocking kernel_accept. Waiting for userspace...\n");
+    ret = p_kernel_accept(listen_sock, &client_sock, 0);
+    if (ret < 0) {
+        kpm_err("kernel_accept handshaking dropped with error: %d\n", ret);
+        p_sock_release(client_sock);
+        p_sock_release(listen_sock);
+        return -EFAULT;
+    }
+    
+    kpm_info("Client linked completely! Starting communication...\n");
+
+    while (1) {
+        struct k_packet pkt;
+        struct iovec iov;
+        struct msghdr msg;
+
+        cz(&pkt, sizeof(pkt));
+        cz(&msg, sizeof(msg));
+        cz(&iov, sizeof(iov));
+
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        ret = p_sock_recvmsg(client_sock, &msg, 0);
+        if (ret <= 0) break; 
+
+        process_packet(&pkt);
+
+        cz(&msg, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        ret = p_sock_sendmsg(client_sock, &msg);
+        if (ret < 0) break;
+    }
+
+    if (client_sock) p_sock_release(client_sock);
+    if (listen_sock) p_sock_release(listen_sock);
+    
+    kpm_info("Session finished cleanly.\n");
+    return 0;
+}
+
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
