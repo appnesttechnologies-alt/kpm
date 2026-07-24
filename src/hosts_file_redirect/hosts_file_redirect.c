@@ -188,17 +188,17 @@ static int hfr_socket_worker(void *data)
 {
     void *client_sock = NULL;
     int ret;
-    kpm_info("Asynchronous I/O Server Subsystem Engaged.\n");
 
     while (!p_kthread_should_stop() && server_running) {
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
             /* 
-             * FIX: Use the native scheduler timeout available in <linux/sched.h>
-             * This tells the CPU to sleep for 2 jiffies when the queue is empty,
-             * allowing the userspace connect() request to break through.
+             * FIX: Force safe thread state transitions using pure primitives.
+             * This explicitly yields the CPU execution frames to the primary 
+             * scheduler tree without depending on unexported wrapper symbols.
              */
-            schedule_timeout_interruptible(2);
+            set_current_state(TASK_INTERRUPTIBLE);
+            schedule();
             continue;
         }
 
