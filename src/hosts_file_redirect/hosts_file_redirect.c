@@ -9,10 +9,10 @@
 #include <linux/string.h>
 
 KPM_NAME("hosts_file_redirect");
-KPM_VERSION("2.0_PRO");
+KPM_VERSION("2.1_PRO");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Professional High-Performance Cross-Process Physical Memory Engine");
+KPM_DESCRIPTION("Professional Event-Driven Cross-Process Memory Engine");
 
 #define KPM_PREFIX "HFR_PRO"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -23,8 +23,6 @@ KPM_DESCRIPTION("Professional High-Performance Cross-Process Physical Memory Eng
 
 #define OP_READ_VM            0x2000
 #define OP_WRITE_VM           0x3000
-#define OP_VIRT_TO_PHYS       0x4000
-#define OP_FORCE_PHYS_WRITE   0x5000
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_PID    0x1001
@@ -80,12 +78,6 @@ typedef int (*kernel_accept_t)(void *, void **, int);
 typedef int (*sock_sendmsg_t)(void *, struct msghdr *);
 typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
 
-typedef struct task_struct *(*kthread_create_on_node_t)(int (*threadfn)(void *data), void *data, int node, const char namefmt[], ...);
-typedef int (*kthread_stop_t)(struct task_struct *k);
-typedef int (*kthread_should_stop_t)(void);
-typedef int (*wake_up_process_t)(struct task_struct *p);
-
-/* FIX: Dropped risky unresolved macro external headers hooks definitions */
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
 static get_task_struct_t    p_get;
@@ -100,14 +92,7 @@ static kernel_accept_t      p_kernel_accept;
 static sock_sendmsg_t       p_sock_sendmsg;
 static sock_recvmsg_t       p_sock_recvmsg;
 
-static kthread_create_on_node_t p_kthread_create;
-static kthread_stop_t           p_kthread_stop;
-static kthread_should_stop_t    p_kthread_should_stop;
-static wake_up_process_t        p_wake_up_process;
-
 static void *listen_sock = NULL;
-static struct task_struct *worker_thread = NULL;
-static int server_running = 0;
 
 static void cp(void *d, const void *s, unsigned long n) {
     unsigned char *dd = d; const unsigned char *ss = s;
@@ -119,132 +104,90 @@ static void cz(void *d, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) dd[i] = 0;
 }
 
-/* Professional Dual-Layer Packet Processing Subsystem */
 static void process_packet(struct k_packet *pkt)
 {
     pkt->status = STATUS_INVALID_PID;
-    
     if (!pkt->size || pkt->size > MAX_INLINE) { 
         pkt->status = STATUS_INVALID_SIZE; 
         return; 
     }
 
     void *task = p_find(pkt->target_pid);
-    if (!task) {
-        pkt->status = STATUS_INVALID_PID;
-        return;
-    }
+    if (!task) return;
     p_get(task);
 
-    switch (pkt->op_code) {
-        case OP_READ_VM: {
-            void *kbuf = p_malloc(pkt->size, GFP_KERNEL);
-            if (!kbuf) { 
-                pkt->status = STATUS_MEM_ALLOC_FAIL; 
-                break; 
-            }
-            int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
-            if (r == pkt->size) { 
-                cp(pkt->inline_data, kbuf, pkt->size); 
-                pkt->status = STATUS_SUCCESS; 
-            } else {
-                pkt->status = STATUS_PAGE_FAULT;
-            }
-            p_free(kbuf);
-            break;
+    if (pkt->op_code == OP_READ_VM) {
+        void *kbuf = p_malloc(pkt->size, GFP_KERNEL);
+        if (!kbuf) { 
+            pkt->status = STATUS_MEM_ALLOC_FAIL; 
+            p_put(task);
+            return; 
         }
-
-        case OP_WRITE_VM: {
-            int r = p_vm(task, pkt->target_addr, pkt->inline_data, pkt->size, 1);
-            pkt->status = (r == pkt->size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
-            break;
+        int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
+        if (r == pkt->size) { 
+            cp(pkt->inline_data, kbuf, pkt->size); 
+            pkt->status = STATUS_SUCCESS; 
+        } else {
+            pkt->status = STATUS_PAGE_FAULT;
         }
-
-        case OP_VIRT_TO_PHYS: {
-            /* 
-             * Safety Layer Fix: Since pid_virt_to_phys linkage is missing from core kernel tables,
-             * we track cross-process mappings cleanly via OP_READ_VM fallback pipelines. 
-             * This prevents loader crashes while maintaining cross-process access.
-             */
-            pkt->physical_out = 0;
-            pkt->status = STATUS_NOT_SUPPORTED;
-            break;
-        }
-
-        case OP_FORCE_PHYS_WRITE: {
-            pkt->status = STATUS_NOT_SUPPORTED; 
-            break;
-        }
-
-        default:
-            pkt->status = STATUS_NOT_SUPPORTED;
-            break;
+        p_free(kbuf);
+    } 
+    else if (pkt->op_code == OP_WRITE_VM) {
+        int r = p_vm(task, pkt->target_addr, pkt->inline_data, pkt->size, 1);
+        pkt->status = (r == pkt->size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
     }
 
     p_put(task);
 }
 
-
-static int hfr_socket_worker(void *data)
+/* Event-driven synchronous execution path called on direct user demand */
+int handle_single_connection(void)
 {
     void *client_sock = NULL;
     int ret;
 
-    while (!p_kthread_should_stop() && server_running) {
-        ret = p_kernel_accept(listen_sock, &client_sock, 0);
-        if (ret < 0) {
-            /* 
-             * FIX: Instead of calling macros like set_current_state,
-             * we execute a clean hardware yield instruction combined with 
-             * a simple execution spin. This safely hands CPU control back to 
-             * the OS scheduler without needing any undeclared symbols!
-             */
-            asm volatile("yield" : : : "memory");
-            
-            volatile int spin = 0;
-            for (spin = 0; spin < 100000; spin++) {
-                asm volatile("" : : : "memory"); // Prevents the compiler from optimizing the loop out
-            }
-            continue;
+    // 1. Blocks natively in the network stack until connection arrives (0% CPU)
+    ret = p_kernel_accept(listen_sock, &client_sock, 0);
+    if (ret < 0) return ret;
+
+    kpm_info("Client connected. Starting single transaction processing path.\n");
+
+    // 2. Loop runs strictly while the client remains actively connected
+    while (1) {
+        struct k_packet pkt;
+        struct iovec iov;
+        struct msghdr msg;
+
+        cz(&pkt, sizeof(pkt));
+        cz(&msg, sizeof(msg));
+        cz(&iov, sizeof(iov));
+
+        iov.iov_base = &pkt;
+        iov.iov_len = sizeof(pkt);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+
+        ret = p_sock_recvmsg(client_sock, &msg, 0);
+        if (ret <= 0) {
+            kpm_info("Client disconnected. Breaking transactional engine loop.\n");
+            break; 
         }
 
-        while (!p_kthread_should_stop() && server_running) {
-            struct k_packet pkt;
-            struct iovec iov;
-            struct msghdr msg;
+        process_packet(&pkt);
 
-            cz(&pkt, sizeof(pkt));
-            cz(&msg, sizeof(msg));
-            cz(&iov, sizeof(iov));
+        cz(&msg, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        ret = p_sock_sendmsg(client_sock, &msg);
+        if (ret < 0) break;
+    }
 
-            iov.iov_base = &pkt;
-            iov.iov_len = sizeof(pkt);
-            msg.msg_iov = &iov;
-            msg.msg_iovlen = 1;
-
-            ret = p_sock_recvmsg(client_sock, &msg, 0);
-            if (ret <= 0) break; 
-
-            process_packet(&pkt);
-
-            cz(&msg, sizeof(msg));
-            msg.msg_iov = &iov;
-            msg.msg_iovlen = 1;
-            ret = p_sock_sendmsg(client_sock, &msg);
-            if (ret < 0) break;
-        }
-
-        if (client_sock) {
-            p_sock_release(client_sock);
-            client_sock = NULL;
-        }
+    if (client_sock) {
+        p_sock_release(client_sock);
     }
     return 0;
 }
 
-
-
-            
 static int start_socket_server(void)
 {
     struct sockaddr_un addr;
@@ -300,43 +243,18 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_sock_sendmsg = (sock_sendmsg_t)kallsyms_lookup_name("sock_sendmsg");
     p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
     
-    p_kthread_create = (kthread_create_on_node_t)kallsyms_lookup_name("kthread_create_on_node");
-    p_kthread_stop = (kthread_stop_t)kallsyms_lookup_name("kthread_stop");
-    p_kthread_should_stop = (kthread_should_stop_t)kallsyms_lookup_name("kthread_should_stop");
-    p_wake_up_process = (wake_up_process_t)kallsyms_lookup_name("wake_up_process");
-
     if (!p_vm || !p_find || !p_malloc) return -EFAULT;
     if (!p_sock_create || !p_sock_release || !p_kernel_bind) return -EFAULT;
     if (!p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg) return -EFAULT;
-    if (!p_kthread_create || !p_kthread_stop || !p_kthread_should_stop || !p_wake_up_process) return -EFAULT;
     
     if (start_socket_server() < 0) return -EFAULT;
     
-    server_running = 1;
-    
-    worker_thread = p_kthread_create(hfr_socket_worker, NULL, -1, "kpm_hfr_pro");
-    
-    if (worker_thread && ((unsigned long)worker_thread < (unsigned long)-4095)) {
-        p_wake_up_process(worker_thread);
-    } else {
-        server_running = 0;
-        if (listen_sock) {
-            p_sock_release(listen_sock);
-            listen_sock = NULL;
-        }
-        return -EFAULT;
-    }
-    
+    kpm_info("Event-Driven Server initialized safely.\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    server_running = 0;
-    if (worker_thread) {
-        p_kthread_stop(worker_thread);
-        worker_thread = NULL;
-    }
     if (listen_sock) { 
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
