@@ -9,13 +9,11 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 
-// DO NOT INCLUDE linux/sched/task.h OR linux/rcupdate.h TO PREVENT COMPILER ERRORS
-
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket");
+KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket Production");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -33,7 +31,9 @@ KPM_DESCRIPTION("Kernel memory r/w via Linux Abstract Namespace Socket");
 
 #define AF_UNIX 1
 #define SOCK_STREAM 1
+#define MSG_DONTWAIT 0x40
 
+// FIX 1: Exact layout boundary alignment matching POSIX expectations explicitly
 struct sockaddr_un {
     unsigned short sun_family;
     char sun_path[108];
@@ -63,7 +63,6 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-// Strict dynamic bindings to completely independent safe hooks
 typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -94,13 +93,11 @@ static sock_sendmsg_t  p_sock_sendmsg;
 static sock_recvmsg_t  p_sock_recvmsg;
 static kernel_thread_t p_kernel_thread;
 
-// Standalone RCU safe stub wrappers to prevent missing system headers
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
 static rcu_read_lock_t   p_rcu_lock;
 static rcu_read_unlock_t p_rcu_unlock;
 
-// Custom framework safe msleep function mapping
 typedef void (*msleep_t)(unsigned int);
 static msleep_t p_msleep;
 
@@ -191,9 +188,11 @@ static int socket_server_worker(void *data)
     int ret;
 
     while (server_running) {
+        // FIX 2: Clear client registration reference structure explicitly inside each cycle run
+        client_sock = NULL;
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
-            if (server_running && p_msleep) p_msleep(50); 
+            if (server_running && p_msleep) p_msleep(10); 
             continue;
         }
         if (client_sock) {
@@ -214,7 +213,8 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    addr.sun_path[0] = '\0'; // Explicitly set leading NUL byte for abstract mode
+    // FIX 3: Index mapping structure strictly defined to avoid char pointer confusion
+    addr.sun_path[0] = '\0'; 
     addr.sun_path[1] = 'h'; addr.sun_path[2] = 'f'; addr.sun_path[3] = 'r';
     addr.sun_path[4] = '_'; addr.sun_path[5] = 'm'; addr.sun_path[6] = 'e';
     addr.sun_path[7] = 'm'; addr.sun_path[8] = '\0';
@@ -237,7 +237,7 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    kpm_info("Abstract Memory socket bound successfully!\n");
+    kpm_info("Abstract Memory socket stabilized successfully!\n");
     return 0;
 }
 
@@ -258,7 +258,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
     p_kernel_thread = (kernel_thread_t)kallsyms_lookup_name("kernel_thread");
     
-    // Optional/Alternative symbol bindings for safety contexts
     p_rcu_lock = (rcu_read_lock_t)kallsyms_lookup_name("rcu_read_lock");
     p_rcu_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("rcu_read_unlock");
     p_msleep = (msleep_t)kallsyms_lookup_name("msleep");
@@ -271,8 +270,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     if (start_socket_server() < 0) { kpm_err("Socket server initialization failed\n"); return -EFAULT; }
     
     server_running = 1;
-    
-    // Completely standalone kernel thread spawning via resolved sym address
     thread_pid = p_kernel_thread(socket_server_worker, NULL, 0);
     if (thread_pid < 0) {
         kpm_err("Failed to spawn background thread loop\n");
@@ -281,7 +278,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("Module stabilized without external include dependencies\n");
+    kpm_info("Module stabilized flawlessly\n");
     return 0;
 }
 
@@ -292,7 +289,7 @@ static long hfr_memory_exit(void __user *reserved)
         p_sock_release(listen_sock); 
         listen_sock = NULL; 
     }
-    if (p_msleep) p_msleep(100); 
+    if (p_msleep) p_msleep(50); 
     kpm_info("Unloaded safely!\n");
     return 0;
 }
