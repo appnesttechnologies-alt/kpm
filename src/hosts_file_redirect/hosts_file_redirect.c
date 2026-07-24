@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Volatile Proc Engine");
+KPM_DESCRIPTION("Kernel memory r/w via Safe GKI Proc Engine");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -61,6 +61,10 @@ typedef void (*kfree_t)(const void *);
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void (*remove_proc_entry_t)(const char *, void *);
 
+// Explicit dynamic binding symbols for fully secure memory plane layout context swaps
+typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
+typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
+
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
 static get_task_struct_t    p_get;
@@ -69,6 +73,8 @@ static kmalloc_t            p_malloc;
 static kfree_t              p_free;
 static proc_create_data_t   p_proc_create_data;
 static remove_proc_entry_t  p_remove_proc_entry;
+static copy_from_user_t     p_copy_from_user;
+static copy_to_user_t       p_copy_to_user;
 
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
@@ -77,17 +83,6 @@ static rcu_read_unlock_t p_rcu_unlock;
 
 static const char *proc_filename = "hfr_mem";
 static void *proc_entry = NULL;
-
-// MASTER FIX 1: Enforcing absolute volatile boundaries to block Clang from generating implicit 'memcpy' calls
-__attribute__((optimize("no-tree-loop-distribute-patterns")))
-static void strict_cp(void *d, const void *s, unsigned long n) {
-    volatile unsigned char *dd = (volatile unsigned char *)d; 
-    const volatile unsigned char *ss = (const volatile unsigned char *)s;
-    unsigned long i;
-    for (i = 0; i < n; i++) {
-        dd[i] = ss[i];
-    }
-}
 
 static void process_packet(struct k_packet *pkt)
 {
@@ -107,7 +102,10 @@ static void process_packet(struct k_packet *pkt)
         p_put(task);
         
         if (r == pkt->size) {
-            strict_cp(pkt->inline_data, kbuf, pkt->size);
+            // Internal standard kernel data buffer copy loop (safe memory to memory)
+            unsigned char *d = (unsigned char *)pkt->inline_data;
+            const unsigned char *s = (const unsigned char *)kbuf;
+            for (uint32_t i = 0; i < pkt->size; i++) d[i] = s[i];
             pkt->status = STATUS_SUCCESS;
         }
         else pkt->status = STATUS_PAGE_FAULT;
@@ -128,19 +126,23 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
-__attribute__((optimize("no-tree-loop-distribute-patterns")))
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
 
     if (count < sizeof(struct k_packet)) return -EINVAL;
 
-    // Strict non-optimized loop copy execution
-    strict_cp(&local_pkt, (const void *)buffer, sizeof(struct k_packet));
+    // MASTER FIX: Strictly using architecture safe memory swap channel interface parameters
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+        return -EFAULT;
+    }
 
     process_packet(&local_pkt);
 
-    strict_cp((void *)buffer, &local_pkt, sizeof(struct k_packet));
+    // Push execution outcomes mapping data blocks back to user context cleanly
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+        return -EFAULT;
+    }
 
     return count;
 }
@@ -166,10 +168,14 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     
+    // Core GKI user boundary memory manipulation lookups
+    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+    
     p_rcu_lock = (rcu_read_lock_t)kallsyms_lookup_name("rcu_read_lock");
     p_rcu_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("rcu_read_unlock");
     
-    if (!p_vm || !p_find || !p_malloc || !p_proc_create_data) {
+    if (!p_vm || !p_find || !p_malloc || !p_proc_create_data || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("Core symbol resolution failed\n");
         return -EFAULT;
     }
@@ -180,7 +186,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("Proc Synchronous Bridge initialized safely without implicit optimizations!\n");
+    kpm_info("Proc Engine stabilized flawlessly under GKI memory layout protection constraints!\n");
     return 0;
 }
 
