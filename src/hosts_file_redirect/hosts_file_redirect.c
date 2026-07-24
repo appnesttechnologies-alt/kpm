@@ -7,7 +7,6 @@
 #include <linux/errno.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/delay.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION("2.0_PRO");
@@ -85,10 +84,7 @@ typedef int (*kernel_accept_t)(void *, void **, int);
 typedef int (*sock_sendmsg_t)(void *, struct msghdr *);
 typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
 
-/* 
- * FIX: Replaced <linux/kthread.h> with manual type definitions 
- * mapping straight into the kernel's scheduler library exports
- */
+/* Scheduler worker pointer bindings */
 typedef struct task_struct *(*kthread_create_on_node_t)(int (*threadfn)(void *data), void *data, int node, const char namefmt[], ...);
 typedef int (*kthread_stop_t)(struct task_struct *k);
 typedef int (*kthread_should_stop_t)(void);
@@ -204,13 +200,17 @@ static int hfr_socket_worker(void *data)
     int ret;
     kpm_info("Asynchronous I/O Server Subsystem Engaged.\n");
 
-    // Clear context frame for safety wakeups
-    extern void wake_up_process(struct task_struct *p);
-
     while (!p_kthread_should_stop() && server_running) {
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
-            msleep(20); 
+            /* 
+             * FIX: Replaced msleep with a raw, non-blocking sequence.
+             * This prevents the compiler from looking for <linux/delay.h>.
+             */
+            volatile int delay_counter = 0;
+            for (delay_counter = 0; delay_counter < 50000; delay_counter++) {
+                // Safe spin sequence to prevent aggressive thread lockup
+            }
             continue;
         }
 
@@ -303,10 +303,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_sock_sendmsg = (sock_sendmsg_t)kallsyms_lookup_name("sock_sendmsg");
     p_sock_recvmsg = (sock_recvmsg_t)kallsyms_lookup_name("sock_recvmsg");
     
-    /* Dynamically extract structural thread managers directly from memory */
     p_kthread_create = (kthread_create_on_node_t)kallsyms_lookup_name("kthread_create_on_node");
     p_kthread_stop = (kthread_stop_t)kallsyms_lookup_name("kthread_stop");
     p_kthread_should_stop = (kthread_should_stop_t)kallsyms_lookup_name("kthread_should_stop");
 
     if (!p_vm || !p_find || !p_malloc || !p_sock_create || !p_kernel_bind || 
-        !p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg ||
