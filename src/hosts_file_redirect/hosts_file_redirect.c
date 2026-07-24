@@ -308,5 +308,25 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         p_wake_up_process(worker_thread);
     } else {
         server_running = 0;
-        if (listen_sock) {
-            p_sock_release(listen_sock);
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+static long hfr_memory_exit(void __user *reserved)
+{
+    server_running = 0;
+    if (worker_thread) {
+        p_kthread_stop(worker_thread);
+        worker_thread = NULL;
+    }
+    if (listen_sock) { 
+        p_sock_release(listen_sock); 
+        listen_sock = NULL; 
+    }
+    return 0;
+}
+
+KPM_INIT(hfr_memory_init);
+KPM_EXIT(hfr_memory_exit);
