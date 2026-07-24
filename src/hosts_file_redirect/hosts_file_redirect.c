@@ -178,13 +178,13 @@ static int hfr_socket_worker(void *data)
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
             /* 
-             * FIX: Pure primitive thread suspension layout.
-             * 1 maps directly to TASK_INTERRUPTIBLE register bit flags.
-             * This drops idle thread CPU utilization to exactly 0% cleanly.
+             * FIX: Directly write to the current thread's state variable.
+             * 1 maps perfectly to TASK_INTERRUPTIBLE across all ARM64 kernels.
+             * This bypasses any missing macro declarations completely!
              */
-            __set_current_state(1); 
+            current->state = 1; 
             
-            // Execute the resolved core scheduling primitive
+            // Call the core scheduling function you verified in your headers
             schedule();
             continue;
         }
@@ -222,6 +222,7 @@ static int hfr_socket_worker(void *data)
     }
     return 0;
 }
+
 
 
 static int start_socket_server(void)
