@@ -132,31 +132,66 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
+
+// Force strict alignment attributes to match target Linux ARM64 kernel layouts
+struct sockaddr_un {
+    unsigned short sun_family;
+    char sun_path[108];
+} __attribute__((packed));
+
 static int start_socket_server(void)
 {
     struct sockaddr_un addr;
     int ret;
-    ret = p_sock_create(AF_UNIX, SOCK_STREAM, 0, &listen_sock);
-    if (ret < 0 || !listen_sock) { kpm_err("sock_create failed\n"); return ret; }
     
-    cz(&addr, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    {
-        const char *path = HFR_SOCKET_PATH;
-        int i;
-        for (i = 0; path[i] && i < 107; i++) addr.sun_path[i] = path[i];
-        addr.sun_path[i] = '\0';
+    ret = p_sock_create(AF_UNIX, SOCK_STREAM, 0, &listen_sock);
+    if (ret < 0 || !listen_sock) { 
+        kpm_err("sock_create failed\n"); 
+        return ret; 
     }
     
-    ret = p_kernel_bind(listen_sock, &addr, sizeof(addr));
-    if (ret < 0) { kpm_err("bind failed\n"); p_sock_release(listen_sock); listen_sock = NULL; return ret; }
+    // Clear out the memory footprint strictly
+    cz(&addr, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    
+    // Explicit, guarded sequential byte transfer path tracking
+    const char *path = HFR_SOCKET_PATH; // "/data/local/tmp/hfr_socket"
+    int i = 0;
+    while (path[i] && i < 107) {
+        addr.sun_path[i] = path[i];
+        i++;
+    }
+    addr.sun_path[i] = '\0'; // Seal the normal string path validation boundary
+
+    /* 
+     * CRITICAL FIX: Explicit Length Calculation
+     * Formula: Size of family descriptor field (2 bytes) + character count + 1 NUL byte.
+     * This informs kernel_bind that we are executing a dedicated string sequence.
+     */
+    int un_len = 2 + i + 1;
+    
+    // Execute the binding logic using the exact length parameter
+    ret = p_kernel_bind(listen_sock, &addr, un_len);
+    if (ret < 0) { 
+        kpm_err("bind failed with error code: %d\n", ret); 
+        p_sock_release(listen_sock); 
+        listen_sock = NULL; 
+        return ret; 
+    }
     
     ret = p_kernel_listen(listen_sock, 5);
-    if (ret < 0) { kpm_err("listen failed\n"); p_sock_release(listen_sock); listen_sock = NULL; return ret; }
+    if (ret < 0) { 
+        kpm_err("listen failed\n"); 
+        p_sock_release(listen_sock); 
+        listen_sock = NULL; 
+        return ret; 
+    }
     
-    kpm_info("Socket ready: %s\n", HFR_SOCKET_PATH);
+    kpm_info("Real file system socket node created successfully!\n");
     return 0;
 }
+
+
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
