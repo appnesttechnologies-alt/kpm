@@ -178,13 +178,18 @@ static int hfr_socket_worker(void *data)
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
             /* 
-             * FIX: Directly write to the current thread's state variable.
-             * 1 maps perfectly to TASK_INTERRUPTIBLE across all ARM64 kernels.
-             * This bypasses any missing macro declarations completely!
+             * FIX: Direct assembly yield combined with the core schedule function.
+             * This completely avoids 'current->state' or any missing macros, 
+             * letting the compiler parse the block with 100% success.
              */
-            current->state = 1; 
+            asm volatile("yield" : : : "memory");
             
-            // Call the core scheduling function you verified in your headers
+            volatile int spin = 0;
+            for (spin = 0; spin < 10000; spin++) {
+                asm volatile("" : : : "memory");
+            }
+            
+            // Invoke the core scheduling primitive resolved via kallsyms
             schedule();
             continue;
         }
