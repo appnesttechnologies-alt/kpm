@@ -21,13 +21,11 @@ KPM_DESCRIPTION("Professional High-Performance Cross-Process Physical Memory Eng
 #define GFP_KERNEL            0xcc0
 #define MAX_INLINE            256
 
-/* Professional Protocol Command Matrix */
 #define OP_READ_VM            0x2000
 #define OP_WRITE_VM           0x3000
 #define OP_VIRT_TO_PHYS       0x4000
 #define OP_FORCE_PHYS_WRITE   0x5000
 
-/* Professional Protocol Status Matrix */
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_PID    0x1001
 #define STATUS_PAGE_FAULT     0x1004
@@ -40,7 +38,7 @@ KPM_DESCRIPTION("Professional High-Performance Cross-Process Physical Memory Eng
 
 struct sockaddr_un {
     unsigned short sun_family;
-    char sun_path[108];
+    char sun_path;
 } __attribute__((packed));
 
 struct iovec {
@@ -58,7 +56,6 @@ struct msghdr {
     unsigned int msg_flags;
 };
 
-/* Unified Communications Payload with Alignment Boundary Matching */
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
@@ -69,7 +66,6 @@ struct k_packet {
     uint8_t inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-/* Advanced Core System Dynamic Pointers */
 typedef int  (*access_process_vm_t)(void *, unsigned long, void *, int, int);
 typedef void *(*find_task_by_vpid_t)(int);
 typedef void *(*get_task_struct_t)(void *);
@@ -84,13 +80,11 @@ typedef int (*kernel_accept_t)(void *, void **, int);
 typedef int (*sock_sendmsg_t)(void *, struct msghdr *);
 typedef int (*sock_recvmsg_t)(void *, struct msghdr *, int);
 
-/* Scheduler worker pointer bindings */
 typedef struct task_struct *(*kthread_create_on_node_t)(int (*threadfn)(void *data), void *data, int node, const char namefmt[], ...);
 typedef int (*kthread_stop_t)(struct task_struct *k);
 typedef int (*kthread_should_stop_t)(void);
 typedef int (*wake_up_process_t)(struct task_struct *p);
 
-/* External low-level architectural headers hooks provided by your SDK */
 extern uint64_t *pgtable_entry_kernel(uint64_t va);
 extern phys_addr_t pid_virt_to_phys(pid_t pid, uintptr_t vaddr);
 
@@ -108,7 +102,6 @@ static kernel_accept_t      p_kernel_accept;
 static sock_sendmsg_t       p_sock_sendmsg;
 static sock_recvmsg_t       p_sock_recvmsg;
 
-/* Dynamic Scheduler Worker Handles */
 static kthread_create_on_node_t p_kthread_create;
 static kthread_stop_t           p_kthread_stop;
 static kthread_should_stop_t    p_kthread_should_stop;
@@ -128,18 +121,15 @@ static void cz(void *d, unsigned long n) {
     for (unsigned long i = 0; i < n; i++) dd[i] = 0;
 }
 
-/* Professional Dual-Layer Packet Processing Subsystem */
 static void process_packet(struct k_packet *pkt)
 {
     pkt->status = STATUS_INVALID_PID;
     
-    // Safety Bounds Check
     if (!pkt->size || pkt->size > MAX_INLINE) { 
         pkt->status = STATUS_INVALID_SIZE; 
         return; 
     }
 
-    // Resolve target task structural pointer
     void *task = p_find(pkt->target_pid);
     if (!task) {
         pkt->status = STATUS_INVALID_PID;
@@ -195,19 +185,16 @@ static void process_packet(struct k_packet *pkt)
     p_put(task);
 }
 
-/* Asynchronous Background Client Listener Mechanism */
 static int hfr_socket_worker(void *data)
 {
     void *client_sock = NULL;
     int ret;
-    kpm_info("Asynchronous I/O Server Subsystem Engaged.\n");
 
     while (!p_kthread_should_stop() && server_running) {
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
             volatile int delay_counter = 0;
             for (delay_counter = 0; delay_counter < 50000; delay_counter++) {
-                // Safe spin loop sequence
             }
             continue;
         }
@@ -257,15 +244,15 @@ static int start_socket_server(void)
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    addr.sun_path[0] = '\0';
-    addr.sun_path[1] = 'h';
-    addr.sun_path[2] = 'f';
-    addr.sun_path[3] = 'r';
-    addr.sun_path[4] = '_';
-    addr.sun_path[5] = 'm';
-    addr.sun_path[6] = 'e';
-    addr.sun_path[7] = 'm';
-    addr.sun_path[8] = '\0';
+    addr.sun_path = '\0';
+    addr.sun_path = 'h';
+    addr.sun_path = 'f';
+    addr.sun_path = 'r';
+    addr.sun_path = '_';
+    addr.sun_path = 'm';
+    addr.sun_path = 'e';
+    addr.sun_path = 'm';
+    addr.sun_path = '\0';
 
     int un_len = 2 + 1 + 7;
     
@@ -306,4 +293,22 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_kthread_should_stop = (kthread_should_stop_t)kallsyms_lookup_name("kthread_should_stop");
     p_wake_up_process = (wake_up_process_t)kallsyms_lookup_name("wake_up_process");
 
-    /* FIX: Verified clean sequential conditional validation block */
+    if (!p_vm || !p_find || !p_malloc) return -EFAULT;
+    if (!p_sock_create || !p_sock_release || !p_kernel_bind) return -EFAULT;
+    if (!p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg) return -EFAULT;
+    if (!p_kthread_create || !p_kthread_stop || !p_kthread_should_stop || !p_wake_up_process) return -EFAULT;
+    
+    if (start_socket_server() < 0) return -EFAULT;
+    
+    server_running = 1;
+    
+    worker_thread = p_kthread_create(hfr_socket_worker, NULL, -1, "kpm_hfr_pro");
+    if (worker_thread && !IS_ERR(worker_thread)) {
+        p_wake_up_process(worker_thread);
+    } else {
+        server_running = 0;
+        p_sock_release(listen_sock);
+        listen_sock = NULL;
+        return -EFAULT;
+    }
+    
