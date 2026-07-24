@@ -77,7 +77,6 @@ typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
 typedef pid_t (*task_pid_vnr_t)(struct task_struct *);
-typedef struct task_struct *(*get_current_t)(void);
 
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
@@ -91,12 +90,22 @@ static find_task_by_vpid_t   p_find_task_by_vpid;
 static get_task_mm_t         p_get_task_mm;
 static mmput_t               p_mmput;
 static task_pid_vnr_t        p_task_pid_vnr;
-static get_current_t         p_get_current;
 static rcu_read_lock_t       p_rcu_read_lock;
 static rcu_read_unlock_t     p_rcu_read_unlock;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
+
+/* ARM64 direct current task retrieval without needing kallsyms get_current */
+static inline struct task_struct *hfr_get_current(void)
+{
+    struct task_struct *tsk;
+    asm volatile(
+        "mrs %0, sp_el0"
+        : "=r" (tsk)
+    );
+    return tsk;
+}
 
 static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos)
 {
@@ -175,19 +184,25 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (count < sizeof(struct k_packet))
         return -EINVAL;
 
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
+    if (p_copy_from_user) {
+        if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)))
+            return -EFAULT;
+    } else {
         return -EFAULT;
+    }
 
-    curr_task = p_get_current ? p_get_current() : NULL;
+    curr_task = hfr_get_current();
     if (!curr_task)
         return -ESRCH;
 
-    caller_pid = p_task_pid_vnr(curr_task);
+    caller_pid = p_task_pid_vnr ? p_task_pid_vnr(curr_task) : 0;
 
     process_packet(&local_pkt, caller_pid);
 
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)))
-        return -EFAULT;
+    if (p_copy_to_user) {
+        if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)))
+            return -EFAULT;
+    }
 
     return (ssize_t)count;
 }
@@ -205,34 +220,33 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 {
     p_proc_create_data   = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry  = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
+    
     p_copy_from_user     = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    if (!p_copy_from_user)
+        p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
+
     p_copy_to_user       = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+    if (!p_copy_to_user)
+        p_copy_to_user   = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
     
     p_access_process_vm  = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find_task_by_vpid  = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get_task_mm        = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
     p_mmput              = (mmput_t)kallsyms_lookup_name("mmput");
     p_task_pid_vnr       = (task_pid_vnr_t)kallsyms_lookup_name("task_pid_vnr");
-    p_get_current        = (get_current_t)kallsyms_lookup_name("get_current");
     
     p_rcu_read_lock      = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
     p_rcu_read_unlock    = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || !p_task_pid_vnr) {
-        kpm_err("Core dynamic symbol resolution failed\n");
-        return -EFAULT;
-    }
-
-    if (!p_rcu_read_lock || !p_rcu_read_unlock) {
-        kpm_err("Failed to resolve RCU symbols\n");
+        kpm_err("Core dynamic symbol resolution failed critical symbols\n");
         return -EFAULT;
     }
 
     kpm_info("proc_create_data  = %px\n", p_proc_create_data);
     kpm_info("access_process_vm = %px\n", p_access_process_vm);
     kpm_info("find_task_by_vpid = %px\n", p_find_task_by_vpid);
-    kpm_info("rcu_read_lock     = %px\n", p_rcu_read_lock);
-    kpm_info("rcu_read_unlock   = %px\n", p_rcu_read_unlock);
+    kpm_info("task_pid_vnr      = %px\n", p_task_pid_vnr);
 
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
