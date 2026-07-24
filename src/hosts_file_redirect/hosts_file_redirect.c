@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Verified Proc Engine Production");
+KPM_DESCRIPTION("Kernel memory r/w via Volatile Proc Engine");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -32,7 +32,6 @@ KPM_DESCRIPTION("Kernel memory r/w via Verified Proc Engine Production");
 
 struct file { void *private_data; };
 
-// Modern standard structure configuration matching exact GKI criteria layouts
 struct proc_ops {
     unsigned int proc_flags;
     int (*proc_open)(struct inode *, struct file *);
@@ -79,6 +78,17 @@ static rcu_read_unlock_t p_rcu_unlock;
 static const char *proc_filename = "hfr_mem";
 static void *proc_entry = NULL;
 
+// MASTER FIX 1: Enforcing absolute volatile boundaries to block Clang from generating implicit 'memcpy' calls
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+static void strict_cp(void *d, const void *s, unsigned long n) {
+    volatile unsigned char *dd = (volatile unsigned char *)d; 
+    const volatile unsigned char *ss = (const volatile unsigned char *)s;
+    unsigned long i;
+    for (i = 0; i < n; i++) {
+        dd[i] = ss[i];
+    }
+}
+
 static void process_packet(struct k_packet *pkt)
 {
     pkt->status = STATUS_INVALID_PID;
@@ -97,10 +107,7 @@ static void process_packet(struct k_packet *pkt)
         p_put(task);
         
         if (r == pkt->size) {
-            // FIX: Manual safe loop copy block to bypass hidden compiler 'memcpy' expansions completely
-            unsigned char *d = (unsigned char *)pkt->inline_data;
-            const unsigned char *s = (const unsigned char *)kbuf;
-            for (uint32_t i = 0; i < pkt->size; i++) d[i] = s[i];
+            strict_cp(pkt->inline_data, kbuf, pkt->size);
             pkt->status = STATUS_SUCCESS;
         }
         else pkt->status = STATUS_PAGE_FAULT;
@@ -121,29 +128,19 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
-    unsigned char *dest;
-    const unsigned char *src;
 
     if (count < sizeof(struct k_packet)) return -EINVAL;
 
-    // FIX 2: Byte-by-byte direct incremental transfer mapping loop to avoid memory overlap dependencies
-    dest = (unsigned char *)&local_pkt;
-    src = (const unsigned char *)buffer;
-    for (unsigned long i = 0; i < sizeof(struct k_packet); i++) {
-        dest[i] = src[i];
-    }
+    // Strict non-optimized loop copy execution
+    strict_cp(&local_pkt, (const void *)buffer, sizeof(struct k_packet));
 
     process_packet(&local_pkt);
 
-    // Feed back frame blocks transaction layers
-    dest = (unsigned char *)buffer;
-    src = (const unsigned char *)&local_pkt;
-    for (unsigned long i = 0; i < sizeof(struct k_packet); i++) {
-        dest[i] = src[i];
-    }
+    strict_cp((void *)buffer, &local_pkt, sizeof(struct k_packet));
 
     return count;
 }
@@ -183,7 +180,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("Proc Synchronous Bridge operational successfully!\n");
+    kpm_info("Proc Synchronous Bridge initialized safely without implicit optimizations!\n");
     return 0;
 }
 
