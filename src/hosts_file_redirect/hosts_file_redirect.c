@@ -138,6 +138,7 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
+
 static int start_socket_server(void)
 {
     struct sockaddr_un addr;
@@ -149,19 +150,29 @@ static int start_socket_server(void)
         return ret; 
     }
     
+    // Explicitly zero out every single byte inside the structure frame
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    const char *path = HFR_SOCKET_PATH;
-    int i = 0;
-    while (path[i] && i < 107) {
-        addr.sun_path[i] = path[i];
-        i++;
-    }
-    addr.sun_path[i] = '\0';
+    // Force index 0 to be a single clean NUL byte to explicitly invoke abstract namespace
+    addr.sun_path[0] = '\0';
+    
+    // Hardcode a short, non-clashing name directly into the character indices
+    // This bypasses alignment shifting
+    addr.sun_path[1] = 'h';
+    addr.sun_path[2] = 'f';
+    addr.sun_path[3] = 'r';
+    addr.sun_path[4] = '_';
+    addr.sun_path[5] = 'm';
+    addr.sun_path[6] = 'e';
+    addr.sun_path[7] = 'm';
+    addr.sun_path[8] = '\0';
 
-    // Exact byte layout length bounding parameter injection
-    int un_len = 2 + i + 1;
+    /* 
+     * CRITICAL LENGTH METRIC FOR ABSTRACT PATHS:
+     * Size of family descriptor (2 bytes) + 1 byte for leading '\0' + strlen("hfr_mem") (7 bytes)
+     */
+    int un_len = 2 + 1 + 7;
     
     ret = p_kernel_bind(listen_sock, &addr, un_len);
     if (ret < 0) { 
@@ -179,9 +190,12 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    kpm_info("Real file system socket node created successfully at %s!\n", HFR_SOCKET_PATH);
+    kpm_info("Abstract Memory socket stabilized successfully!\n");
     return 0;
 }
+
+
+
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
