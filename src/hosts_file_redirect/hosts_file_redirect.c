@@ -13,7 +13,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel memory r/w via Verified /dev/ Misc Node Engine");
+KPM_DESCRIPTION("Kernel memory r/w via Volatile Proc Engine");
 
 #define KPM_PREFIX "HFR_MEM"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -32,21 +32,15 @@ KPM_DESCRIPTION("Kernel memory r/w via Verified /dev/ Misc Node Engine");
 
 struct file { void *private_data; };
 
-// Struct mapping for modern GKI character devices operations layout
-struct file_operations {
-    struct module *owner;
-    loff_t (*llseek) (struct file *, loff_t, int);
-    ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
-};
-
-// Strict layout parameters alignment matching global misc device infrastructure
-struct miscdevice {
-    int minor;
-    const char *name;
-    const struct file_operations *fops;
-    void *empty1; void *empty2; void *empty3; void *empty4;
-};
+struct proc_ops {
+    unsigned int proc_flags;
+    int (*proc_open)(struct inode *, struct file *);
+    ssize_t (*proc_read)(struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*proc_write)(struct file *, const char __user *, size_t, loff_t *);
+    loff_t (*proc_lseek)(struct file *, loff_t, int);
+    int (*proc_release)(struct inode *, struct file *);
+    unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+} __attribute__((packed));
 
 struct k_packet {
     uint32_t op_code;
@@ -64,9 +58,8 @@ typedef void (*put_task_struct_t)(void *);
 typedef void *(*kmalloc_t)(unsigned long, unsigned int);
 typedef void (*kfree_t)(const void *);
 
-// Exact verified global signatures from your kallsyms dump context sequence
-typedef int (*misc_register_t)(struct miscdevice *);
-typedef void (*misc_deregister_t)(struct miscdevice *);
+typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
+typedef void (*remove_proc_entry_t)(const char *, void *);
 
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
@@ -74,13 +67,26 @@ static get_task_struct_t    p_get;
 static put_task_struct_t    p_put;
 static kmalloc_t            p_malloc;
 static kfree_t              p_free;
-static misc_register_t      p_misc_register;
-static misc_deregister_t    p_misc_deregister;
+static proc_create_data_t   p_proc_create_data;
+static remove_proc_entry_t  p_remove_proc_entry;
 
-// Working code memory copy block mapping integration
-static void cp(void *d, const void *s, unsigned long n) {
-    unsigned char *dd = d; const unsigned char *ss = s;
-    for (unsigned long i = 0; i < n; i++) dd[i] = ss[i];
+typedef void (*rcu_read_lock_t)(void);
+typedef void (*rcu_read_unlock_t)(void);
+static rcu_read_lock_t   p_rcu_lock;
+static rcu_read_unlock_t p_rcu_unlock;
+
+static const char *proc_filename = "hfr_mem";
+static void *proc_entry = NULL;
+
+// MASTER FIX 1: Enforcing absolute volatile boundaries to block Clang from generating implicit 'memcpy' calls
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+static void strict_cp(void *d, const void *s, unsigned long n) {
+    volatile unsigned char *dd = (volatile unsigned char *)d; 
+    const volatile unsigned char *ss = (const volatile unsigned char *)s;
+    unsigned long i;
+    for (i = 0; i < n; i++) {
+        dd[i] = ss[i];
+    }
 }
 
 static void process_packet(struct k_packet *pkt)
@@ -90,50 +96,62 @@ static void process_packet(struct k_packet *pkt)
         if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
         void *kbuf = p_malloc(pkt->size, GFP_KERNEL);
         if (!kbuf) { pkt->status = STATUS_MEM_ALLOC_FAIL; return; }
+        
+        if (p_rcu_lock) p_rcu_lock();
         void *task = p_find(pkt->target_pid);
-        if (!task) { p_free(kbuf); return; }
+        if (!task) { if (p_rcu_unlock) p_rcu_unlock(); p_free(kbuf); return; }
         p_get(task);
+        if (p_rcu_unlock) p_rcu_unlock();
+        
         int r = p_vm(task, pkt->target_addr, kbuf, pkt->size, 0);
         p_put(task);
-        if (r == pkt->size) { cp(pkt->inline_data, kbuf, pkt->size); pkt->status = STATUS_SUCCESS; }
+        
+        if (r == pkt->size) {
+            strict_cp(pkt->inline_data, kbuf, pkt->size);
+            pkt->status = STATUS_SUCCESS;
+        }
         else pkt->status = STATUS_PAGE_FAULT;
         p_free(kbuf);
     }
     else if (pkt->op_code == OP_WRITE_VM) {
         if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
+        
+        if (p_rcu_lock) p_rcu_lock();
         void *task = p_find(pkt->target_pid);
-        if (!task) return;
+        if (!task) { if (p_rcu_unlock) p_rcu_unlock(); return; }
         p_get(task);
+        if (p_rcu_unlock) p_rcu_unlock();
+        
         int r = p_vm(task, pkt->target_addr, pkt->inline_data, pkt->size, 1);
         p_put(task);
         pkt->status = (r == pkt->size) ? STATUS_SUCCESS : STATUS_PAGE_FAULT;
     }
 }
 
-// SECURE SYNCHRONOUS TRANSACTION FLOW: Direct overlay assignment handles layout perfectly
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-static ssize_t misc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
+static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
-    struct k_packet *pkt_ptr = (struct k_packet *)buffer;
+    struct k_packet local_pkt;
 
-    if (count < 24) return -EINVAL; // Quick parameter size validation
+    if (count < sizeof(struct k_packet)) return -EINVAL;
 
-    // Direct synchronous calculation inside the current user space thread context layer
-    process_packet(pkt_ptr);
+    // Strict non-optimized loop copy execution
+    strict_cp(&local_pkt, (const void *)buffer, sizeof(struct k_packet));
+
+    process_packet(&local_pkt);
+
+    strict_cp((void *)buffer, &local_pkt, sizeof(struct k_packet));
 
     return count;
 }
 
-static const struct file_operations misc_fops = {
-    .owner = NULL,
-    .write = misc_write_handler,
-};
-
-// 255 Minor configuration minor triggers safe dynamic automatic devfs node creation loop
-static struct miscdevice hfr_misc_dev = {
-    .minor = 255, 
-    .name = "hfr_mem",
-    .fops = &misc_fops,
+static const struct proc_ops p_ops = {
+    .proc_flags = 0,
+    .proc_open = NULL,
+    .proc_read = NULL,
+    .proc_write = proc_write_handler,
+    .proc_lseek = NULL,
+    .proc_release = NULL,
 };
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
@@ -145,31 +163,33 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_malloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
     p_free = (kfree_t)kallsyms_lookup_name("kfree");
     
-    // Linked onto verified globally open tokens
-    p_misc_register = (misc_register_t)kallsyms_lookup_name("misc_register");
-    p_misc_deregister = (misc_deregister_t)kallsyms_lookup_name("misc_deregister");
+    p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
+    p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     
-    if (!p_vm || !p_find || !p_malloc || !p_misc_register || !p_misc_deregister) {
+    p_rcu_lock = (rcu_read_lock_t)kallsyms_lookup_name("rcu_read_lock");
+    p_rcu_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("rcu_read_unlock");
+    
+    if (!p_vm || !p_find || !p_malloc || !p_proc_create_data) {
         kpm_err("Core symbol resolution failed\n");
         return -EFAULT;
     }
     
-    int ret = p_misc_register(&hfr_misc_dev);
-    if (ret < 0) {
-        kpm_err("Misc registration channel assignment failed: %d\n", ret);
+    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
+    if (!proc_entry) {
+        kpm_err("Proc registration node failure.\n");
         return -EFAULT;
     }
 
-    kpm_info("/dev/hfr_mem node interface stabilized flawlessly!\n");
+    kpm_info("Proc Synchronous Bridge initialized safely without implicit optimizations!\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    if (p_misc_deregister) {
-        p_misc_deregister(&hfr_misc_dev);
+    if (proc_entry && p_remove_proc_entry) {
+        p_remove_proc_entry(proc_filename, NULL);
     }
-    kpm_info("Misc driver components dropped out securely!\n");
+    kpm_info("Proc pipeline unlinked safely!\n");
     return 0;
 }
 
