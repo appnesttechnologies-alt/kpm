@@ -29,16 +29,22 @@ KPM_DESCRIPTION("Kernel memory r/w via Unix socket (file socket)");
 #define STATUS_PAGE_FAULT    0x1004
 #define STATUS_INVALID_SIZE  0x1005
 #define STATUS_MEM_ALLOC_FAIL 0x1008
-#define HFR_SOCKET_PATH "/data/local/tmp/hfr_socket"
+
+/* 
+ * FIX: Switched to /dev/ to bypass Android's rigid /data/ partition 
+ * multi-user sandbox constraints during file creation.
+ */
+#define HFR_SOCKET_PATH "/dev/hfr_socket"
 
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define MSG_DONTWAIT 0x40
 
+// Force strict alignment attributes to match target Linux ARM64 kernel layouts
 struct sockaddr_un {
     unsigned short sun_family;
     char sun_path[108];
-};
+} __attribute__((packed));
 
 struct iovec {
     void *iov_base;
@@ -132,13 +138,6 @@ static void process_packet(struct k_packet *pkt)
     }
 }
 
-
-// Force strict alignment attributes to match target Linux ARM64 kernel layouts
-struct sockaddr_un {
-    unsigned short sun_family;
-    char sun_path[108];
-} __attribute__((packed));
-
 static int start_socket_server(void)
 {
     struct sockaddr_un addr;
@@ -150,27 +149,20 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    // Clear out the memory footprint strictly
     cz(&addr, sizeof(addr));
     addr.sun_family = AF_UNIX;
     
-    // Explicit, guarded sequential byte transfer path tracking
-    const char *path = HFR_SOCKET_PATH; // "/data/local/tmp/hfr_socket"
+    const char *path = HFR_SOCKET_PATH;
     int i = 0;
     while (path[i] && i < 107) {
         addr.sun_path[i] = path[i];
         i++;
     }
-    addr.sun_path[i] = '\0'; // Seal the normal string path validation boundary
+    addr.sun_path[i] = '\0';
 
-    /* 
-     * CRITICAL FIX: Explicit Length Calculation
-     * Formula: Size of family descriptor field (2 bytes) + character count + 1 NUL byte.
-     * This informs kernel_bind that we are executing a dedicated string sequence.
-     */
+    // Exact byte layout length bounding parameter injection
     int un_len = 2 + i + 1;
     
-    // Execute the binding logic using the exact length parameter
     ret = p_kernel_bind(listen_sock, &addr, un_len);
     if (ret < 0) { 
         kpm_err("bind failed with error code: %d\n", ret); 
@@ -187,11 +179,9 @@ static int start_socket_server(void)
         return ret; 
     }
     
-    kpm_info("Real file system socket node created successfully!\n");
+    kpm_info("Real file system socket node created successfully at %s!\n", HFR_SOCKET_PATH);
     return 0;
 }
-
-
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
