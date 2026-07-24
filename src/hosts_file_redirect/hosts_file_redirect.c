@@ -293,5 +293,41 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     if (!p_kthread_create || !p_kthread_stop || !p_kthread_should_stop || !p_wake_up_process) return -EFAULT;
     if (!p_set_current_state || !p_schedule_timeout) return -EFAULT;
     
-    if (start_socket_server() < 0) return -EFAULT;
+        if (start_socket_server() < 0) return -EFAULT;
+    
+    server_running = 1;
+    
+    worker_thread = p_kthread_create(hfr_socket_worker, NULL, -1, "kpm_hfr_pro");
+    
+    if (worker_thread && ((unsigned long)worker_thread < (unsigned long)-4095)) {
+        p_wake_up_process(worker_thread);
+    } else {
+        server_running = 0;
+        if (listen_sock) {
+            p_sock_release(listen_sock);
+            listen_sock = NULL;
+        }
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+static long hfr_memory_exit(void __user *reserved)
+{
+    server_running = 0;
+    if (worker_thread) {
+        p_kthread_stop(worker_thread);
+        worker_thread = NULL;
+    }
+    if (listen_sock) { 
+        p_sock_release(listen_sock); 
+        listen_sock = NULL; 
+    }
+    return 0;
+}
+
+KPM_INIT(hfr_memory_init);
+KPM_EXIT(hfr_memory_exit);
+
     
