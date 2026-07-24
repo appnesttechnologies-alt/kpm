@@ -188,13 +188,17 @@ static int hfr_socket_worker(void *data)
 {
     void *client_sock = NULL;
     int ret;
+    kpm_info("Asynchronous I/O Server Subsystem Engaged.\n");
 
     while (!p_kthread_should_stop() && server_running) {
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
-            volatile int delay_counter = 0;
-            for (delay_counter = 0; delay_counter < 50000; delay_counter++) {
-            }
+            /* 
+             * FIX: Use the native scheduler timeout available in <linux/sched.h>
+             * This tells the CPU to sleep for 2 jiffies when the queue is empty,
+             * allowing the userspace connect() request to break through.
+             */
+            schedule_timeout_interruptible(2);
             continue;
         }
 
@@ -232,6 +236,7 @@ static int hfr_socket_worker(void *data)
     return 0;
 }
 
+            
 static int start_socket_server(void)
 {
     struct sockaddr_un addr;
