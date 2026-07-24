@@ -40,21 +40,39 @@ KPM_DESCRIPTION("Safe self-contained proc interface: read/write module's own mem
 #define STATUS_OUT_OF_RANGE   0x1006
 #define STATUS_BAD_OPCODE     0x1007
 
-/* ---- proc_ops layout must match this kernel's include/linux/proc_fs.h ----
- * Verify field order against your target kernel version before building.
- * Kernels >= 5.6 use proc_ops; older kernels use file_operations instead.
+/* ---- proc_ops layout verified against actual kernel source ----
+ * include/linux/proc_fs.h, this kernel's .config:
+ *   CONFIG_COMPAT is not set  -> proc_compat_ioctl field does NOT exist
+ *   CONFIG_RANDSTRUCT is not set -> declared field order == real layout
+ * If you rebuild against a different kernel, re-verify this struct against
+ * that kernel's actual include/linux/proc_fs.h and .config before use.
  */
 struct file { void *private_data; };
+
+/* Opaque forward declarations - we never call through these pointers,
+ * we only need the compiler to accept the struct member types. */
+struct kiocb;
+struct iov_iter;
+struct poll_table_struct;
+struct vm_area_struct;
+typedef unsigned int __poll_t;
 
 struct proc_ops {
     unsigned int proc_flags;
     int (*proc_open)(struct inode *, struct file *);
     ssize_t (*proc_read)(struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*proc_read_iter)(struct kiocb *, struct iov_iter *);
     ssize_t (*proc_write)(struct file *, const char __user *, size_t, loff_t *);
     loff_t (*proc_lseek)(struct file *, loff_t, int);
     int (*proc_release)(struct inode *, struct file *);
+    __poll_t (*proc_poll)(struct file *, struct poll_table_struct *);
+    long (*proc_ioctl)(struct file *, unsigned int, unsigned long);
+    int (*proc_mmap)(struct file *, struct vm_area_struct *);
     unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
-} __attribute__((packed));
+    /* NOTE: no packed/aligned attribute - the real kernel struct doesn't
+     * use one, and all fields here are naturally pointer-aligned. Adding
+     * packing you don't need can only introduce a mismatch, never fix one. */
+};
 
 struct k_packet {
     uint32_t op_code;
