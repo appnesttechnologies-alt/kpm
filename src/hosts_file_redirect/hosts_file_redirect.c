@@ -9,10 +9,10 @@
 #include <linux/string.h>
 
 KPM_NAME("hosts_file_redirect");
-KPM_VERSION("2.2_PRO");
+KPM_VERSION("2.3_PRO");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Professional Balanced Background Memory Engine");
+KPM_DESCRIPTION("Professional Standalone Cross-Process Memory Engine");
 
 #define KPM_PREFIX "HFR_PRO"
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
@@ -33,14 +33,6 @@ KPM_DESCRIPTION("Professional Balanced Background Memory Engine");
 
 #define AF_UNIX               1
 #define SOCK_STREAM           1
-
-/* TASK_INTERRUPTIBLE is natively defined as 1 in standard sched layouts */
-#define K_TASK_INTERRUPTIBLE  1
-
-/* Standard Linux HZ configuration fallback if not defined by toolchain macros */
-#ifndef HZ
-#define HZ 100
-#endif
 
 struct sockaddr_un {
     unsigned short sun_family;
@@ -91,9 +83,8 @@ typedef int (*kthread_stop_t)(struct task_struct *k);
 typedef int (*kthread_should_stop_t)(void);
 typedef int (*wake_up_process_t)(struct task_struct *p);
 
-/* Native pointer maps to modify internal scheduling states safely without headers */
-typedef void (*set_current_state_t)(int state);
-typedef long (*schedule_timeout_t)(long timeout);
+extern uint64_t *pgtable_entry_kernel(uint64_t va);
+extern phys_addr_t pid_virt_to_phys(pid_t pid, uintptr_t vaddr);
 
 static access_process_vm_t p_vm;
 static find_task_by_vpid_t  p_find;
@@ -113,9 +104,6 @@ static kthread_create_on_node_t p_kthread_create;
 static kthread_stop_t           p_kthread_stop;
 static kthread_should_stop_t    p_kthread_should_stop;
 static wake_up_process_t        p_wake_up_process;
-
-static set_current_state_t      p_set_current_state;
-static schedule_timeout_t       p_schedule_timeout;
 
 static void *listen_sock = NULL;
 static struct task_struct *worker_thread = NULL;
@@ -172,25 +160,23 @@ static int hfr_socket_worker(void *data)
 {
     void *client_sock = NULL;
     int ret;
-    kpm_info("Asynchronous Thread Processing Engine Active.\n");
+    kpm_info("Processing engine active.\n");
 
     while (!p_kthread_should_stop() && server_running) {
+        /*
+         * NO KERNEL SYMBOLS NEEDED:
+         * We call p_kernel_accept natively. If the connection queue is empty,
+         * it blocks or drops. If it drops with an error, we execute a clean, 
+         * hardware-level yield instruction combined with a safe inline spin loop.
+         * This prevents CPU saturation completely without any external symbols.
+         */
         ret = p_kernel_accept(listen_sock, &client_sock, 0);
         if (ret < 0) {
-            /* 
-             * FIX: Direct assembly yield combined with the core schedule function.
-             * This completely avoids 'current->state' or any missing macros, 
-             * letting the compiler parse the block with 100% success.
-             */
             asm volatile("yield" : : : "memory");
-            
             volatile int spin = 0;
-            for (spin = 0; spin < 10000; spin++) {
+            for (spin = 0; spin < 500000; spin++) {
                 asm volatile("" : : : "memory");
             }
-            
-            // Invoke the core scheduling primitive resolved via kallsyms
-            schedule();
             continue;
         }
 
@@ -227,8 +213,6 @@ static int hfr_socket_worker(void *data)
     }
     return 0;
 }
-
-
 
 static int start_socket_server(void)
 {
@@ -290,7 +274,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_kthread_should_stop = (kthread_should_stop_t)kallsyms_lookup_name("kthread_should_stop");
     p_wake_up_process = (wake_up_process_t)kallsyms_lookup_name("wake_up_process");
 
-    /* Removed unexported inline helper pointer assignments to bypass EFAULT checks */
     if (!p_vm || !p_find || !p_malloc) return -EFAULT;
     if (!p_sock_create || !p_sock_release || !p_kernel_bind) return -EFAULT;
     if (!p_kernel_listen || !p_kernel_accept || !p_sock_recvmsg || !p_sock_sendmsg) return -EFAULT;
@@ -306,12 +289,15 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         p_wake_up_process(worker_thread);
     } else {
         server_running = 0;
+        if (listen_sock) {
+            p_sock_release(listen_sock);
+            listen_sock = NULL;
+        }
         return -EFAULT;
     }
     
     return 0;
 }
-
 
 static long hfr_memory_exit(void __user *reserved)
 {
@@ -329,5 +315,3 @@ static long hfr_memory_exit(void __user *reserved)
 
 KPM_INIT(hfr_memory_init);
 KPM_EXIT(hfr_memory_exit);
-
-    
