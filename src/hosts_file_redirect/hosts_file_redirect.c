@@ -29,10 +29,16 @@ KPM_DESCRIPTION("KPM ANTICRASH Memory Bridge — bulletproof read/write via GUP"
 
 /* ─── Logging ──────────────────────────────────────────────────────────────── */
 #define KPM_TAG "KPM_AC"
-#define kpm_info(fmt, ...) pr_info("[%s] " fmt, KPM_TAG, ##__VA_ARGS__)
-#define kpm_err(fmt, ...)  pr_err("[%s] ERR " fmt, KPM_TAG, ##__VA_ARGS__)
-#define kpm_warn(fmt, ...) pr_warn("[%s] WARN " fmt, KPM_TAG, ##__VA_ARGS__)
-#define kpm_dbg(fmt, ...)  pr_debug("[%s] DBG " fmt, KPM_TAG, ##__VA_ARGS__)
+#define kpm_info(fmt, ...)  pr_info("[%s] " fmt, KPM_TAG, ##__VA_ARGS__)
+#define kpm_err(fmt, ...)   pr_err("[%s] ERR " fmt, KPM_TAG, ##__VA_ARGS__)
+#define kpm_warn(fmt, ...)  pr_warn("[%s] WARN " fmt, KPM_TAG, ##__VA_ARGS__)
+
+/* Comment out pr_debug usage - not available in all kernel configs */
+#ifdef CONFIG_DYNAMIC_DEBUG
+#define kpm_dbg(fmt, ...)   pr_debug("[%s] DBG " fmt, KPM_TAG, ##__VA_ARGS__)
+#else
+#define kpm_dbg(fmt, ...)   /* disabled */
+#endif
 
 /* ─── Protocol ─────────────────────────────────────────────────────────────── */
 #define MAX_INLINE      256
@@ -100,28 +106,8 @@ struct k_packet {
 } __attribute__((aligned(8), packed));
 
 /* ─── Dynamic Struct Definitions ───────────────────────────────────────────── */
-struct mutex_dynamic {
-    void *owner;
-    int count;
-    void *wait_lock;
-    void *wait_list;
-};
-
-struct vm_area_struct_dynamic {
-    unsigned long vm_start;
-    unsigned long vm_end;
-    unsigned long vm_flags;
-    void *vm_next;
-    void *vm_prev;
-    void *vm_mm;
-    void *vm_ops;
-    void *vm_private_data;
-    void *vm_file;
-    unsigned long vm_pgoff;
-};
-
 struct mm_struct_dynamic {
-    struct vm_area_struct_dynamic *mmap;
+    void *mmap;
     void *pgd;
     int mm_users;
     int mm_count;
@@ -207,7 +193,7 @@ static void *resolve_symbol_dynamic(const char **names, const char *desc)
     while (*n) {
         void *addr = (void *)kallsyms_lookup_name(*n);
         if (addr) {
-            kpm_info("✓ %s: '%s' → %px\n", desc, *n, addr);
+            kpm_info("✓ %s: '%s' -> %px\n", desc, *n, addr);
             return addr;
         }
         n++;
@@ -294,13 +280,11 @@ static void unmap_page_safe(page_map_safe_t *m)
 static int is_mm_alive(struct mm_struct *mm)
 {
     if (!mm) {
-        kpm_dbg("is_mm_alive: mm is NULL\n");
         return 0;
     }
 
     if (!sym_atomic_read) {
-        kpm_dbg("is_mm_alive: atomic_read not available, assuming alive\n");
-        return 1;
+        return 1; /* Assume alive if we can't check */
     }
 
     struct mm_struct_dynamic *mmd = (struct mm_struct_dynamic *)mm;
@@ -322,7 +306,6 @@ static int lock_mm_safe(struct mm_struct *mm)
     }
 
     if (!sym_down_read_killable) {
-        kpm_dbg("lock_mm_safe: down_read_killable not available\n");
         return 1; /* Assume success, GUP will handle it */
     }
 
@@ -367,7 +350,6 @@ static int rw_core_safe(struct task_struct *task,
     int i, retry;
     unsigned int gup_flags;
     int mm_locked = 0;
-    int task_valid = 1;
 
     /* Validation */
     if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
@@ -434,7 +416,7 @@ static int rw_core_safe(struct task_struct *task,
         memset(pages, 0, sizeof(pages));
 
         /* GUP flags */
-        gup_flags = 0x01 | 0x04; /* FOLL_GET | FOLL_WRITE? */
+        gup_flags = 0x01 | 0x04; /* FOLL_GET | FOLL_WRITE */
         if (is_write) {
             gup_flags |= 0x10; /* FOLL_FORCE for write */
         }
@@ -638,8 +620,6 @@ static void process_packet_safe(struct k_packet *pkt, pid_t caller_pid)
         } else if (sym_get_task_struct) {
             sym_get_task_struct(task);
             task_ref_taken = 1;
-            kpm_dbg("process_packet_safe: task found and referenced pid=%d task=%px\n",
-                    target_pid, task);
         }
     }
 
@@ -740,30 +720,85 @@ static int proc_open_cb(struct inode *inode, struct file *file)
         kpm_err("proc_open: module not active\n");
         return -EIO;
     }
-    kpm_dbg("proc_open: fd opened\n");
     return 0;
 }
 
 static int proc_release_cb(struct inode *inode, struct file *file)
 {
-    kpm_dbg("proc_release: fd closed\n");
     return 0;
 }
 
 static ssize_t proc_read_cb(struct file *file, char __user *buf,
                              size_t count, loff_t *pos)
 {
-    /* Read not used - stats can be added here */
+    /* Simple stats via read - using manual string formatting */
     char stats[256];
-    int len;
+    int len = 0;
     
     if (*pos > 0)
         return 0;
     
-    len = snprintf(stats, sizeof(stats),
-                   "KPM Bridge v3.0 (ANTICRASH)\n"
-                   "Reads: %lu\nWrites: %lu\nErrors: %lu\n",
-                   g_total_reads, g_total_writes, g_total_errors);
+    /* Manual string construction instead of snprintf */
+    len = 0;
+    memcpy(stats + len, "KPM Bridge v3.0 (ANTICRASH)\n", 27);
+    len += 27;
+    memcpy(stats + len, "Reads: ", 7);
+    len += 7;
+    
+    /* Simple number conversion for stats */
+    if (g_total_reads == 0) {
+        stats[len++] = '0';
+    } else {
+        char tmp[32];
+        int tmp_len = 0;
+        unsigned long val = g_total_reads;
+        while (val > 0) {
+            tmp[tmp_len++] = '0' + (val % 10);
+            val /= 10;
+        }
+        while (tmp_len > 0) {
+            stats[len++] = tmp[--tmp_len];
+        }
+    }
+    stats[len++] = '\n';
+    
+    memcpy(stats + len, "Writes: ", 8);
+    len += 8;
+    
+    if (g_total_writes == 0) {
+        stats[len++] = '0';
+    } else {
+        char tmp[32];
+        int tmp_len = 0;
+        unsigned long val = g_total_writes;
+        while (val > 0) {
+            tmp[tmp_len++] = '0' + (val % 10);
+            val /= 10;
+        }
+        while (tmp_len > 0) {
+            stats[len++] = tmp[--tmp_len];
+        }
+    }
+    stats[len++] = '\n';
+    
+    memcpy(stats + len, "Errors: ", 8);
+    len += 8;
+    
+    if (g_total_errors == 0) {
+        stats[len++] = '0';
+    } else {
+        char tmp[32];
+        int tmp_len = 0;
+        unsigned long val = g_total_errors;
+        while (val > 0) {
+            tmp[tmp_len++] = '0' + (val % 10);
+            val /= 10;
+        }
+        while (tmp_len > 0) {
+            stats[len++] = tmp[--tmp_len];
+        }
+    }
+    stats[len++] = '\n';
     
     if (len > count)
         len = count;
@@ -830,10 +865,6 @@ static ssize_t proc_write_cb(struct file *file, const char __user *ubuf,
         return -ESRCH;
     }
 
-    kpm_dbg("proc_write: caller_pid=%d op=0x%x target_pid=%u addr=0x%llx size=%u\n",
-            caller_pid, local_pkt.op_code, local_pkt.target_pid,
-            local_pkt.vaddr, local_pkt.size);
-
     /* Process packet */
     process_packet_safe(&local_pkt, caller_pid);
 
@@ -884,9 +915,9 @@ static struct kpm_proc_ops kpm_proc_ops_safe = {
 static long kpm_bridge_init(const char *args, const char *event,
                              void __user *reserved)
 {
-    kpm_info("═══════════════════════════════════════════\n");
-    kpm_info("  KPM BRIDGE v3.0 — ANTICRASH EDITION\n");
-    kpm_info("═══════════════════════════════════════════\n");
+    kpm_info("===========================================\n");
+    kpm_info("  KPM BRIDGE v3.0 - ANTICRASH EDITION\n");
+    kpm_info("===========================================\n");
 
     /* Resolve critical symbols */
     kpm_info("Resolving symbols...\n");
@@ -1001,7 +1032,7 @@ static long kpm_bridge_init(const char *args, const char *event,
                     kpm_warn("OPTIONAL: %s not found - degraded mode\n", name); \
                 } \
             } else { \
-                kpm_info("  ✓ %s\n", name); \
+                kpm_info("  OK %s\n", name); \
             } \
         } while(0)
 
@@ -1052,11 +1083,11 @@ static long kpm_bridge_init(const char *args, const char *event,
     g_total_writes = 0;
     g_total_errors = 0;
 
-    kpm_info("═══════════════════════════════════════════\n");
+    kpm_info("===========================================\n");
     kpm_info("  KPM BRIDGE v3.0 READY\n");
     kpm_info("  Device: /proc/%s\n", PROC_NAME);
     kpm_info("  Mode: ANTICRASH (retries: %d)\n", GUP_RETRY_COUNT);
-    kpm_info("═══════════════════════════════════════════\n");
+    kpm_info("===========================================\n");
 
     return 0;
 }
@@ -1064,11 +1095,11 @@ static long kpm_bridge_init(const char *args, const char *event,
 /* ─── Module exit ─────────────────────────────────────────────────────────── */
 static long kpm_bridge_exit(void __user *reserved)
 {
-    kpm_info("═══════════════════════════════════════════\n");
+    kpm_info("===========================================\n");
     kpm_info("  KPM BRIDGE v3.0 EXIT\n");
     kpm_info("  Stats: R=%lu W=%lu E=%lu\n",
              g_total_reads, g_total_writes, g_total_errors);
-    kpm_info("═══════════════════════════════════════════\n");
+    kpm_info("===========================================\n");
 
     g_module_active = 0;
 
