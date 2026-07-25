@@ -9,7 +9,6 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
-#include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
@@ -56,11 +55,6 @@ KPM_DESCRIPTION("KPM Ultimate Memory Bridge");
 
 #ifndef PAGE_MASK
 #define PAGE_MASK (~(PAGE_SIZE - 1))
-#endif
-
-// ✅ GFP_KERNEL - Direct value from kernel
-#ifndef GFP_KERNEL
-#define GFP_KERNEL 0xD0  // __GFP_RECLAIM | __GFP_IO | __GFP_FS
 #endif
 
 // ✅ min macro
@@ -184,7 +178,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================
-// ✅ ULTIMATE READ/WRITE - 100% DYNAMIC
+// ✅ ULTIMATE READ/WRITE - Static Array (No kmalloc needed)
 // ============================================
 static int kpm_ultimate_rw(struct task_struct *task, 
                            unsigned long addr, 
@@ -193,7 +187,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
                            int is_write)
 {
     struct mm_struct *mm;
-    void **pages = NULL;
+    void *pages[64]; // ✅ Static array to avoid kmalloc/kfree symbol issues
     int nr_pages;
     long ret;
     int i;
@@ -207,12 +201,9 @@ static int kpm_ultimate_rw(struct task_struct *task,
     if (!mm) return -EINVAL;
     
     nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    
-    // ✅ Use kmalloc with GFP_KERNEL
-    pages = kmalloc(nr_pages * sizeof(void *), GFP_KERNEL);
-    if (!pages) {
+    if (nr_pages > 64) {
         p_mmput(mm);
-        return -ENOMEM;
+        return -EINVAL; // Request too large
     }
     
     // ✅ FOLL_WRITE | FOLL_FORCE for bypass
@@ -227,7 +218,6 @@ static int kpm_ultimate_rw(struct task_struct *task,
     
     if (ret < 0) {
         kpm_err("get_user_pages_remote failed: %ld\n", ret);
-        kfree(pages);
         p_mmput(mm);
         return ret;
     }
@@ -237,7 +227,6 @@ static int kpm_ultimate_rw(struct task_struct *task,
         int offset = (i == 0) ? (addr & ~PAGE_MASK) : 0;
         int copy_size = min(size - processed, (int)PAGE_SIZE - offset);
         
-        // ✅ DYNAMIC - Use page_address or kmap_atomic
         if (p_page_address) {
             kaddr = p_page_address(pages[i]);
         } else if (p_kmap_atomic) {
@@ -271,7 +260,6 @@ static int kpm_ultimate_rw(struct task_struct *task,
         processed += copy_size;
     }
     
-    kfree(pages);
     p_mmput(mm);
     return processed;
 }
