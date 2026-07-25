@@ -103,20 +103,19 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 
-// ✅ ULTIMATE BYPASS SYMBOLS - ALL DYNAMIC
+// ✅ SIMPLE - Use void* instead of struct page*
 typedef long (*get_user_pages_remote_t)(struct mm_struct *mm,
                                         unsigned long start,
                                         unsigned long nr_pages,
                                         unsigned int gup_flags,
-                                        struct page **pages,
+                                        void **pages,
                                         struct vm_area_struct **vmas);
 
-// ✅ INLINE FUNCTIONS - DIRECT KERNEL IMPLEMENTATION
-static void *(*kmap_atomic_ptr)(struct page *page);
-static void (*kunmap_atomic_ptr)(void *addr);
-static void *(*page_address_ptr)(struct page *page);
-static int (*set_page_dirty_ptr)(struct page *page);
-static void (*flush_dcache_page_ptr)(struct page *page);
+typedef void *(*kmap_atomic_t)(void *page);
+typedef void (*kunmap_atomic_t)(void *addr);
+typedef void *(*page_address_t)(void *page);
+typedef int (*set_page_dirty_t)(void *page);
+typedef void (*flush_dcache_page_t)(void *page);
 
 // ============================================
 // ✅ STATIC FUNCTION POINTERS
@@ -138,6 +137,11 @@ static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
 
 static get_user_pages_remote_t p_get_user_pages_remote;
+static kmap_atomic_t           p_kmap_atomic;
+static kunmap_atomic_t         p_kunmap_atomic;
+static page_address_t          p_page_address;
+static set_page_dirty_t        p_set_page_dirty;
+static flush_dcache_page_t     p_flush_dcache_page;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -167,7 +171,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
                            int is_write)
 {
     struct mm_struct *mm;
-    struct page **pages = NULL;
+    void **pages = NULL;
     int nr_pages;
     long ret;
     int i;
@@ -182,7 +186,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
     
     nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     
-    pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
+    pages = kmalloc_array(nr_pages, sizeof(void *), GFP_KERNEL);
     if (!pages) {
         p_mmput(mm);
         return -ENOMEM;
@@ -211,17 +215,15 @@ static int kpm_ultimate_rw(struct task_struct *task,
         int copy_size = min(size - processed, (int)PAGE_SIZE - offset);
         
         // ✅ DYNAMIC - Use page_address or kmap_atomic
-        if (page_address_ptr) {
-            kaddr = page_address_ptr(pages[i]);
-        } else if (kmap_atomic_ptr) {
-            kaddr = kmap_atomic_ptr(pages[i]);
+        if (p_page_address) {
+            kaddr = p_page_address(pages[i]);
+        } else if (p_kmap_atomic) {
+            kaddr = p_kmap_atomic(pages[i]);
         } else {
-            put_page(pages[i]);
             continue;
         }
         
         if (!kaddr) {
-            put_page(pages[i]);
             continue;
         }
         
@@ -229,25 +231,24 @@ static int kpm_ultimate_rw(struct task_struct *task,
             memcpy(kaddr + offset, (char *)buffer + processed, copy_size);
             
             // ✅ DYNAMIC - Mark page dirty
-            if (set_page_dirty_ptr) {
-                set_page_dirty_ptr(pages[i]);
+            if (p_set_page_dirty) {
+                p_set_page_dirty(pages[i]);
             }
             
             // ✅ DYNAMIC - Flush cache for ARM64
-            if (flush_dcache_page_ptr) {
-                flush_dcache_page_ptr(pages[i]);
+            if (p_flush_dcache_page) {
+                p_flush_dcache_page(pages[i]);
             }
         } else {
             memcpy((char *)buffer + processed, kaddr + offset, copy_size);
         }
         
         // ✅ DYNAMIC - Unmap
-        if (kunmap_atomic_ptr) {
-            kunmap_atomic_ptr(kaddr);
+        if (p_kunmap_atomic) {
+            p_kunmap_atomic(kaddr);
         }
         
         processed += copy_size;
-        put_page(pages[i]);
     }
     
     kfree(pages);
@@ -426,29 +427,24 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
     
-    // ✅ ULTIMATE SYMBOLS - ALL DYNAMIC
+    // ✅ ULTIMATE SYMBOLS - ALL DYNAMIC with void*
     p_get_user_pages_remote = (get_user_pages_remote_t)kallsyms_lookup_name("get_user_pages_remote");
-    
-    // ✅ INLINE FUNCTIONS - DIRECT FROM KERNEL
-    kmap_atomic_ptr = (void *(*)(struct page *))kallsyms_lookup_name("kmap_atomic");
-    if (!kmap_atomic_ptr) kmap_atomic_ptr = (void *(*)(struct page *))kallsyms_lookup_name("kmap_atomic_high");
-    
-    kunmap_atomic_ptr = (void (*)(void *))kallsyms_lookup_name("kunmap_atomic");
-    if (!kunmap_atomic_ptr) kunmap_atomic_ptr = (void (*)(void *))kallsyms_lookup_name("kunmap_atomic_high");
-    
-    page_address_ptr = (void *(*)(struct page *))kallsyms_lookup_name("page_address");
-    set_page_dirty_ptr = (int (*)(struct page *))kallsyms_lookup_name("set_page_dirty");
-    flush_dcache_page_ptr = (void (*)(struct page *))kallsyms_lookup_name("flush_dcache_page");
+    p_kmap_atomic = (kmap_atomic_t)kallsyms_lookup_name("kmap_atomic");
+    if (!p_kmap_atomic) p_kmap_atomic = (kmap_atomic_t)kallsyms_lookup_name("kmap_atomic_high");
+    p_kunmap_atomic = (kunmap_atomic_t)kallsyms_lookup_name("kunmap_atomic");
+    if (!p_kunmap_atomic) p_kunmap_atomic = (kunmap_atomic_t)kallsyms_lookup_name("kunmap_atomic_high");
+    p_page_address = (page_address_t)kallsyms_lookup_name("page_address");
+    p_set_page_dirty = (set_page_dirty_t)kallsyms_lookup_name("set_page_dirty");
+    p_flush_dcache_page = (flush_dcache_page_t)kallsyms_lookup_name("flush_dcache_page");
 
     kpm_info("=== SYMBOLS RESOLVED ===\n");
     kpm_info("get_user_pages_remote = %px\n", p_get_user_pages_remote);
-    kpm_info("kmap_atomic_ptr       = %px\n", kmap_atomic_ptr);
-    kpm_info("kunmap_atomic_ptr     = %px\n", kunmap_atomic_ptr);
-    kpm_info("page_address_ptr      = %px\n", page_address_ptr);
-    kpm_info("set_page_dirty_ptr    = %px\n", set_page_dirty_ptr);
-    kpm_info("flush_dcache_page_ptr = %px\n", flush_dcache_page_ptr);
+    kpm_info("p_kmap_atomic         = %px\n", p_kmap_atomic);
+    kpm_info("p_kunmap_atomic       = %px\n", p_kunmap_atomic);
+    kpm_info("p_page_address        = %px\n", p_page_address);
+    kpm_info("p_set_page_dirty      = %px\n", p_set_page_dirty);
+    kpm_info("p_flush_dcache_page   = %px\n", p_flush_dcache_page);
 
-    // ✅ Check critical symbols
     if (!p_proc_create_data || !p_get_user_pages_remote || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
