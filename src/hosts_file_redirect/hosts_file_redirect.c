@@ -161,9 +161,14 @@ typedef void (*fn_rcu_read_unlock)(void);
 typedef void (*fn_mutex_init)(struct mutex *);
 typedef void (*fn_mutex_lock)(struct mutex *);
 typedef void (*fn_mutex_unlock)(struct mutex *);
-typedef long (*fn_get_user_pages_remote)(struct mm_struct *, unsigned long,
-                                          unsigned long, unsigned int,
-                                          void **, struct vm_area_struct **);
+typedef long (*fn_get_user_pages_remote)(
+        struct mm_struct *mm,
+        unsigned long start,
+        unsigned long nr_pages,
+        unsigned int gup_flags,
+        struct page **pages,
+        struct vm_area_struct **vmas,
+        int *locked);
 typedef void *(*fn_kmap_atomic)(void *page);
 typedef void  (*fn_kunmap_atomic)(void *addr);
 typedef void *(*fn_page_address)(void *page);
@@ -198,7 +203,7 @@ static fn_put_page               sym_put_page;
 /* ─── Global state ──────────────────────────────────────────────────────────── */
 static const char   *PROC_NAME  = "hfr_mem";
 static void         *proc_entry = NULL;
-static struct mutex  kpm_mutex;
+
 
 /* ─── Current task via sp_el0 (ARM64) ──────────────────────────────────────── */
 static inline struct task_struct *kpm_current_task(void)
@@ -289,14 +294,13 @@ static void kpm_unmap_page(page_map_t *m)
  *   - task refcount taken with get_task_struct / released with put_task_struct.
  */
 static int kpm_rw_core(struct task_struct *task,
-                       pid_t task_pid,
                        unsigned long addr,
                        void *buffer,
                        int size,
                        int is_write)
 {
     struct mm_struct *mm;
-    void    *pages[MAX_GUP_PAGES];
+    struct page *pages[MAX_GUP_PAGES];
     long     gup_ret;
     int      nr_pages_needed;
     int      processed = 0;
@@ -319,7 +323,7 @@ static int kpm_rw_core(struct task_struct *task,
     mm = sym_get_task_mm(task);
     if (!mm) {
         kpm_err("rw_core: get_task_mm returned NULL for pid=%d\n",
-                (int)task_pid);
+                (int)task->pid);
         return -ESRCH;
     }
 
@@ -340,12 +344,15 @@ static int kpm_rw_core(struct task_struct *task,
     gup_flags = KPM_FOLL_FORCE | KPM_FOLL_GET;
     if (is_write) gup_flags |= KPM_FOLL_WRITE;
 
-    gup_ret = sym_get_user_pages_remote(mm,
-                                        addr & PAGE_MASK,
-                                        (unsigned long)nr_pages_needed,
-                                        gup_flags,
-                                        pages,
-                                        NULL);
+    int locked = 1;
+
+gup_ret = sym_get_user_pages_remote(mm,
+                                    addr & PAGE_MASK,
+                                    (unsigned long)nr_pages_needed,
+                                    gup_flags,
+                                    pages,
+                                    NULL,
+                                    &locked);
 
     if (gup_ret <= 0) {
         kpm_err("rw_core: GUP failed ret=%ld addr=0x%lx flags=0x%x\n",
@@ -360,12 +367,15 @@ static int kpm_rw_core(struct task_struct *task,
             memset(pages, 0, sizeof(pages));
             mm = sym_get_task_mm(task);
             if (!mm) return -ESRCH;
-            gup_ret = sym_get_user_pages_remote(mm,
-                                                addr & PAGE_MASK,
-                                                (unsigned long)nr_pages_needed,
-                                                gup_flags,
-                                                pages,
-                                                NULL);
+            locked = 1;
+
+gup_ret = sym_get_user_pages_remote(mm,
+                                    addr & PAGE_MASK,
+                                    (unsigned long)nr_pages_needed,
+                                    gup_flags,
+                                    pages,
+                                    NULL,
+                                    &locked);
             if (gup_ret <= 0) {
                 kpm_err("rw_core: GUP retry also failed ret=%ld\n", gup_ret);
                 sym_mmput(mm);
@@ -511,7 +521,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     /* ── transfer ────────────────────────────────────────────────────────── */
     transferred = kpm_rw_core(task,
-                              target_pid,
                               (unsigned long)pkt->vaddr,
                               scratch,
                               (int)pkt->size,
@@ -631,9 +640,7 @@ static ssize_t proc_write_cb(struct file *file, const char __user *ubuf,
     }
 
     /* ── process under mutex ────────────────────────────────────────────── */
-    if (sym_mutex_lock)   sym_mutex_lock(&kpm_mutex);
     process_packet(&local_pkt, caller_pid);
-    if (sym_mutex_unlock) sym_mutex_unlock(&kpm_mutex);
 
     /* ── write result back to userspace ─────────────────────────────────── */
     copy_ret = sym_copy_to_user((void __user *)ubuf,
