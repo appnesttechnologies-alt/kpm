@@ -798,9 +798,6 @@ static long kpm_bridge_init(const char *args, const char *event,
     }
 
     /* ── init mutex ──────────────────────────────────────────────────────── */
-    memset(&kpm_mutex, 0, sizeof(kpm_mutex));
-    if (sym_mutex_init)
-        sym_mutex_init(&kpm_mutex);
 
     /* ── create /proc/hfr_mem ────────────────────────────────────────────── */
     proc_entry = sym_proc_create_data(PROC_NAME, 0666, NULL,
