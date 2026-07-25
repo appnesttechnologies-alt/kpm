@@ -13,8 +13,6 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <linux/gfp.h>
-#include <linux/kernel.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -47,7 +45,11 @@ KPM_DESCRIPTION("KPM Ultimate Memory Bridge");
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
 
-// ✅ DEFINE PAGE SIZE MANUALLY (ARM64)
+// ============================================
+// ✅ DEFINE EVERYTHING MANUALLY
+// ============================================
+
+// ARM64 Page Size
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
@@ -56,7 +58,12 @@ KPM_DESCRIPTION("KPM Ultimate Memory Bridge");
 #define PAGE_MASK (~(PAGE_SIZE - 1))
 #endif
 
-// ✅ MIN MACRO
+// ✅ GFP_KERNEL - Direct value from kernel
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xD0  // __GFP_RECLAIM | __GFP_IO | __GFP_FS
+#endif
+
+// ✅ min macro
 #ifndef min
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -201,7 +208,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
     
     nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     
-    // ✅ Use kmalloc (not kmalloc_array)
+    // ✅ Use kmalloc with GFP_KERNEL
     pages = kmalloc(nr_pages * sizeof(void *), GFP_KERNEL);
     if (!pages) {
         p_mmput(mm);
