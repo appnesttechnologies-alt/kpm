@@ -321,11 +321,15 @@ static int kpm_rw_core(struct task_struct *task,
 
     /* ── take mm reference ───────────────────────────────────────────────── */
     mm = sym_get_task_mm(task);
-    if (!mm) {
-        kpm_err("rw_core: get_task_mm returned NULL for pid=%d\n",
-                (int)task->pid);
-        return -ESRCH;
-    }
+if (!mm) {
+    pid_t pid = -1;
+
+    if (sym_task_pid_nr_ns)
+        pid = sym_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
+
+    kpm_err("rw_core: get_task_mm returned NULL for pid=%d\n", pid);
+    return -ESRCH;
+}
 
     /* ── calculate page span ─────────────────────────────────────────────── */
     nr_pages_needed = (int)(((addr & ~PAGE_MASK) + (unsigned long)size
