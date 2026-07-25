@@ -12,6 +12,7 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -44,11 +45,6 @@ KPM_DESCRIPTION("KPM Ultimate Memory Bridge");
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
 
-// ============================================
-// ✅ DEFINE EVERYTHING MANUALLY
-// ============================================
-
-// ARM64 Page Size
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
@@ -57,10 +53,13 @@ KPM_DESCRIPTION("KPM Ultimate Memory Bridge");
 #define PAGE_MASK (~(PAGE_SIZE - 1))
 #endif
 
-// ✅ min macro
 #ifndef min
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
+
+// FOLL flags
+#define FOLL_WRITE  0x01
+#define FOLL_FORCE  0x10
 
 struct k_packet {
     uint32_t op_code;
@@ -100,9 +99,7 @@ struct mutex {
     void *wait_list;
 };
 
-// ============================================
-// ✅ ALL TYPEDEFS - DYNAMIC RESOLUTION
-// ============================================
+// Function pointer typedefs
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
@@ -118,24 +115,17 @@ typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
-
-// ✅ Use void* instead of struct page*
-typedef long (*get_user_pages_remote_t)(struct mm_struct *mm,
-                                        unsigned long start,
-                                        unsigned long nr_pages,
-                                        unsigned int gup_flags,
-                                        void **pages,
-                                        struct vm_area_struct **vmas);
-
+typedef long (*get_user_pages_remote_t)(struct mm_struct *mm, unsigned long start,
+                                         unsigned long nr_pages, unsigned int gup_flags,
+                                         void **pages, struct vm_area_struct **vmas);
 typedef void *(*kmap_atomic_t)(void *page);
 typedef void (*kunmap_atomic_t)(void *addr);
 typedef void *(*page_address_t)(void *page);
 typedef int (*set_page_dirty_t)(void *page);
 typedef void (*flush_dcache_page_t)(void *page);
+typedef void (*put_page_t)(void *page);
 
-// ============================================
-// ✅ STATIC FUNCTION POINTERS
-// ============================================
+// Static function pointers
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
@@ -151,13 +141,13 @@ static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
-
 static get_user_pages_remote_t p_get_user_pages_remote;
 static kmap_atomic_t           p_kmap_atomic;
 static kunmap_atomic_t         p_kunmap_atomic;
 static page_address_t          p_page_address;
 static set_page_dirty_t        p_set_page_dirty;
 static flush_dcache_page_t     p_flush_dcache_page;
+static put_page_t              p_put_page;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -173,12 +163,14 @@ static inline struct task_struct *hfr_get_current(void)
 static inline int is_valid_user_address(uint64_t addr)
 {
     if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;
+    if (addr >= (1ULL << 63)) return 0;  // Kernel space check
+    // TASK_SIZE on ARM64 is typically 0x00007FFFFFFFFFFF for 48-bit VA
+    if (addr >= 0x0000800000000000ULL) return 0;
     return 1;
 }
 
 // ============================================
-// ✅ ULTIMATE READ/WRITE - Static Array (No kmalloc needed)
+// ✅ SAFE READ/WRITE - With put_page and better error handling
 // ============================================
 static int kpm_ultimate_rw(struct task_struct *task, 
                            unsigned long addr, 
@@ -187,7 +179,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
                            int is_write)
 {
     struct mm_struct *mm;
-    void *pages[64]; // ✅ Static array to avoid kmalloc/kfree symbol issues
+    void *pages[16];  // Enough for MAX_INLINE bytes
     int nr_pages;
     long ret;
     int i;
@@ -195,31 +187,42 @@ static int kpm_ultimate_rw(struct task_struct *task,
     unsigned int gup_flags;
     void *kaddr;
     
-    if (!task || !p_get_task_mm) return -EINVAL;
+    if (!task || !p_get_task_mm) {
+        kpm_err("Invalid task or get_task_mm not found\n");
+        return -EINVAL;
+    }
     
     mm = p_get_task_mm(task);
-    if (!mm) return -EINVAL;
+    if (!mm) {
+        kpm_err("get_task_mm returned NULL\n");
+        return -EINVAL;
+    }
     
     nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (nr_pages > 64) {
+    if (nr_pages > 16) {
+        kpm_err("Request too large: %d pages needed\n", nr_pages);
         p_mmput(mm);
-        return -EINVAL; // Request too large
+        return -EINVAL;
     }
     
-    // ✅ FOLL_WRITE | FOLL_FORCE for bypass
+    // Zero out pages array
+    memset(pages, 0, sizeof(pages));
+    
+    // Set GUP flags
+    gup_flags = 0;  // FOLL_GET is implicit
     if (is_write) {
-        gup_flags = 0x01 | 0x10; // FOLL_WRITE | FOLL_FORCE
-    } else {
-        gup_flags = 0;
+        gup_flags |= FOLL_WRITE;
+        // Don't use FOLL_FORCE unless absolutely necessary - it can cause issues
     }
     
+    // Pin the pages
     ret = p_get_user_pages_remote(mm, addr & PAGE_MASK, nr_pages, 
                                   gup_flags, pages, NULL);
     
-    if (ret < 0) {
-        kpm_err("get_user_pages_remote failed: %ld\n", ret);
+    if (ret <= 0) {
+        kpm_err("get_user_pages_remote failed: %ld, addr=0x%lx\n", ret, addr);
         p_mmput(mm);
-        return ret;
+        return -EFAULT;
     }
     
     // Process each page
@@ -227,25 +230,26 @@ static int kpm_ultimate_rw(struct task_struct *task,
         int offset = (i == 0) ? (addr & ~PAGE_MASK) : 0;
         int copy_size = min(size - processed, (int)PAGE_SIZE - offset);
         
+        // Map the page
+        kaddr = NULL;
         if (p_page_address) {
             kaddr = p_page_address(pages[i]);
-        } else if (p_kmap_atomic) {
+        }
+        if (!kaddr && p_kmap_atomic) {
             kaddr = p_kmap_atomic(pages[i]);
-        } else {
-            continue;
         }
         
         if (!kaddr) {
+            kpm_err("Failed to map page %d\n", i);
             continue;
         }
         
+        // Do the copy
         if (is_write) {
             memcpy(kaddr + offset, (char *)buffer + processed, copy_size);
-            
             if (p_set_page_dirty) {
                 p_set_page_dirty(pages[i]);
             }
-            
             if (p_flush_dcache_page) {
                 p_flush_dcache_page(pages[i]);
             }
@@ -253,11 +257,24 @@ static int kpm_ultimate_rw(struct task_struct *task,
             memcpy((char *)buffer + processed, kaddr + offset, copy_size);
         }
         
-        if (p_kunmap_atomic) {
+        // Unmap
+        if (p_kunmap_atomic && kaddr) {
             p_kunmap_atomic(kaddr);
         }
         
+        // Release page reference
+        if (p_put_page) {
+            p_put_page(pages[i]);
+        }
+        
         processed += copy_size;
+    }
+    
+    // Release any remaining pages that weren't processed
+    for (; i < ret; i++) {
+        if (p_put_page && pages[i]) {
+            p_put_page(pages[i]);
+        }
     }
     
     p_mmput(mm);
@@ -272,22 +289,29 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
+    kpm_info("Processing packet: op=0x%x, pid=%u, addr=0x%llx, size=%u\n",
+             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size);
+
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
+        kpm_err("Bad opcode: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
+        kpm_err("Invalid size: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
     if (!is_valid_user_address(pkt->vaddr)) {
+        kpm_err("Invalid user address: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
     if (!p_get_user_pages_remote || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+        kpm_err("Missing critical symbols\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
@@ -295,14 +319,17 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
     
     if (target_pid <= 0) {
+        kpm_err("Invalid target PID: %d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
 
+    // Find the target task
     if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(target_pid);
     
     if (!task) {
+        kpm_err("Task not found: pid=%d\n", target_pid);
         if (p_rcu_read_unlock) p_rcu_read_unlock();
         pkt->status = STATUS_NO_TASK;
         return;
@@ -323,11 +350,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
+        kpm_err("Transfer failed: %d\n", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
+        kpm_err("Protection fault: 0 bytes transferred\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -338,60 +367,97 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
+        kpm_info("Partial transfer: %d/%u bytes\n", transferred, pkt->size);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
     }
 
+    kpm_info("Transfer successful: %u bytes\n", pkt->size);
     pkt->status = STATUS_SUCCESS;
 }
 
-static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
-static int proc_release_handler(struct inode *inode, struct file *file) { return 0; }
-static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos) { return 0; }
+static int proc_open_handler(struct inode *inode, struct file *file) 
+{ 
+    return 0; 
+}
+
+static int proc_release_handler(struct inode *inode, struct file *file) 
+{ 
+    return 0; 
+}
+
+static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos) 
+{ 
+    return 0; 
+}
 
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
-    struct k_packet local_pkt;
+    struct k_packet *local_pkt;
     pid_t caller_pid;
     struct task_struct *curr_task;
+    ssize_t ret;
 
     if (count != sizeof(struct k_packet)) {
+        kpm_err("Invalid write size: %zu (expected %zu)\n", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
     if (!p_copy_from_user) {
+        kpm_err("copy_from_user not available\n");
         return -EFAULT;
     }
     
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+    // Allocate packet on heap to avoid stack overflow
+    local_pkt = kmalloc(sizeof(struct k_packet), GFP_KERNEL);
+    if (!local_pkt) {
+        kpm_err("Failed to allocate packet\n");
+        return -ENOMEM;
+    }
+    
+    if (p_copy_from_user(local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_from_user failed\n");
+        kfree(local_pkt);
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
     if (!curr_task) {
+        kpm_err("Failed to get current task\n");
+        kfree(local_pkt);
         return -ESRCH;
     }
 
     if (!p_task_pid_nr_ns) {
+        kpm_err("task_pid_nr_ns not available\n");
+        kfree(local_pkt);
         return -EFAULT;
     }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
     
     if (caller_pid <= 0) {
+        kpm_err("Invalid caller PID\n");
+        kfree(local_pkt);
         return -ESRCH;
     }
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
-    process_packet(&local_pkt, caller_pid);
+    process_packet(local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user) {
+        kpm_err("copy_to_user not available\n");
+        kfree(local_pkt);
         return -EFAULT;
     }
     
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+    ret = p_copy_to_user((void __user *)buffer, local_pkt, sizeof(struct k_packet));
+    kfree(local_pkt);
+    
+    if (ret != 0) {
+        kpm_err("copy_to_user failed: %zd\n", ret);
         return -EFAULT;
     }
 
@@ -442,14 +508,16 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_page_address = (page_address_t)kallsyms_lookup_name("page_address");
     p_set_page_dirty = (set_page_dirty_t)kallsyms_lookup_name("set_page_dirty");
     p_flush_dcache_page = (flush_dcache_page_t)kallsyms_lookup_name("flush_dcache_page");
+    p_put_page = (put_page_t)kallsyms_lookup_name("put_page");
 
-    kpm_info("get_user_pages_remote = %px\n", p_get_user_pages_remote);
-    kpm_info("kmap_atomic           = %px\n", p_kmap_atomic);
-    kpm_info("page_address          = %px\n", p_page_address);
-    kpm_info("set_page_dirty        = %px\n", p_set_page_dirty);
+    kpm_info("Symbols found:\n");
+    kpm_info("  get_user_pages_remote = %px\n", p_get_user_pages_remote);
+    kpm_info("  kmap_atomic           = %px\n", p_kmap_atomic);
+    kpm_info("  page_address          = %px\n", p_page_address);
+    kpm_info("  put_page              = %px\n", p_put_page);
 
-    if (!p_proc_create_data || !p_get_user_pages_remote || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
+    if (!p_proc_create_data || !p_find_task_by_vpid || !p_get_task_mm || 
+        !p_mmput || !p_copy_from_user || !p_copy_to_user || !p_put_page) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
