@@ -289,6 +289,7 @@ static void kpm_unmap_page(page_map_t *m)
  *   - task refcount taken with get_task_struct / released with put_task_struct.
  */
 static int kpm_rw_core(struct task_struct *task,
+                       pid_t task_pid,
                        unsigned long addr,
                        void *buffer,
                        int size,
@@ -318,7 +319,7 @@ static int kpm_rw_core(struct task_struct *task,
     mm = sym_get_task_mm(task);
     if (!mm) {
         kpm_err("rw_core: get_task_mm returned NULL for pid=%d\n",
-                (int)task->pid);
+                (int)task_pid);
         return -ESRCH;
     }
 
@@ -510,6 +511,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     /* ── transfer ────────────────────────────────────────────────────────── */
     transferred = kpm_rw_core(task,
+                              target_pid,
                               (unsigned long)pkt->vaddr,
                               scratch,
                               (int)pkt->size,
