@@ -163,8 +163,7 @@ static inline struct task_struct *hfr_get_current(void)
 static inline int is_valid_user_address(uint64_t addr)
 {
     if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;  // Kernel space check
-    // TASK_SIZE on ARM64 is typically 0x00007FFFFFFFFFFF for 48-bit VA
+    if (addr >= (1ULL << 63)) return 0;
     if (addr >= 0x0000800000000000ULL) return 0;
     return 1;
 }
@@ -179,7 +178,7 @@ static int kpm_ultimate_rw(struct task_struct *task,
                            int is_write)
 {
     struct mm_struct *mm;
-    void *pages[16];  // Enough for MAX_INLINE bytes
+    void *pages[16];
     int nr_pages;
     long ret;
     int i;
@@ -205,17 +204,13 @@ static int kpm_ultimate_rw(struct task_struct *task,
         return -EINVAL;
     }
     
-    // Zero out pages array
     memset(pages, 0, sizeof(pages));
     
-    // Set GUP flags
-    gup_flags = 0;  // FOLL_GET is implicit
+    gup_flags = 0;
     if (is_write) {
         gup_flags |= FOLL_WRITE;
-        // Don't use FOLL_FORCE unless absolutely necessary - it can cause issues
     }
     
-    // Pin the pages
     ret = p_get_user_pages_remote(mm, addr & PAGE_MASK, nr_pages, 
                                   gup_flags, pages, NULL);
     
@@ -225,12 +220,10 @@ static int kpm_ultimate_rw(struct task_struct *task,
         return -EFAULT;
     }
     
-    // Process each page
     for (i = 0; i < ret && processed < size; i++) {
         int offset = (i == 0) ? (addr & ~PAGE_MASK) : 0;
         int copy_size = min(size - processed, (int)PAGE_SIZE - offset);
         
-        // Map the page
         kaddr = NULL;
         if (p_page_address) {
             kaddr = p_page_address(pages[i]);
@@ -244,7 +237,6 @@ static int kpm_ultimate_rw(struct task_struct *task,
             continue;
         }
         
-        // Do the copy
         if (is_write) {
             memcpy(kaddr + offset, (char *)buffer + processed, copy_size);
             if (p_set_page_dirty) {
@@ -257,12 +249,10 @@ static int kpm_ultimate_rw(struct task_struct *task,
             memcpy((char *)buffer + processed, kaddr + offset, copy_size);
         }
         
-        // Unmap
         if (p_kunmap_atomic && kaddr) {
             p_kunmap_atomic(kaddr);
         }
         
-        // Release page reference
         if (p_put_page) {
             p_put_page(pages[i]);
         }
@@ -270,7 +260,6 @@ static int kpm_ultimate_rw(struct task_struct *task,
         processed += copy_size;
     }
     
-    // Release any remaining pages that weren't processed
     for (; i < ret; i++) {
         if (p_put_page && pages[i]) {
             p_put_page(pages[i]);
@@ -324,7 +313,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // Find the target task
     if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(target_pid);
     
@@ -394,10 +382,10 @@ static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t 
 
 static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
 {
-    struct k_packet *local_pkt;
+    struct k_packet local_pkt;
     pid_t caller_pid;
     struct task_struct *curr_task;
-    ssize_t ret;
+    unsigned long ret;
 
     if (count != sizeof(struct k_packet)) {
         kpm_err("Invalid write size: %zu (expected %zu)\n", count, sizeof(struct k_packet));
@@ -409,29 +397,22 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
         return -EFAULT;
     }
     
-    // Allocate packet on heap to avoid stack overflow
-    local_pkt = kmalloc(sizeof(struct k_packet), GFP_KERNEL);
-    if (!local_pkt) {
-        kpm_err("Failed to allocate packet\n");
-        return -ENOMEM;
-    }
+    // Use stack allocation - no kmalloc needed
+    memset(&local_pkt, 0, sizeof(local_pkt));
     
-    if (p_copy_from_user(local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
         kpm_err("copy_from_user failed\n");
-        kfree(local_pkt);
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
     if (!curr_task) {
         kpm_err("Failed to get current task\n");
-        kfree(local_pkt);
         return -ESRCH;
     }
 
     if (!p_task_pid_nr_ns) {
         kpm_err("task_pid_nr_ns not available\n");
-        kfree(local_pkt);
         return -EFAULT;
     }
 
@@ -439,25 +420,22 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     
     if (caller_pid <= 0) {
         kpm_err("Invalid caller PID\n");
-        kfree(local_pkt);
         return -ESRCH;
     }
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
-    process_packet(local_pkt, caller_pid);
+    process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user) {
         kpm_err("copy_to_user not available\n");
-        kfree(local_pkt);
         return -EFAULT;
     }
     
-    ret = p_copy_to_user((void __user *)buffer, local_pkt, sizeof(struct k_packet));
-    kfree(local_pkt);
+    ret = p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet));
     
     if (ret != 0) {
-        kpm_err("copy_to_user failed: %zd\n", ret);
+        kpm_err("copy_to_user failed: %lu\n", ret);
         return -EFAULT;
     }
 
