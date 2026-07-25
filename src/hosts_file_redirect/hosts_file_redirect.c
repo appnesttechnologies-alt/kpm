@@ -12,7 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/highmem.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 
@@ -20,7 +19,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM Ultimate Memory Bridge - get_user_pages_remote");
+KPM_DESCRIPTION("KPM Ultimate - 100% Dynamic Symbol Resolution");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -85,6 +84,9 @@ struct mutex {
     void *wait_list;
 };
 
+// ============================================
+// ✅ ALL TYPEDEFS - DYNAMIC RESOLUTION
+// ============================================
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
@@ -101,16 +103,24 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 
-// ✅ KERNEL SOURCE KE HISAB SE EXACT PROTOTYPES
+// ✅ ULTIMATE BYPASS SYMBOLS - ALL DYNAMIC
 typedef long (*get_user_pages_remote_t)(struct mm_struct *mm,
                                         unsigned long start,
                                         unsigned long nr_pages,
                                         unsigned int gup_flags,
                                         struct page **pages,
                                         struct vm_area_struct **vmas);
-typedef int (*set_page_dirty_t)(struct page *page);
-typedef void (*flush_dcache_page_t)(struct page *page);
 
+// ✅ INLINE FUNCTIONS - DIRECT KERNEL IMPLEMENTATION
+static void *(*kmap_atomic_ptr)(struct page *page);
+static void (*kunmap_atomic_ptr)(void *addr);
+static void *(*page_address_ptr)(struct page *page);
+static int (*set_page_dirty_ptr)(struct page *page);
+static void (*flush_dcache_page_ptr)(struct page *page);
+
+// ============================================
+// ✅ STATIC FUNCTION POINTERS
+// ============================================
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
@@ -127,10 +137,7 @@ static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
 
-// ✅ ULTIMATE BYPASS FUNCTION POINTERS
 static get_user_pages_remote_t p_get_user_pages_remote;
-static set_page_dirty_t        p_set_page_dirty;
-static flush_dcache_page_t     p_flush_dcache_page;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -151,7 +158,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================
-// ✅ ULTIMATE READ/WRITE - Bypass EVERYTHING
+// ✅ ULTIMATE READ/WRITE - 100% DYNAMIC
 // ============================================
 static int kpm_ultimate_rw(struct task_struct *task, 
                            unsigned long addr, 
@@ -166,13 +173,13 @@ static int kpm_ultimate_rw(struct task_struct *task,
     int i;
     int processed = 0;
     unsigned int gup_flags;
+    void *kaddr;
     
-    if (!task) return -EINVAL;
+    if (!task || !p_get_task_mm) return -EINVAL;
     
     mm = p_get_task_mm(task);
     if (!mm) return -EINVAL;
     
-    // Calculate number of pages needed
     nr_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     
     pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_KERNEL);
@@ -181,21 +188,15 @@ static int kpm_ultimate_rw(struct task_struct *task,
         return -ENOMEM;
     }
     
-    // ✅ ULTIMATE FLAGS - Bypass ALL protections
+    // ✅ FOLL_WRITE | FOLL_FORCE for bypass
     if (is_write) {
         gup_flags = 0x01 | 0x10; // FOLL_WRITE | FOLL_FORCE
     } else {
         gup_flags = 0;
     }
     
-    kpm_info("get_user_pages_remote: mm=%px start=0x%lx nr=%d flags=0x%x\n",
-             mm, addr & PAGE_MASK, nr_pages, gup_flags);
-    
-    // ✅ KERNEL SOURCE KE HISAB SE EXACT CALL
     ret = p_get_user_pages_remote(mm, addr & PAGE_MASK, nr_pages, 
                                   gup_flags, pages, NULL);
-    
-    kpm_info("get_user_pages_remote returned: %ld\n", ret);
     
     if (ret < 0) {
         kpm_err("get_user_pages_remote failed: %ld\n", ret);
@@ -206,34 +207,45 @@ static int kpm_ultimate_rw(struct task_struct *task,
     
     // Process each page
     for (i = 0; i < ret && processed < size; i++) {
-        void *kaddr;
         int offset = (i == 0) ? (addr & ~PAGE_MASK) : 0;
         int copy_size = min(size - processed, (int)PAGE_SIZE - offset);
         
-        // Map page to kernel space
-        kaddr = kmap_atomic(pages[i]);
+        // ✅ DYNAMIC - Use page_address or kmap_atomic
+        if (page_address_ptr) {
+            kaddr = page_address_ptr(pages[i]);
+        } else if (kmap_atomic_ptr) {
+            kaddr = kmap_atomic_ptr(pages[i]);
+        } else {
+            put_page(pages[i]);
+            continue;
+        }
+        
         if (!kaddr) {
             put_page(pages[i]);
             continue;
         }
         
         if (is_write) {
-            // ✅ FORCE WRITE - No permission check
             memcpy(kaddr + offset, (char *)buffer + processed, copy_size);
             
-            // Mark page dirty - KERNEL SOURCE KE HISAB SE
-            if (p_set_page_dirty) {
-                p_set_page_dirty(pages[i]);
+            // ✅ DYNAMIC - Mark page dirty
+            if (set_page_dirty_ptr) {
+                set_page_dirty_ptr(pages[i]);
             }
-            if (p_flush_dcache_page) {
-                p_flush_dcache_page(pages[i]);
+            
+            // ✅ DYNAMIC - Flush cache for ARM64
+            if (flush_dcache_page_ptr) {
+                flush_dcache_page_ptr(pages[i]);
             }
         } else {
-            // Read
             memcpy((char *)buffer + processed, kaddr + offset, copy_size);
         }
         
-        kunmap_atomic(kaddr);
+        // ✅ DYNAMIC - Unmap
+        if (kunmap_atomic_ptr) {
+            kunmap_atomic_ptr(kaddr);
+        }
+        
         processed += copy_size;
         put_page(pages[i]);
     }
@@ -251,38 +263,29 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
-    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u\n",
-             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size);
-
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
-        kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
     if (!is_valid_user_address(pkt->vaddr)) {
-        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
     if (!p_get_user_pages_remote || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid: %d\n", target_pid);
     
     if (target_pid <= 0) {
-        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
@@ -292,7 +295,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
@@ -307,20 +309,16 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
-    // ✅ USE ULTIMATE METHOD
     transferred = kpm_ultimate_rw(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
-    kpm_info("kpm_ultimate_rw returned: %d\n", transferred);
 
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
-        kpm_err("VM_FAULT: %d\n", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
-        kpm_err("PROTECTION\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -331,13 +329,11 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
-        kpm_info("PARTIAL_IO: wanted %u got %d\n", pkt->size, transferred);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS\n");
     pkt->status = STATUS_SUCCESS;
 }
 
@@ -352,35 +348,29 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     struct task_struct *curr_task;
 
     if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
     if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL\n");
         return -EFAULT;
     }
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_from_user failed\n");
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
     if (!curr_task) {
-        kpm_err("get_current failed\n");
         return -ESRCH;
     }
 
     if (!p_task_pid_nr_ns) {
-        kpm_err("task_pid_nr_ns NULL\n");
         return -EFAULT;
     }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
     
     if (caller_pid <= 0) {
-        kpm_err("Invalid caller_pid: %d\n", caller_pid);
         return -ESRCH;
     }
 
@@ -389,12 +379,10 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user) {
-        kpm_err("copy_to_user NULL\n");
         return -EFAULT;
     }
     
     if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_to_user failed\n");
         return -EFAULT;
     }
 
@@ -417,9 +405,9 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== ULTIMATE KPM INIT START ===\n");
+    kpm_info("=== ULTIMATE KPM - 100% DYNAMIC INIT ===\n");
     
-    // ✅ RESOLVE ALL SYMBOLS
+    // ✅ RESOLVE ALL SYMBOLS FROM KERNEL
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -438,16 +426,29 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
     
-    // ✅ ULTIMATE SYMBOLS - KERNEL SOURCE KE HISAB SE
+    // ✅ ULTIMATE SYMBOLS - ALL DYNAMIC
     p_get_user_pages_remote = (get_user_pages_remote_t)kallsyms_lookup_name("get_user_pages_remote");
-    p_set_page_dirty = (set_page_dirty_t)kallsyms_lookup_name("set_page_dirty");
-    p_flush_dcache_page = (flush_dcache_page_t)kallsyms_lookup_name("flush_dcache_page");
+    
+    // ✅ INLINE FUNCTIONS - DIRECT FROM KERNEL
+    kmap_atomic_ptr = (void *(*)(struct page *))kallsyms_lookup_name("kmap_atomic");
+    if (!kmap_atomic_ptr) kmap_atomic_ptr = (void *(*)(struct page *))kallsyms_lookup_name("kmap_atomic_high");
+    
+    kunmap_atomic_ptr = (void (*)(void *))kallsyms_lookup_name("kunmap_atomic");
+    if (!kunmap_atomic_ptr) kunmap_atomic_ptr = (void (*)(void *))kallsyms_lookup_name("kunmap_atomic_high");
+    
+    page_address_ptr = (void *(*)(struct page *))kallsyms_lookup_name("page_address");
+    set_page_dirty_ptr = (int (*)(struct page *))kallsyms_lookup_name("set_page_dirty");
+    flush_dcache_page_ptr = (void (*)(struct page *))kallsyms_lookup_name("flush_dcache_page");
 
-    kpm_info("Ultimate Symbols:\n");
-    kpm_info("  get_user_pages_remote = %px\n", p_get_user_pages_remote);
-    kpm_info("  set_page_dirty        = %px\n", p_set_page_dirty);
-    kpm_info("  flush_dcache_page     = %px\n", p_flush_dcache_page);
+    kpm_info("=== SYMBOLS RESOLVED ===\n");
+    kpm_info("get_user_pages_remote = %px\n", p_get_user_pages_remote);
+    kpm_info("kmap_atomic_ptr       = %px\n", kmap_atomic_ptr);
+    kpm_info("kunmap_atomic_ptr     = %px\n", kunmap_atomic_ptr);
+    kpm_info("page_address_ptr      = %px\n", page_address_ptr);
+    kpm_info("set_page_dirty_ptr    = %px\n", set_page_dirty_ptr);
+    kpm_info("flush_dcache_page_ptr = %px\n", flush_dcache_page_ptr);
 
+    // ✅ Check critical symbols
     if (!p_proc_create_data || !p_get_user_pages_remote || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
