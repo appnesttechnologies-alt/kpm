@@ -19,7 +19,7 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
 KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
 
-#define HFR_DEBUG  // UNCOMMENT FOR DEBUG, COMMENT FOR STEALTH
+#define HFR_DEBUG
 #ifdef HFR_DEBUG
 #define kpm_info(fmt, ...) pr_info("HFR: " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)  pr_err("HFR: " fmt, ##__VA_ARGS__)
@@ -46,7 +46,6 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 
 #define HFR_FOLL_WRITE        0x01
 
-// EXACT MATCH with userspace kernel_rpm.hpp - 280 bytes
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
@@ -147,29 +146,38 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
+    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
+             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
+
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
+        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
+        kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
     if (!is_valid_user_address(pkt->vaddr)) {
+        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+        kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
+    kpm_info("target_pid resolved: %d\n", target_pid);
     
     if (target_pid <= 0) {
+        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
@@ -177,18 +185,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (p_rcu_read_lock) p_rcu_read_lock();
 
     task = p_find_task_by_vpid(target_pid);
+    kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
+    
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
+        kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
 
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
+    kpm_info("get_task_mm = %px\n", mm);
 
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
+        kpm_err("NO_MM\n");
         pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
         return;
@@ -204,17 +217,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         gup_flags = 0;
     }
 
+    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
+             task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
+    
     transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
+    kpm_info("access_process_vm returned: %d\n", transferred);
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
+        kpm_err("VM_FAULT: %d\n", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
+        kpm_err("PROTECTION\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -225,11 +244,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
+        kpm_info("PARTIAL_IO: wanted %u got %d\n", pkt->size, transferred);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
     }
 
+    kpm_info("<<< process_packet SUCCESS\n");
     pkt->status = STATUS_SUCCESS;
 }
 
@@ -243,29 +264,57 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    if (count != sizeof(struct k_packet))
-        return -EINVAL;
+    kpm_info("*** proc_write_handler: count=%zu expected=%zu\n", count, sizeof(struct k_packet));
 
-    if (!p_copy_from_user) return -EFAULT;
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0)
+    if (count != sizeof(struct k_packet)) {
+        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
+        return -EINVAL;
+    }
+
+    if (!p_copy_from_user) {
+        kpm_err("copy_from_user NULL\n");
         return -EFAULT;
+    }
+    
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_from_user failed\n");
+        return -EFAULT;
+    }
 
     curr_task = hfr_get_current();
-    if (!curr_task) return -ESRCH;
+    if (!curr_task) {
+        kpm_err("get_current failed\n");
+        return -ESRCH;
+    }
 
-    if (!p_task_pid_nr_ns) return -EFAULT;
+    if (!p_task_pid_nr_ns) {
+        kpm_err("task_pid_nr_ns NULL\n");
+        return -EFAULT;
+    }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) return -ESRCH;
+    kpm_info("caller_pid from current task: %d\n", caller_pid);
+    
+    if (caller_pid <= 0) {
+        kpm_err("Invalid caller_pid: %d\n", caller_pid);
+        return -ESRCH;
+    }
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user) return -EFAULT;
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0)
+    if (!p_copy_to_user) {
+        kpm_err("copy_to_user NULL\n");
         return -EFAULT;
+    }
+    
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_to_user failed\n");
+        return -EFAULT;
+    }
 
+    kpm_info("*** proc_write_handler SUCCESS\n");
     return (ssize_t)count;
 }
 
@@ -285,6 +334,8 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
+    kpm_info("=== INIT START ===\n");
+    
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -304,23 +355,32 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
+
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user)
+        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
+        kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
+    }
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
 
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
-    if (!proc_entry) return -EFAULT;
+    if (!proc_entry) {
+        kpm_err("proc_create FAILED\n");
+        return -EFAULT;
+    }
 
-    kpm_info("HFR Memory Bridge initialized at /proc/%s\n", proc_filename);
+    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
+    kpm_info("=== EXIT ===\n");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
-    kpm_info("HFR Memory Bridge removed\n");
     return 0;
 }
 
