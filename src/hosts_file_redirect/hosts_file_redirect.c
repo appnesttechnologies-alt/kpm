@@ -17,7 +17,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
+KPM_DESCRIPTION("hostfileredirect");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -44,7 +44,9 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
 
+// 🔥🔥🔥 FOLL_FORCE DEFINED - Permission ignore!
 #define HFR_FOLL_WRITE        0x01
+#define FOLL_FORCE            0x20
 
 struct k_packet {
     uint32_t op_code;
@@ -210,18 +212,67 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     is_write_op = (pkt->op_code == OP_WRITE_VM);
     memset(temp_buffer, 0, MAX_INLINE);
     
+    // ============================================================
+    // 🔥🔥🔥 FOLL_FORCE LAGAYA - AB PERMISSION IGNORE! 🔥🔥🔥
+    // ============================================================
     if (is_write_op) {
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
-        gup_flags = HFR_FOLL_WRITE;
+        // 🔥 WRITE: FOLL_FORCE + FOLL_WRITE - Seedha ghuso!
+        gup_flags = HFR_FOLL_WRITE | FOLL_FORCE;
+        kpm_info("WRITE with FOLL_FORCE | FOLL_WRITE (flags=0x%x)\n", gup_flags);
     } else {
-        gup_flags = 0;
+        // 🔥 READ: FOLL_FORCE - Permission ignore karo!
+        gup_flags = FOLL_FORCE;
+        kpm_info("READ with FOLL_FORCE (flags=0x%x)\n", gup_flags);
     }
 
-    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
-             task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
+    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d flags=0x%x\n",
+             task, (unsigned long)pkt->vaddr, (int)pkt->size, gup_flags);
     
+    // 🔥🔥🔥 ACCESS_PROCESS_VM WITH FOLL_FORCE 🔥🔥🔥
     transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
     kpm_info("access_process_vm returned: %d\n", transferred);
+
+    // ============================================================
+    // 🔥 AGAR ABHI BHI FAIL HO, TOH GET_USER_PAGES USE KARO
+    // ============================================================
+    if (transferred <= 0 && is_write_op) {
+        kpm_info("access_process_vm failed, trying get_user_pages with FOLL_FORCE...\n");
+        
+        struct page *page;
+        int ret = get_user_pages(task, task->mm, (unsigned long)pkt->vaddr, 
+                                 1, FOLL_WRITE | FOLL_FORCE | FOLL_GET, &page, NULL);
+        
+        if (ret == 1) {
+            void *kaddr = kmap(page);
+            if (kaddr) {
+                unsigned long offset = (unsigned long)pkt->vaddr & ~PAGE_MASK;
+                memcpy(kaddr + offset, temp_buffer, pkt->size);
+                kunmap(page);
+                transferred = pkt->size;
+                kpm_info("get_user_pages WRITE success: %d bytes\n", transferred);
+            }
+            put_page(page);
+        }
+    } else if (transferred <= 0 && !is_write_op) {
+        kpm_info("access_process_vm read failed, trying get_user_pages with FOLL_FORCE...\n");
+        
+        struct page *page;
+        int ret = get_user_pages(task, task->mm, (unsigned long)pkt->vaddr, 
+                                 1, FOLL_FORCE | FOLL_GET, &page, NULL);
+        
+        if (ret == 1) {
+            void *kaddr = kmap(page);
+            if (kaddr) {
+                unsigned long offset = (unsigned long)pkt->vaddr & ~PAGE_MASK;
+                memcpy(temp_buffer, kaddr + offset, pkt->size);
+                kunmap(page);
+                transferred = pkt->size;
+                kpm_info("get_user_pages READ success: %d bytes\n", transferred);
+            }
+            put_page(page);
+        }
+    }
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
@@ -233,7 +284,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if (transferred == 0 && pkt->size > 0) {
-        kpm_err("PROTECTION\n");
+        kpm_err("PROTECTION (even with FOLL_FORCE!)\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -250,7 +301,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS\n");
+    kpm_info("<<< process_packet SUCCESS ✅\n");
     pkt->status = STATUS_SUCCESS;
 }
 
