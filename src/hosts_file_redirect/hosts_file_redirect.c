@@ -13,6 +13,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/irqflags.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -119,49 +120,24 @@ static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
-// ============================================================
-// PAGE TABLE WALK HELPERS
-// ============================================================
+static inline struct task_struct *hfr_get_current(void)
+{
+    struct task_struct *tsk;
+    asm volatile("mrs %0, sp_el0" : "=r" (tsk));
+    return tsk;
+}
 
 // ARM64 PTE bit definitions
 #define PTE_VALID            (1UL << 0)
-#define PTE_TYPE_PAGE        (3UL << 0)  // bits[1:0] = 0b11
-#define PTE_TYPE_BLOCK       (1UL << 0)  // bits[1:0] = 0b01
-#define PTE_AF               (1UL << 10) // Access Flag
-#define PTE_AP2              (1UL << 6)  // AP[2] - 0=write, 1=read-only
-#define PTE_AP1              (1UL << 7)  // AP[1] - 0=user, 1=kernel
-#define PTE_DBM              (1UL << 51) // Dirty Bit Modifier (if supported)
-#define PMD_SECT             (1UL << 1)  // Section/Block mapping indicator
+#define PTE_TYPE_PAGE        (3UL << 0)
+#define PTE_TYPE_BLOCK       (1UL << 0)
+#define PTE_AP2              (1UL << 6)
 #define PTE_ADDR_MASK        0xFFFFFFFFF000ULL
 
-// Find PGD in mm_struct by scanning for page-aligned physical address
-static unsigned long find_pgd_phys(struct mm_struct *mm)
-{
-    unsigned long possible_offsets[] = {0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88};
-    unsigned long val;
-    
-    for (int i = 0; i < 10; i++) {
-        val = *(unsigned long *)((char *)mm + possible_offsets[i]);
-        // Valid PGD: non-zero, page-aligned, reasonable physical address (< 1TB)
-        if (val != 0 && (val & 0xFFF) == 0 && val < (1ULL << 40)) {
-            // Also check it's not a kernel pointer (kernel addresses > PAGE_OFFSET)
-            if (val < (1ULL << 40)) {
-                kpm_info("PGD found at mm+0x%lx = 0x%llx\n", possible_offsets[i], val);
-                return val;
-            }
-        }
-    }
-    kpm_err("Could not find PGD in mm_struct\n");
-    return 0;
-}
-
 // Convert physical address to kernel virtual using linear map
-// NOTE: Only for accessing page TABLE pages, NOT for userspace data!
+// Only for accessing page TABLE pages, NOT userspace data!
 static unsigned long phys_to_kvirt(unsigned long phys)
 {
-    // PAGE_OFFSET for 39-bit VA, 4KB pages
-    // Linear map: virt = phys + PAGE_OFFSET (assuming memstart_addr=0)
-    // For GKI with 39-bit, PAGE_OFFSET = 0xffffff8000000000
     return phys + 0xffffff8000000000ULL;
 }
 
@@ -177,6 +153,25 @@ static inline void flush_tlb_entry(unsigned long addr)
     );
 }
 
+// Find PGD in mm_struct
+static unsigned long find_pgd_phys(struct mm_struct *mm)
+{
+    unsigned long possible_offsets[] = {0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88};
+    unsigned long val;
+    
+    for (int i = 0; i < 10; i++) {
+        val = *(unsigned long *)((char *)mm + possible_offsets[i]);
+        if (val != 0 && (val & 0xFFF) == 0 && val < (1ULL << 40)) {
+            if (val < (1ULL << 40)) {
+                kpm_info("PGD found at mm+0x%lx = 0x%llx\n", possible_offsets[i], val);
+                return val;
+            }
+        }
+    }
+    kpm_err("Could not find PGD in mm_struct\n");
+    return 0;
+}
+
 // ============================================================
 // ZERO TRACE PTE MODIFICATION - READ
 // ============================================================
@@ -187,22 +182,18 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
     unsigned long pgd_val, pmd_val, pte_val;
     unsigned long pmd_table, pte_table;
     unsigned long pgd_idx, pmd_idx, pte_idx;
-    unsigned long flags;
     int ret = -EFAULT;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
     
-    // Step 1: Get PGD physical address
     pgd_phys = find_pgd_phys(mm);
     if (!pgd_phys)
         return -EFAULT;
     
-    // Step 2: Convert PGD physical to kernel virtual (for reading tables only)
     pgd_table = phys_to_kvirt(pgd_phys);
     kpm_info("PGD table: virt=0x%llx (from phys=0x%llx)\n", pgd_table, pgd_phys);
     
-    // Step 3: Read PGD entry
     pgd_idx = (addr >> 30) & 0x1FF;
     pgd_val = *(volatile unsigned long *)(pgd_table + pgd_idx * 8);
     kpm_info("PGD[%lu] = 0x%llx\n", pgd_idx, pgd_val);
@@ -212,7 +203,6 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Step 4: Read PMD entry
     pmd_table = phys_to_kvirt(pgd_val & ~0xFFFULL);
     pmd_idx = (addr >> 21) & 0x1FF;
     pmd_val = *(volatile unsigned long *)(pmd_table + pmd_idx * 8);
@@ -223,10 +213,8 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Check for 2MB block mapping
     if ((pmd_val & 0x3) == PTE_TYPE_BLOCK) {
         kpm_info("Block mapping detected - reading directly\n");
-        // For block mapping, use kernel linear map to access
         unsigned long block_phys = (pmd_val & PTE_ADDR_MASK) | (addr & 0x1FFFFF);
         unsigned long block_virt = phys_to_kvirt(block_phys);
         memcpy(buffer, (void *)block_virt, size);
@@ -238,7 +226,6 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Step 5: Read PTE entry
     pte_table = phys_to_kvirt(pmd_val & ~0xFFFULL);
     pte_idx = (addr >> 12) & 0x1FF;
     pte_val = *(volatile unsigned long *)(pte_table + pte_idx * 8);
@@ -249,9 +236,6 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Step 6: For READ, we can just read directly from the linear map
-    // OR we can access through the userspace virtual address (kernel can access any process's memory via linear map)
-    // Here we use linear map access for read too (simpler, no PTE modification needed for read)
     {
         unsigned long phys_addr = (pte_val & PTE_ADDR_MASK) | (addr & 0xFFF);
         unsigned long kvirt_addr = phys_to_kvirt(phys_addr);
@@ -270,7 +254,7 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
 }
 
 // ============================================================
-// ZERO TRACE PTE MODIFICATION - WRITE (THE MAGIC!)
+// ZERO TRACE PTE MODIFICATION - WRITE
 // ============================================================
 static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
                           void *buffer, int size)
@@ -280,20 +264,17 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     unsigned long pmd_table, pte_table;
     unsigned long pgd_idx, pmd_idx, pte_idx;
     unsigned long *pte_entry_ptr;
-    unsigned long flags;
     int ret = -EFAULT;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
     
-    // Step 1: Get PGD
     pgd_phys = find_pgd_phys(mm);
     if (!pgd_phys)
         return -EFAULT;
     
     pgd_table = phys_to_kvirt(pgd_phys);
     
-    // Step 2: Walk to PTE
     pgd_idx = (addr >> 30) & 0x1FF;
     pgd_val = *(volatile unsigned long *)(pgd_table + pgd_idx * 8);
     kpm_info("PGD[%lu] = 0x%llx\n", pgd_idx, pgd_val);
@@ -317,33 +298,24 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     if ((pmd_val & 0x3) == PTE_TYPE_BLOCK) {
         kpm_info("Block mapping write\n");
         
-        // Save original PMD
         unsigned long orig_pmd = pmd_val;
         unsigned long *pmd_entry_ptr = (unsigned long *)(pmd_table + pmd_idx * 8);
+        unsigned long irq_flags;
         
-        // Disable interrupts during modification
-        local_irq_save(flags);
+        local_irq_save(irq_flags);
         
-        // Make writable: Clear AP[2] (bit 6) if set
         pmd_val &= ~PTE_AP2;
         *pmd_entry_ptr = pmd_val;
         
-        // Flush TLB for this address
         flush_tlb_entry(addr);
         
-        // 🔥 DIRECT WRITE TO USERSAPCE VIRTUAL ADDRESS!
-        // In kernel mode, we can access userspace addresses when page table allows it
-        // The PMD now allows writes, so this works!
         memcpy((void *)addr, buffer, size);
-        kpm_info("🔥 ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
+        kpm_info("ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
         
-        // Restore original PMD
         *pmd_entry_ptr = orig_pmd;
-        
-        // Flush TLB again
         flush_tlb_entry(addr);
         
-        local_irq_restore(flags);
+        local_irq_restore(irq_flags);
         return size;
     }
     
@@ -352,7 +324,6 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Step 3: Get PTE entry
     pte_table = phys_to_kvirt(pmd_val & ~0xFFFULL);
     pte_idx = (addr >> 12) & 0x1FF;
     pte_entry_ptr = (unsigned long *)(pte_table + pte_idx * 8);
@@ -370,39 +341,27 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // Step 4: 🔥 PTE MODIFICATION - Make it writable!
-    
-    // Disable interrupts to make this atomic
-    local_irq_save(flags);
-    
-    // Clear AP[2] (bit 6) to make page writable
-    // AP[2]=0 means read-write (for user or kernel based on AP[1])
-    pte_val &= ~PTE_AP2;
-    
-    // Write modified PTE
-    *pte_entry_ptr = pte_val;
-    
-    // Ensure PTE write is visible before access
-    asm volatile("dsb ishst" ::: "memory");
-    
-    // Flush TLB for this specific address
-    flush_tlb_entry(addr);
-    
-    // Step 5: 🔥 ZERO TRACE DIRECT WRITE to userspace virtual address!
-    // Since PTE now allows write, kernel can write directly to this userspace address!
-    memcpy((void *)addr, buffer, size);
-    kpm_info("🔥 ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
-    
-    // Step 6: Restore original PTE
-    *pte_entry_ptr = orig_pte;
-    
-    // Ensure PTE restore is visible
-    asm volatile("dsb ishst" ::: "memory");
-    
-    // Flush TLB again
-    flush_tlb_entry(addr);
-    
-    local_irq_restore(flags);
+    {
+        unsigned long irq_flags;
+        
+        local_irq_save(irq_flags);
+        
+        pte_val &= ~PTE_AP2;
+        *pte_entry_ptr = pte_val;
+        
+        asm volatile("dsb ishst" ::: "memory");
+        flush_tlb_entry(addr);
+        
+        memcpy((void *)addr, buffer, size);
+        kpm_info("ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
+        
+        *pte_entry_ptr = orig_pte;
+        
+        asm volatile("dsb ishst" ::: "memory");
+        flush_tlb_entry(addr);
+        
+        local_irq_restore(irq_flags);
+    }
     
     ret = size;
     return ret;
@@ -483,7 +442,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
-    // 🔥 USE PTE MODIFICATION FOR ZERO TRACE!
     if (is_write_op) {
         transferred = pte_mod_write(mm, pkt->vaddr, temp_buffer, pkt->size);
     } else {
