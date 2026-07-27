@@ -15,6 +15,7 @@
 #include <linux/version.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/err.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -27,9 +28,6 @@ KPM_DESCRIPTION("ZERO TRACE PTE MODIFICATION - CRASH FREE");
 
 static struct file *log_file = NULL;
 
-// ============================================================
-// SIMPLE FILE LOGGING - No linux/file.h needed!
-// ============================================================
 static void log_to_file(const char *fmt, ...)
 {
     va_list args;
@@ -76,6 +74,7 @@ static void log_close(void)
     }
 }
 
+#ifdef HFR_DEBUG
 #define hfr_log(fmt, ...) do { \
     pr_info("HFR: " fmt, ##__VA_ARGS__); \
     log_to_file(fmt, ##__VA_ARGS__); \
@@ -85,7 +84,6 @@ static void log_close(void)
     pr_err("HFR: " fmt, ##__VA_ARGS__); \
     log_to_file("ERROR: " fmt, ##__VA_ARGS__); \
 } while(0)
-
 #else
 #define hfr_log(fmt, ...)
 #define hfr_err(fmt, ...)
@@ -190,12 +188,11 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-// ARM64 PTE bit definitions
-#define PTE_VALID            (1UL << 0)
-#define PTE_TYPE_PAGE        (3UL << 0)
-#define PTE_TYPE_BLOCK       (1UL << 0)
-#define PTE_AP2              (1UL << 6)
-#define PTE_ADDR_MASK        0xFFFFFFFFF000ULL
+// ARM64 PTE bits
+#define HFR_PTE_VALID            (1UL << 0)
+#define HFR_PTE_TYPE_BLOCK       (1UL << 0)
+#define HFR_PTE_AP2              (1UL << 6)
+#define HFR_PTE_ADDR_MASK        0xFFFFFFFFF000ULL
 
 static unsigned long phys_to_kvirt(unsigned long phys)
 {
@@ -258,12 +255,12 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     pmd_val = *(volatile unsigned long *)(pmd_table + pmd_idx * 8);
     hfr_log("PMD[%lu] = 0x%llx", pmd_idx, pmd_val);
     
-    if (!(pmd_val & PTE_VALID)) {
+    if (!(pmd_val & HFR_PTE_VALID)) {
         hfr_err("walk_page_table: PMD not present");
         return -EFAULT;
     }
     
-    if ((pmd_val & 0x3) == PTE_TYPE_BLOCK) {
+    if ((pmd_val & 0x3) == HFR_PTE_TYPE_BLOCK) {
         hfr_log("walk_page_table: Block mapping at PMD");
         *pte_ptr_out = (unsigned long *)(pmd_table + pmd_idx * 8);
         *pte_val_out = pmd_val;
@@ -281,7 +278,7 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     *pte_val_out = *(volatile unsigned long *)(*pte_ptr_out);
     hfr_log("PTE[%lu] = 0x%llx", pte_idx, *pte_val_out);
     
-    if (!(*pte_val_out & PTE_VALID)) {
+    if (!(*pte_val_out & HFR_PTE_VALID)) {
         hfr_err("walk_page_table: PTE not present");
         return -EFAULT;
     }
@@ -312,9 +309,9 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
     }
     
     if (ret == 2)
-        phys_addr = (pte_val & PTE_ADDR_MASK) | (addr & 0x1FFFFF);
+        phys_addr = (pte_val & HFR_PTE_ADDR_MASK) | (addr & 0x1FFFFF);
     else
-        phys_addr = (pte_val & PTE_ADDR_MASK) | (addr & 0xFFF);
+        phys_addr = (pte_val & HFR_PTE_ADDR_MASK) | (addr & 0xFFF);
     
     kvirt_addr = phys_to_kvirt(phys_addr);
     memcpy(buffer, (void *)kvirt_addr, size);
@@ -350,36 +347,30 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     
     orig_pte = pte_val;
     
-    if (!(pte_val & PTE_AP2)) {
+    if (!(pte_val & HFR_PTE_AP2)) {
         hfr_log("WRITE: Already writable, direct write");
         memcpy((void *)addr, buffer, size);
         return size;
     }
     
-    // Save IRQ state and disable interrupts
     asm volatile("mrs %0, daif" : "=r"(irq_flags) : : "memory");
     asm volatile("msr daifset, #2" : : : "memory");
     
-    hfr_log("WRITE: Original entry=0x%llx AP[2]=%lu, making writable", orig_pte, (orig_pte >> 6) & 1);
+    hfr_log("WRITE: Original=0x%llx AP[2]=%lu, making writable", orig_pte, (orig_pte >> 6) & 1);
     
-    // Clear AP[2] to make writable
-    pte_val &= ~PTE_AP2;
+    pte_val &= ~HFR_PTE_AP2;
     *pte_ptr = pte_val;
     
-    // Memory barrier + TLB flush all cores
     asm volatile("dsb ishst" ::: "memory");
     flush_tlb_all_cores(addr);
     
-    // DIRECT WRITE
     memcpy((void *)addr, buffer, size);
     hfr_log("WRITE: Direct write complete!");
     
-    // Restore original PTE
     *pte_ptr = orig_pte;
     asm volatile("dsb ishst" ::: "memory");
     flush_tlb_all_cores(addr);
     
-    // Restore interrupts
     asm volatile("msr daif, %0" : : "r"(irq_flags) : "memory");
     
     hfr_log("WRITE: Success! %d bytes to 0x%llx", size, addr);
