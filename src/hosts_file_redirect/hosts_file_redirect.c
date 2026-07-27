@@ -13,7 +13,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <asm/pgtable.h>
+#include <pgtable.h>
 
 // ============================================================
 // ✅ PHYS_TO_VIRT - Direct ARM64 formula
