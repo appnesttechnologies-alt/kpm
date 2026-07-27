@@ -13,13 +13,27 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <pgtable.h>
+
+// ============================================================
+// ✅ PHYS_TO_VIRT - memstart_addr se resolve
+// ============================================================
+#ifndef PAGE_OFFSET
+#define PAGE_OFFSET 0xffffffc000000000ULL
+#endif
+
+static unsigned long g_memstart_addr = 0;
+
+static inline void *phys_to_virt_arm64(unsigned long phys)
+{
+    return (void *)(phys + (PAGE_OFFSET - g_memstart_addr));
+}
+#define phys_to_virt(phys) phys_to_virt_arm64(phys)
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE ZERO TRACE - Clean Page Walk");
+KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -138,7 +152,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥 FINAL FIXED - Page Table Walk (3-Level)
+// 🔥 ULTIMATE MEMORY ACCESS - 3-Level Page Walk
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
@@ -162,7 +176,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
     
-    // 🔥 STEP 1: PGD table - PHYSICAL address from mm_struct
+    // 🔥 STEP 1: PGD table - PHYSICAL from mm_struct (offset 0x48)
     pgd_table_phys = *(unsigned long *)((char *)mm + 0x48);
     if (!pgd_table_phys) {
         kpm_err("ULTIMATE: pgd_table_phys is NULL\n");
@@ -220,7 +234,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = (void *)(phys_addr + 0xffffffc000000000ULL);
+        kaddr = phys_to_virt(phys_addr);
         if (!kaddr) {
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
@@ -277,8 +291,8 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     phys_addr = (pfn << 12) | (addr & 0xFFF);
     kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
     
-    // 🔥 STEP 13: Direct Mapping (ARM64 linear map)
-    kaddr = (void *)(phys_addr + 0xffffffc000000000ULL);
+    // 🔥 STEP 13: phys_to_virt se kernel virtual address
+    kaddr = phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: kaddr is NULL\n");
         if (p_mmput) p_mmput(mm);
@@ -306,7 +320,6 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     if (p_mmput) p_mmput(mm);
     return ret;
 }
-
 
 // ============================================================
 // PROCESS PACKET - Ultimate Access (No Fallback!)
@@ -388,9 +401,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
-    // ============================================================
-    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - FIXED 🔥🔥🔥
-    // ============================================================
     transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     if (transferred > 0) {
@@ -401,7 +411,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         pkt->status = STATUS_PROTECTION;
     }
 
-    // ✅ Single mmput (already done inside ultimate_memory_access)
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
@@ -509,6 +518,15 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
+    // 🔥🔥🔥 GET memstart_addr FROM KALLSYMS 🔥🔥🔥
+    g_memstart_addr = (unsigned long)kallsyms_lookup_name("memstart_addr");
+    if (!g_memstart_addr) {
+        kpm_err("❌ memstart_addr not found!\n");
+        return -EFAULT;
+    }
+    kpm_info("✅ memstart_addr = 0x%llx\n", g_memstart_addr);
+    kpm_info("✅ PAGE_OFFSET - memstart_addr = 0x%llx\n", (PAGE_OFFSET - g_memstart_addr));
+
     kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
              p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
@@ -528,7 +546,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 3-LEVEL PAGE WALK ACTIVE! No fallback!\n");
+    kpm_info("🔥 3-LEVEL PAGE WALK ACTIVE! memstart_addr resolved!\n");
     return 0;
 }
 
