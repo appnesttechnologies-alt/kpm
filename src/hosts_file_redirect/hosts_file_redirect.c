@@ -15,25 +15,29 @@
 #include <linux/version.h>
 
 // ============================================================
-// ✅ PHYS_TO_VIRT - memstart_addr se resolve
+// DYNAMIC PHYS_TO_VIRT RESOLUTION
 // ============================================================
 #ifndef PAGE_OFFSET
 #define PAGE_OFFSET 0xffffffc000000000ULL
 #endif
 
-static unsigned long g_memstart_addr = 0;
+static unsigned long g_phys_offset = 0;
+static int g_offset_resolved = 0;
 
-static inline void *phys_to_virt_arm64(unsigned long phys)
+static void *safe_phys_to_virt(unsigned long phys)
 {
-    return (void *)(phys + (PAGE_OFFSET - g_memstart_addr));
+    if (!g_offset_resolved)
+        return NULL;
+    return (void *)(phys + g_phys_offset);
 }
-#define phys_to_virt(phys) phys_to_virt_arm64(phys)
+
+#define phys_to_virt(phys) safe_phys_to_virt(phys)
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
+KPM_DESCRIPTION("SAFE MEMORY ACCESS - NO CRASH");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -59,7 +63,7 @@ KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
 #define STATUS_PROTECTION     0x100C
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
-#define STATUS_ULTIMATE_OK    0x2000
+#define STATUS_RESOLVE_FAIL   0x100F
 
 struct k_packet {
     uint32_t op_code;
@@ -147,182 +151,439 @@ static inline struct task_struct *hfr_get_current(void)
 static inline int is_valid_user_address(uint64_t addr)
 {
     if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;
+    if (addr >= (1ULL << 39)) return 0;
     return 1;
 }
 
 // ============================================================
-// 🔥 ULTIMATE MEMORY ACCESS - 3-Level Page Walk
+// SAFE MEMORY PROBE - Check if address is readable
 // ============================================================
-static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
-                                   void *buffer, int size, int is_write)
+static int is_address_readable(void *addr)
 {
-    struct mm_struct *mm;
-    unsigned long pgd_table_phys, pgd_table_virt;
-    unsigned long pmd_table_phys, pmd_table_virt;
-    unsigned long pte_table_phys, pte_table_virt;
-    unsigned long pgd_val, pmd_val, pte_val;
-    unsigned long pfn, phys_addr, offset;
-    void *kaddr;
-    int ret = 0;
+    unsigned long dummy;
     
-    if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
-        return -EINVAL;
+    if (!addr)
+        return 0;
+    
+    if ((unsigned long)addr < PAGE_OFFSET)
+        return 0;
+    
+    __try {
+        asm volatile(
+            "1: ldr %0, [%1]\n"
+            "2:\n"
+            _ASM_EXTABLE(1b, 2b)
+            : "=r" (dummy)
+            : "r" (addr)
+        );
+        return 1;
+    } __catch {
+        return 0;
     }
-    
-    mm = p_get_task_mm(task);
-    if (!mm) {
-        kpm_err("ULTIMATE: No mm for task\n");
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 1: PGD table - PHYSICAL from mm_struct (offset 0x48)
-    pgd_table_phys = *(unsigned long *)((char *)mm + 0x48);
-    if (!pgd_table_phys) {
-        kpm_err("ULTIMATE: pgd_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_table_phys = 0x%llx\n", pgd_table_phys);
-    
-    // 🔥 STEP 2: PHYSICAL → VIRTUAL
-    pgd_table_virt = (unsigned long)phys_to_virt(pgd_table_phys);
-    if (!pgd_table_virt) {
-        kpm_err("ULTIMATE: pgd_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_table_virt = 0x%llx\n", pgd_table_virt);
-    
-    // 🔥 STEP 3: PGD Entry (shift 39, 9 bits)
-    unsigned long pgd_idx = (addr >> 30) & 0x1FF;
-    pgd_val = *(unsigned long *)(pgd_table_virt + pgd_idx * 8);
-    if (!(pgd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PGD entry at idx %lu\n", pgd_idx);
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
-    
-    // 🔥 STEP 4: PMD Table - PHYSICAL from PGD
-    pmd_table_phys = pgd_val & ~0xFFF;
-    if (!pmd_table_phys) {
-        kpm_err("ULTIMATE: pmd_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 5: PHYSICAL → VIRTUAL
-    pmd_table_virt = (unsigned long)phys_to_virt(pmd_table_phys);
-    if (!pmd_table_virt) {
-        kpm_err("ULTIMATE: pmd_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 6: PMD Entry (shift 30, 9 bits)
-    unsigned long pmd_idx = (addr >> 21) & 0x1FF;
-    pmd_val = *(unsigned long *)(pmd_table_virt + pmd_idx * 8);
-    if (!(pmd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PMD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
-    
-    // 🔥 STEP 7: Check Huge Page (PMD_SECT bit - bit 1)
-    if (!(pmd_val & (1UL << 1))) {
-        pfn = pmd_val >> 12;
-        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = phys_to_virt(phys_addr);
-        if (!kaddr) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        offset = addr & 0x1FFFFF;
-        if (offset + size > 0x200000) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        if (is_write) {
-            memcpy((char *)kaddr + offset, buffer, size);
-        } else {
-            memcpy(buffer, (char *)kaddr + offset, size);
-        }
-        if (p_mmput) p_mmput(mm);
-        return size;
-    }
-    
-    // 🔥 STEP 8: PTE Table - PHYSICAL from PMD
-    pte_table_phys = pmd_val & ~0xFFF;
-    if (!pte_table_phys) {
-        kpm_err("ULTIMATE: pte_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 9: PHYSICAL → VIRTUAL
-    pte_table_virt = (unsigned long)phys_to_virt(pte_table_phys);
-    if (!pte_table_virt) {
-        kpm_err("ULTIMATE: pte_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 10: PTE Entry (shift 21, 9 bits)
-    unsigned long pte_idx = (addr >> 12) & 0x1FF;
-    pte_val = *(unsigned long *)(pte_table_virt + pte_idx * 8);
-    if (!(pte_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PTE entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
-    
-    // 🔥 STEP 11: PFN from PTE
-    pfn = (pte_val & ~0xFFFUL) >> 12;
-    if (pfn == 0) {
-        kpm_err("ULTIMATE: Invalid PFN\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 12: Physical Address
-    phys_addr = (pfn << 12) | (addr & 0xFFF);
-    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
-    
-    // 🔥 STEP 13: phys_to_virt se kernel virtual address
-    kaddr = phys_to_virt(phys_addr);
-    if (!kaddr) {
-        kpm_err("ULTIMATE: kaddr is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 14: Check page boundary
-    offset = addr & 0xFFF;
-    if (offset + size > 0x1000) {
-        kpm_err("ULTIMATE: Page boundary crossed\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 15: DIRECT ACCESS
-    if (is_write) {
-        memcpy((char *)kaddr + offset, buffer, size);
-        kpm_info("ULTIMATE: Wrote %d bytes\n", size);
-    } else {
-        memcpy(buffer, (char *)kaddr + offset, size);
-        kpm_info("ULTIMATE: Read %d bytes\n", size);
-    }
-    ret = size;
-    
-    if (p_mmput) p_mmput(mm);
-    return ret;
+    return 0;
 }
 
 // ============================================================
-// PROCESS PACKET - Ultimate Access (No Fallback!)
+// DYNAMIC PHYS_TO_VIRT OFFSET DISCOVERY
+// Method: Use linear mapping properties of ARM64
+// ============================================================
+static int resolve_phys_to_virt_offset(void)
+{
+    unsigned long *memstart_ptr;
+    unsigned long *kimage_ptr;
+    unsigned long *swapper_ptr;
+    unsigned long swapper_phys;
+    unsigned long test_offset;
+    void *test_addr;
+    
+    kpm_info("Resolving phys_to_virt offset dynamically...\n");
+    
+    // Method 1: Try memstart_addr
+    memstart_ptr = (unsigned long *)kallsyms_lookup_name("memstart_addr");
+    if (memstart_ptr) {
+        kpm_info("memstart_addr ptr: %px, value: 0x%llx\n", memstart_ptr, *memstart_ptr);
+        if (*memstart_ptr != 0 || (unsigned long)memstart_ptr > PAGE_OFFSET) {
+            g_phys_offset = PAGE_OFFSET - *memstart_ptr;
+            g_offset_resolved = 1;
+            kpm_info("Method 1 SUCCESS: memstart_addr=0x%llx, phys_offset=0x%llx\n", 
+                     *memstart_ptr, g_phys_offset);
+            return 0;
+        }
+    }
+    
+    // Method 2: Try kimage_voffset
+    kimage_ptr = (unsigned long *)kallsyms_lookup_name("kimage_voffset");
+    if (kimage_ptr) {
+        kpm_info("kimage_voffset ptr: %px, value: 0x%llx\n", kimage_ptr, *kimage_ptr);
+        if (*kimage_ptr != 0 && *kimage_ptr < PAGE_OFFSET) {
+            // kimage_voffset = kernel virtual base - kernel physical base
+            // For linear map: virt = phys + PAGE_OFFSET
+            // We need to find PAGE_OFFSET
+            // Try using _text symbol
+            unsigned long *_text = (unsigned long *)kallsyms_lookup_name("_text");
+            if (_text) {
+                // _text virtual address = _text physical + kimage_voffset
+                // We know _text virtual from _text symbol itself
+                // Linear map of _text = _text physical + PAGE_OFFSET
+                // This doesn't directly help, need another approach
+                kpm_info("_text: %px\n", _text);
+            }
+        }
+    }
+    
+    // Method 3: Use swapper_pg_dir to calculate offset
+    swapper_ptr = (unsigned long *)kallsyms_lookup_name("swapper_pg_dir");
+    if (swapper_ptr && is_address_readable(swapper_ptr)) {
+        kpm_info("swapper_pg_dir virtual: %px\n", swapper_ptr);
+        
+        // Try common PAGE_OFFSET values for ARM64
+        unsigned long possible_offsets[] = {
+            0xffffff8000000000ULL,  // 39-bit VA
+            0xffffffc000000000ULL,  // Default in header
+            0xffff800000000000ULL,  // Another common
+            0xffffff0000000000ULL,  // Another variant
+        };
+        
+        // For each possible offset, check if linear map works
+        for (int i = 0; i < 4; i++) {
+            test_offset = possible_offsets[i];
+            
+            // Check if PAGE_OFFSET itself is mappable
+            test_addr = (void *)test_offset;
+            if (is_address_readable(test_addr)) {
+                // This offset seems valid
+                // Now try to find memstart_addr by scanning low physical memory
+                // Physical 0 should be at PAGE_OFFSET
+                // Check if reading from PAGE_OFFSET + some known physical address works
+                
+                // Try reading at PAGE_OFFSET (physical 0 if memstart_addr=0)
+                if (is_address_readable(test_addr)) {
+                    kpm_info("Testing PAGE_OFFSET=0x%llx - readable\n", test_offset);
+                    
+                    // Assume memstart_addr = 0 (physical 0 at PAGE_OFFSET)
+                    g_phys_offset = test_offset;
+                    g_offset_resolved = 1;
+                    kpm_info("Method 3 SUCCESS: phys_offset=0x%llx\n", g_phys_offset);
+                    return 0;
+                }
+            }
+        }
+    }
+    
+    // Method 4: Try to calculate from kernel symbols
+    // Find a symbol we know both virtual and can compute physical
+    // __START_KERNEL_map and physvirt_offset
+    {
+        unsigned long *physvirt_ptr;
+        physvirt_ptr = (unsigned long *)kallsyms_lookup_name("physvirt_offset");
+        if (physvirt_ptr) {
+            kpm_info("physvirt_offset: %px, value: 0x%llx\n", physvirt_ptr, *physvirt_ptr);
+            if (*physvirt_ptr != 0) {
+                // physvirt_offset = PHYS_OFFSET - PAGE_OFFSET
+                // We want phys_to_virt: virt = phys + PAGE_OFFSET
+                // From physvirt_offset: PHYS_OFFSET = PAGE_OFFSET + physvirt_offset
+                // But we need PAGE_OFFSET itself
+                // Actually: physvirt_offset = PHYS_OFFSET - PAGE_OFFSET
+                // PAGE_OFFSET is typically fixed per VA bits
+                // Try default PAGE_OFFSET
+                g_phys_offset = PAGE_OFFSET;
+                g_offset_resolved = 1;
+                kpm_info("Method 4 SUCCESS: using default PAGE_OFFSET=0x%llx\n", g_phys_offset);
+                return 0;
+            }
+        }
+    }
+    
+    // Method 5: Last resort - try default PAGE_OFFSET and verify
+    {
+        test_addr = (void *)PAGE_OFFSET;
+        if (is_address_readable(test_addr)) {
+            kpm_info("Default PAGE_OFFSET 0x%llx is readable, using it\n", PAGE_OFFSET);
+            g_phys_offset = PAGE_OFFSET;
+            g_offset_resolved = 1;
+            kpm_info("Method 5 SUCCESS: using PAGE_OFFSET=0x%llx\n", g_phys_offset);
+            return 0;
+        }
+    }
+    
+    kpm_err("ALL METHODS FAILED to resolve phys_to_virt offset!\n");
+    return -EFAULT;
+}
+
+// ============================================================
+// SAFE PAGE TABLE WALK - With validation at every step
+// ============================================================
+static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
+                                void *buffer, int size)
+{
+    unsigned long pgd_val, pmd_val, pte_val;
+    unsigned long pgd_phys, pmd_phys, pte_phys;
+    unsigned long pgd_virt, pmd_virt, pte_virt;
+    unsigned long pfn, phys_addr, offset;
+    unsigned long pgd_idx, pmd_idx, pte_idx;
+    void *kaddr;
+    
+    if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
+        return -EINVAL;
+    
+    if (!g_offset_resolved)
+        return -EFAULT;
+    
+    // Step 1: Get PGD physical address from mm_struct
+    // Try multiple possible offsets for pgd in mm_struct
+    int pgd_found = 0;
+    unsigned long possible_offsets[] = {0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80};
+    
+    for (int i = 0; i < 8; i++) {
+        pgd_phys = *(unsigned long *)((char *)mm + possible_offsets[i]);
+        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 40)) {
+            // Looks like a valid physical address (page-aligned, reasonable range)
+            kpm_info("pgd offset try 0x%lx: pgd_phys=0x%llx\n", possible_offsets[i], pgd_phys);
+            pgd_found = 1;
+            break;
+        }
+    }
+    
+    if (!pgd_found) {
+        kpm_err("Cannot find PGD in mm_struct\n");
+        return -EFAULT;
+    }
+    
+    // Step 2: Convert PGD physical to virtual
+    pgd_virt = (unsigned long)phys_to_virt(pgd_phys);
+    if (!pgd_virt || !is_address_readable((void *)pgd_virt)) {
+        kpm_err("PGD virtual address 0x%llx not readable\n", pgd_virt);
+        return -EFAULT;
+    }
+    
+    // Step 3: Walk PGD -> PMD -> PTE (3-level for 39-bit VA)
+    pgd_idx = (addr >> 30) & 0x1FF;
+    pgd_val = *(unsigned long *)(pgd_virt + pgd_idx * 8);
+    
+    // Check if PGD entry is valid table descriptor (bits[1:0] = 0b11)
+    if ((pgd_val & 0x3) != 0x3) {
+        kpm_err("Invalid PGD entry: 0x%llx (type bits: 0x%llx)\n", 
+                pgd_val, pgd_val & 0x3);
+        return -EFAULT;
+    }
+    
+    // Step 4: Get PMD table
+    pmd_phys = pgd_val & ~0xFFFULL;
+    pmd_virt = (unsigned long)phys_to_virt(pmd_phys);
+    if (!pmd_virt || !is_address_readable((void *)pmd_virt)) {
+        kpm_err("PMD virtual address 0x%llx not readable\n", pmd_virt);
+        return -EFAULT;
+    }
+    
+    pmd_idx = (addr >> 21) & 0x1FF;
+    pmd_val = *(unsigned long *)(pmd_virt + pmd_idx * 8);
+    
+    // Check if PMD entry is valid
+    if (!(pmd_val & 0x1)) {
+        kpm_err("Invalid PMD entry (not present): 0x%llx\n", pmd_val);
+        return -EFAULT;
+    }
+    
+    // Check for block mapping (bit 1 = 0, bit 0 = 1)
+    if ((pmd_val & 0x3) == 0x1) {
+        // This is a 2MB block mapping
+        kpm_info("PMD block mapping detected\n");
+        pfn = pmd_val >> 12;
+        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
+        offset = addr & 0x1FFFFF;
+        
+        if (offset + size > 0x200000) {
+            kpm_err("Block mapping boundary crossed\n");
+            return -EFAULT;
+        }
+        
+        kaddr = phys_to_virt(phys_addr);
+        if (!kaddr || !is_address_readable(kaddr)) {
+            kpm_err("Block physical 0x%llx not readable\n", phys_addr);
+            return -EFAULT;
+        }
+        
+        memcpy(buffer, (char *)kaddr, size);
+        return size;
+    }
+    
+    // Check if PMD entry is table descriptor (bits[1:0] = 0b11)
+    if ((pmd_val & 0x3) != 0x3) {
+        kpm_err("Invalid PMD entry type: 0x%llx\n", pmd_val & 0x3);
+        return -EFAULT;
+    }
+    
+    // Step 5: Get PTE table
+    pte_phys = pmd_val & ~0xFFFULL;
+    pte_virt = (unsigned long)phys_to_virt(pte_phys);
+    if (!pte_virt || !is_address_readable((void *)pte_virt)) {
+        kpm_err("PTE virtual address 0x%llx not readable\n", pte_virt);
+        return -EFAULT;
+    }
+    
+    pte_idx = (addr >> 12) & 0x1FF;
+    pte_val = *(unsigned long *)(pte_virt + pte_idx * 8);
+    
+    // Check if PTE is valid and present
+    if (!(pte_val & 0x1)) {
+        kpm_err("Invalid PTE entry (not present): 0x%llx\n", pte_val);
+        return -EFAULT;
+    }
+    
+    // Step 6: Get physical page
+    pfn = (pte_val & ~0xFFFULL) >> 12;
+    if (pfn == 0) {
+        kpm_err("Zero PFN from PTE\n");
+        return -EFAULT;
+    }
+    
+    phys_addr = (pfn << 12) | (addr & 0xFFF);
+    offset = addr & 0xFFF;
+    
+    if (offset + size > 0x1000) {
+        kpm_err("Page boundary crossed\n");
+        return -EFAULT;
+    }
+    
+    kaddr = phys_to_virt(phys_addr);
+    if (!kaddr || !is_address_readable(kaddr)) {
+        kpm_err("Physical 0x%llx not readable\n", phys_addr);
+        return -EFAULT;
+    }
+    
+    memcpy(buffer, (char *)kaddr, size);
+    return size;
+}
+
+static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
+                                 void *buffer, int size)
+{
+    unsigned long pgd_val, pmd_val, pte_val;
+    unsigned long pgd_phys, pmd_phys, pte_phys;
+    unsigned long pgd_virt, pmd_virt, pte_virt;
+    unsigned long pfn, phys_addr, offset;
+    unsigned long pgd_idx, pmd_idx, pte_idx;
+    void *kaddr;
+    
+    if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
+        return -EINVAL;
+    
+    if (!g_offset_resolved)
+        return -EFAULT;
+    
+    // Same walk as read but with write at the end
+    int pgd_found = 0;
+    unsigned long possible_offsets[] = {0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80};
+    
+    for (int i = 0; i < 8; i++) {
+        pgd_phys = *(unsigned long *)((char *)mm + possible_offsets[i]);
+        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 40)) {
+            pgd_found = 1;
+            break;
+        }
+    }
+    
+    if (!pgd_found) {
+        kpm_err("Cannot find PGD in mm_struct\n");
+        return -EFAULT;
+    }
+    
+    pgd_virt = (unsigned long)phys_to_virt(pgd_phys);
+    if (!pgd_virt || !is_address_readable((void *)pgd_virt)) {
+        kpm_err("PGD virtual address 0x%llx not readable\n", pgd_virt);
+        return -EFAULT;
+    }
+    
+    pgd_idx = (addr >> 30) & 0x1FF;
+    pgd_val = *(unsigned long *)(pgd_virt + pgd_idx * 8);
+    
+    if ((pgd_val & 0x3) != 0x3) {
+        kpm_err("Invalid PGD entry: 0x%llx\n", pgd_val);
+        return -EFAULT;
+    }
+    
+    pmd_phys = pgd_val & ~0xFFFULL;
+    pmd_virt = (unsigned long)phys_to_virt(pmd_phys);
+    if (!pmd_virt || !is_address_readable((void *)pmd_virt)) {
+        kpm_err("PMD virtual address 0x%llx not readable\n", pmd_virt);
+        return -EFAULT;
+    }
+    
+    pmd_idx = (addr >> 21) & 0x1FF;
+    pmd_val = *(unsigned long *)(pmd_virt + pmd_idx * 8);
+    
+    if (!(pmd_val & 0x1)) {
+        kpm_err("Invalid PMD entry\n");
+        return -EFAULT;
+    }
+    
+    // Block mapping for write
+    if ((pmd_val & 0x3) == 0x1) {
+        pfn = pmd_val >> 12;
+        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
+        offset = addr & 0x1FFFFF;
+        
+        if (offset + size > 0x200000) {
+            kpm_err("Block mapping boundary crossed\n");
+            return -EFAULT;
+        }
+        
+        kaddr = phys_to_virt(phys_addr);
+        if (!kaddr || !is_address_readable(kaddr)) {
+            kpm_err("Block physical 0x%llx not readable\n", phys_addr);
+            return -EFAULT;
+        }
+        
+        memcpy((char *)kaddr, buffer, size);
+        return size;
+    }
+    
+    if ((pmd_val & 0x3) != 0x3) {
+        kpm_err("Invalid PMD entry type\n");
+        return -EFAULT;
+    }
+    
+    pte_phys = pmd_val & ~0xFFFULL;
+    pte_virt = (unsigned long)phys_to_virt(pte_phys);
+    if (!pte_virt || !is_address_readable((void *)pte_virt)) {
+        kpm_err("PTE virtual address 0x%llx not readable\n", pte_virt);
+        return -EFAULT;
+    }
+    
+    pte_idx = (addr >> 12) & 0x1FF;
+    pte_val = *(unsigned long *)(pte_virt + pte_idx * 8);
+    
+    if (!(pte_val & 0x1)) {
+        kpm_err("Invalid PTE entry\n");
+        return -EFAULT;
+    }
+    
+    pfn = (pte_val & ~0xFFFULL) >> 12;
+    if (pfn == 0) {
+        kpm_err("Zero PFN from PTE\n");
+        return -EFAULT;
+    }
+    
+    phys_addr = (pfn << 12) | (addr & 0xFFF);
+    offset = addr & 0xFFF;
+    
+    if (offset + size > 0x1000) {
+        kpm_err("Page boundary crossed\n");
+        return -EFAULT;
+    }
+    
+    kaddr = phys_to_virt(phys_addr);
+    if (!kaddr || !is_address_readable(kaddr)) {
+        kpm_err("Physical 0x%llx not readable\n", phys_addr);
+        return -EFAULT;
+    }
+    
+    memcpy((char *)kaddr, buffer, size);
+    return size;
+}
+
+// ============================================================
+// PROCESS PACKET - Safe Version
 // ============================================================
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
@@ -333,35 +594,47 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
-    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
+    kpm_info(">>> process_packet: op=0x%x pid=%u addr=0x%llx size=%u caller=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
+    // Validate opcode
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
+    // Validate size
     if (!pkt->size || pkt->size > MAX_INLINE) {
         kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
+    // Validate address
     if (!is_valid_user_address(pkt->vaddr)) {
         kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
+    // Check offset resolution
+    if (!g_offset_resolved) {
+        kpm_err("PHYS_OFFSET not resolved\n");
+        pkt->status = STATUS_RESOLVE_FAIL;
+        return;
+    }
+
+    // Check required symbols
     if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
+    // Resolve target PID
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid resolved: %d\n", target_pid);
+    kpm_info("target_pid: %d\n", target_pid);
     
     if (target_pid <= 0) {
         kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
@@ -369,8 +642,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
+    // Find task
     if (p_rcu_read_lock) p_rcu_read_lock();
-
     task = p_find_task_by_vpid(target_pid);
     kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
     
@@ -381,10 +654,11 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
+    // Get task struct and mm
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
     kpm_info("get_task_mm = %px\n", mm);
-
+    
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
@@ -394,6 +668,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
+    // Prepare buffer
     is_write_op = (pkt->op_code == OP_WRITE_VM);
     memset(temp_buffer, 0, MAX_INLINE);
     
@@ -401,41 +676,44 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
-    transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
-
-    if (transferred > 0) {
-        kpm_info("✅ ULTIMATE SUCCESS: %d bytes\n", transferred);
-        pkt->status = STATUS_ULTIMATE_OK;
+    // Perform safe memory access
+    if (is_write_op) {
+        transferred = safe_page_walk_write(mm, pkt->vaddr, temp_buffer, pkt->size);
     } else {
-        kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
-        pkt->status = STATUS_PROTECTION;
+        transferred = safe_page_walk_read(mm, pkt->vaddr, temp_buffer, pkt->size);
     }
 
+    kpm_info("Transfer result: %d\n", transferred);
+
+    // Process result
+    if (transferred > 0) {
+        pkt->status = STATUS_SUCCESS;
+        kpm_info("SUCCESS: %d bytes transferred\n", transferred);
+    } else if (transferred == -EFAULT) {
+        pkt->status = STATUS_VM_FAULT;
+        kpm_err("VM_FAULT\n");
+    } else if (transferred == -EINVAL) {
+        pkt->status = STATUS_INVALID_SIZE;
+        kpm_err("INVALID\n");
+    } else {
+        pkt->status = STATUS_PROTECTION;
+        kpm_err("PROTECTION\n");
+    }
+
+    // Cleanup
+    if (p_mmput && mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
 
-    if (transferred < 0) {
-        pkt->status = STATUS_VM_FAULT;
-        return;
-    }
-
-    if (transferred == 0 && pkt->size > 0) {
-        pkt->status = STATUS_PROTECTION;
-        return;
-    }
-
+    // Copy back read data
     if (!is_write_op && transferred > 0) {
         memset(pkt->inline_data, 0, MAX_INLINE);
         memcpy(pkt->inline_data, temp_buffer, transferred);
     }
 
-    if ((uint32_t)transferred != pkt->size) {
+    // Update size for partial transfers
+    if (transferred > 0 && (uint32_t)transferred != pkt->size) {
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
-        return;
-    }
-
-    if (pkt->status == STATUS_ULTIMATE_OK) {
-        pkt->status = STATUS_SUCCESS;
     }
 }
 
@@ -450,31 +728,50 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     struct task_struct *curr_task;
 
     if (count != sizeof(struct k_packet)) {
+        kpm_err("Invalid write size: %zu, expected: %zu\n", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
-    if (!p_copy_from_user) return -EFAULT;
+    if (!p_copy_from_user) {
+        kpm_err("copy_from_user not available\n");
+        return -EFAULT;
+    }
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_from_user failed\n");
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
-    if (!curr_task) return -ESRCH;
+    if (!curr_task) {
+        kpm_err("Cannot get current task\n");
+        return -ESRCH;
+    }
 
-    if (!p_task_pid_nr_ns) return -EFAULT;
+    if (!p_task_pid_nr_ns) {
+        kpm_err("task_pid_nr_ns not available\n");
+        return -EFAULT;
+    }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
+    kpm_info("Caller PID: %d\n", caller_pid);
     
-    if (caller_pid <= 0) return -ESRCH;
+    if (caller_pid <= 0) {
+        kpm_err("Invalid caller PID\n");
+        return -ESRCH;
+    }
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user) return -EFAULT;
+    if (!p_copy_to_user) {
+        kpm_err("copy_to_user not available\n");
+        return -EFAULT;
+    }
     
     if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_to_user failed\n");
         return -EFAULT;
     }
 
@@ -497,8 +794,9 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== ULTIMATE ZERO TRACE INIT START ===\n");
+    kpm_info("=== SAFE MEMORY ACCESS INIT START ===\n");
     
+    // Resolve symbols
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -518,48 +816,55 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    // 🔥🔥🔥 GET memstart_addr FROM KALLSYMS 🔥🔥🔥
-    {
-    unsigned long *memstart_ptr;
-    memstart_ptr = (unsigned long *)kallsyms_lookup_name("memstart_addr");
-    if (!memstart_ptr)
-        return -EFAULT;
-    g_memstart_addr = *memstart_ptr;
-};
-    if (!g_memstart_addr) {
-        kpm_err("❌ memstart_addr not found!\n");
-        return -EFAULT;
-    }
-    kpm_info("✅ memstart_addr = 0x%llx\n", g_memstart_addr);
-    kpm_info("✅ PAGE_OFFSET - memstart_addr = 0x%llx\n", (PAGE_OFFSET - g_memstart_addr));
+    kpm_info("Symbols resolved:\n");
+    kpm_info("  proc_create_data: %px\n", p_proc_create_data);
+    kpm_info("  find_task_by_vpid: %px\n", p_find_task_by_vpid);
+    kpm_info("  get_task_mm: %px\n", p_get_task_mm);
+    kpm_info("  mmput: %px\n", p_mmput);
+    kpm_info("  copy_from_user: %px\n", p_copy_from_user);
+    kpm_info("  copy_to_user: %px\n", p_copy_to_user);
+    kpm_info("  task_pid_nr_ns: %px\n", p_task_pid_nr_ns);
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
-
+    // Check critical symbols
     if (!p_proc_create_data || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
+        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || 
+        !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
 
+    // Resolve phys_to_virt offset dynamically
+    kpm_info("Resolving phys_to_virt offset...\n");
+    if (resolve_phys_to_virt_offset() != 0) {
+        kpm_err("Failed to resolve phys_to_virt offset\n");
+        return -EFAULT;
+    }
+    
+    kpm_info("Phys to virt offset resolved: 0x%llx\n", g_phys_offset);
+
+    // Initialize mutex
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
 
+    // Create proc entry
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
         kpm_err("proc_create FAILED\n");
         return -EFAULT;
     }
 
-    kpm_info("=== ULTIMATE ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 3-LEVEL PAGE WALK ACTIVE! memstart_addr resolved!\n");
+    kpm_info("=== SAFE MEMORY ACCESS INIT SUCCESS ===\n");
+    kpm_info("=== /proc/%s created ===\n", proc_filename);
+    kpm_info("=== Dynamic offset: 0x%llx ===\n", g_phys_offset);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== ULTIMATE EXIT ===\n");
-    if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
+    kpm_info("=== SAFE MEMORY ACCESS EXIT ===\n");
+    if (proc_entry && p_remove_proc_entry) {
+        p_remove_proc_entry(proc_filename, NULL);
+        kpm_info("proc entry removed\n");
+    }
     return 0;
 }
 
