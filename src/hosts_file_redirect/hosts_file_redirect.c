@@ -13,7 +13,8 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <pgtable.h>
+#include <asm/pgtable.h>
+
 // ============================================================
 // ✅ PHYS_TO_VIRT - Direct ARM64 formula
 // ============================================================
@@ -31,17 +32,11 @@ static inline void *phys_to_virt_arm64(unsigned long phys) {
 
 #define phys_to_virt(phys) phys_to_virt_arm64(phys)
 
-// ============================================================
-// 🔥 EXPORTED SYMBOLS - init_mm and swapper_pg_dir
-// ============================================================
-extern struct mm_struct init_mm;
-extern unsigned long swapper_pg_dir[];
-
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE ZERO TRACE - init_mm PGD offset");
+KPM_DESCRIPTION("ULTIMATE ZERO TRACE - kallsyms PGD offset");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -145,7 +140,9 @@ static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
-// 🔥 GLOBAL PGD OFFSET - init_mm se calculate karenge
+// 🔥 GLOBALS - init_mm and swapper_pg_dir addresses
+static unsigned long g_init_mm_addr = 0;
+static unsigned long g_swapper_pg_dir_addr = 0;
 static int g_pgd_offset = -1;
 
 static inline struct task_struct *hfr_get_current(void)
@@ -163,38 +160,41 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥 PGD OFFSET FINDER - init_mm aur swapper_pg_dir se
+// 🔥 PGD OFFSET FINDER - kallsyms_lookup_name se
 // ============================================================
 static int get_pgd_offset_from_init_mm(void)
 {
-    unsigned long init_mm_addr = (unsigned long)&init_mm;
-    unsigned long swapper_pg_dir_addr = (unsigned long)swapper_pg_dir;
-    int offset;
     unsigned long *ptr;
+    int offset;
     unsigned long val;
     
-    kpm_info("🔍 init_mm addr: 0x%llx\n", init_mm_addr);
-    kpm_info("🔍 swapper_pg_dir addr: 0x%llx\n", swapper_pg_dir_addr);
+    if (!g_init_mm_addr || !g_swapper_pg_dir_addr) {
+        kpm_err("❌ init_mm or swapper_pg_dir not resolved!\n");
+        return -1;
+    }
+    
+    kpm_info("🔍 init_mm addr: 0x%llx\n", g_init_mm_addr);
+    kpm_info("🔍 swapper_pg_dir addr: 0x%llx\n", g_swapper_pg_dir_addr);
     
     // Calculate offset
-    offset = swapper_pg_dir_addr - init_mm_addr;
+    offset = g_swapper_pg_dir_addr - g_init_mm_addr;
     kpm_info("🔍 Calculated PGD offset: 0x%x\n", offset);
     
     // Verify: init_mm + offset should point to swapper_pg_dir
-    ptr = (unsigned long *)(init_mm_addr + offset);
+    ptr = (unsigned long *)(g_init_mm_addr + offset);
     val = *ptr;
     
-    if (val == swapper_pg_dir_addr) {
+    if (val == g_swapper_pg_dir_addr) {
         kpm_info("✅ PGD offset verification SUCCESS: 0x%x\n", offset);
         g_pgd_offset = offset;
         return offset;
     }
     
-    // Fallback: Scan init_mm for swapper_pg_dir pointer
+    // Fallback: Scan init_mm
     kpm_info("🔍 Verification failed, scanning init_mm...\n");
     for (int i = 0; i < 64; i++) {
-        ptr = (unsigned long *)(init_mm_addr + (i * 8));
-        if (*ptr == swapper_pg_dir_addr) {
+        ptr = (unsigned long *)(g_init_mm_addr + (i * 8));
+        if (*ptr == g_swapper_pg_dir_addr) {
             offset = i * 8;
             kpm_info("✅ Found PGD at offset 0x%x (scan)\n", offset);
             g_pgd_offset = offset;
@@ -229,7 +229,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: Get PGD offset from init_mm if not cached
+    // 🔥 STEP 1: Get PGD offset if not cached
     if (g_pgd_offset < 0) {
         if (get_pgd_offset_from_init_mm() < 0) {
             if (p_mmput) p_mmput(mm);
@@ -539,6 +539,17 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
+    // 🔥🔥🔥 FETCH init_mm AND swapper_pg_dir FROM KALLSYMS 🔥🔥🔥
+    g_init_mm_addr = (unsigned long)kallsyms_lookup_name("init_mm");
+    g_swapper_pg_dir_addr = (unsigned long)kallsyms_lookup_name("swapper_pg_dir");
+    
+    if (!g_init_mm_addr || !g_swapper_pg_dir_addr) {
+        kpm_err("❌ init_mm or swapper_pg_dir not found!\n");
+        return -EFAULT;
+    }
+    kpm_info("✅ init_mm = 0x%llx\n", g_init_mm_addr);
+    kpm_info("✅ swapper_pg_dir = 0x%llx\n", g_swapper_pg_dir_addr);
+
     kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
              p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
@@ -558,7 +569,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 init_mm PGD offset finder ACTIVE!\n");
+    kpm_info("🔥 kallsyms PGD offset finder ACTIVE!\n");
     return 0;
 }
 
