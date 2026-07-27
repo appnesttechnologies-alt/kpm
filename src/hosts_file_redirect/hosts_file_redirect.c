@@ -13,16 +13,32 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <asm/memory.h>          // ✅ phys_to_virt, __va
 
 // 🔥 mm_struct_offset - dynamic offsets ke liye
 extern struct mm_struct_offset mm_struct_offset;
+
+// ============================================================
+// ✅ PHYS_TO_VIRT - Direct ARM64 formula (No header needed!)
+// ============================================================
+#ifndef PHYS_OFFSET
+#define PHYS_OFFSET 0x0000000000000000ULL
+#endif
+
+#ifndef PAGE_OFFSET
+#define PAGE_OFFSET 0xffffffc000000000ULL
+#endif
+
+static inline void *phys_to_virt_arm64(unsigned long phys) {
+    return (void *)((phys - PHYS_OFFSET) | PAGE_OFFSET);
+}
+
+#define phys_to_virt(phys) phys_to_virt_arm64(phys)
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE NO TRACE - Kernel phys_to_virt");
+KPM_DESCRIPTION("ULTIMATE NO TRACE - Direct phys_to_virt");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -141,7 +157,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Kernel phys_to_virt 🔥🔥🔥
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Direct phys_to_virt 🔥🔥🔥
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
@@ -157,22 +173,19 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EINVAL;
     }
 
-    // Get mm_struct
     mm = p_get_task_mm(task);
     if (!mm) {
         kpm_err("ULTIMATE: No mm for task\n");
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: PGD using mm_struct_offset (Dynamic!)
+    // 🔥 STEP 1: PGD using mm_struct_offset
     pgd_ptr = (unsigned long)((char *)mm + mm_struct_offset.pgd_offset);
     if (!pgd_ptr || *(unsigned long *)pgd_ptr == 0) {
         kpm_err("ULTIMATE: Invalid PGD pointer\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: mm->pgd at offset 0x%x = 0x%llx\n", 
-             mm_struct_offset.pgd_offset, pgd_ptr);
 
     // 🔥 STEP 2: PGD Entry (ARM64: 9 bits, shift 39)
     unsigned long pgd_idx = (addr >> 39) & 0x1FF;
@@ -182,7 +195,6 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
 
     // 🔥 STEP 3: PUD Entry (ARM64: 9 bits, shift 30)
     unsigned long pud_idx = (addr >> 30) & 0x1FF;
@@ -193,7 +205,6 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: pud_val = 0x%llx\n", pud_val);
 
     // 🔥 STEP 4: PMD Entry (ARM64: 9 bits, shift 21)
     unsigned long pmd_idx = (addr >> 21) & 0x1FF;
@@ -204,25 +215,20 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
 
-    // 🔥 STEP 5: Check Huge Page (2MB) - PMD_SECT bit (bit 1)
+    // 🔥 STEP 5: Huge Page (2MB)
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        // ✅ KERNEL phys_to_virt
         kaddr = phys_to_virt(phys_addr);
         if (!kaddr) {
-            kpm_err("ULTIMATE: phys_to_virt failed for huge page\n");
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
         if (is_write) {
             memcpy(kaddr + (addr & 0x1FFFFF), buffer, size);
-            kpm_info("ULTIMATE: Huge page WRITE %d bytes\n", size);
         } else {
             memcpy(buffer, kaddr + (addr & 0x1FFFFF), size);
-            kpm_info("ULTIMATE: Huge page READ %d bytes\n", size);
         }
         if (p_mmput) p_mmput(mm);
         return size;
@@ -237,9 +243,8 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
 
-    // 🔥 STEP 7: PFN direct from PTE (bits 12-47)
+    // 🔥 STEP 7: PFN from PTE
     pfn = pte_val >> 12;
     if (pfn == 0) {
         kpm_err("ULTIMATE: Invalid PFN\n");
@@ -249,9 +254,8 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
 
     // 🔥 STEP 8: Physical Address
     phys_addr = (pfn << 12) | (addr & 0xFFF);
-    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
 
-    // ✅ KERNEL phys_to_virt
+    // ✅ Direct phys_to_virt
     kaddr = phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: phys_to_virt failed\n");
@@ -263,10 +267,8 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     offset = addr & 0xFFF;
     if (is_write) {
         memcpy(kaddr + offset, buffer, size);
-        kpm_info("ULTIMATE: Wrote %d bytes at offset 0x%lx\n", size, offset);
     } else {
         memcpy(buffer, kaddr + offset, size);
-        kpm_info("ULTIMATE: Read %d bytes from offset 0x%lx\n", size, offset);
     }
     ret = size;
 
@@ -355,12 +357,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
-    // ============================================================
-    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO TRACE 🔥🔥🔥
-    // ============================================================
-    kpm_info("ULTIMATE: Accessing addr 0x%llx, size %d, write=%d\n", 
-             pkt->vaddr, pkt->size, is_write_op);
-
     transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     if (transferred > 0) {
@@ -369,11 +365,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         ultimate_used = 1;
     } else {
         kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
-        // Fallback to access_process_vm if ultimate fails
         unsigned int gup_flags = is_write_op ? 0x01 : 0x00;
-        kpm_info("Fallback: Using access_process_vm\n");
         transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-        kpm_info("access_process_vm returned: %d\n", transferred);
         if (transferred > 0) {
             pkt->status = STATUS_SUCCESS;
         }
@@ -383,13 +376,11 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
-        kpm_err("VM_FAULT: %d\n", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
-        kpm_err("PROTECTION\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -400,13 +391,11 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
-        kpm_info("PARTIAL_IO: wanted %u got %d\n", pkt->size, transferred);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS (Ultimate: %d)\n", ultimate_used);
     if (pkt->status == STATUS_ULTIMATE_OK) {
         pkt->status = STATUS_SUCCESS;
     }
@@ -422,57 +411,35 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    kpm_info("*** proc_write_handler: count=%zu expected=%zu\n", count, sizeof(struct k_packet));
-
     if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
-    if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL\n");
-        return -EFAULT;
-    }
+    if (!p_copy_from_user) return -EFAULT;
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_from_user failed\n");
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
-    if (!curr_task) {
-        kpm_err("get_current failed\n");
-        return -ESRCH;
-    }
+    if (!curr_task) return -ESRCH;
 
-    if (!p_task_pid_nr_ns) {
-        kpm_err("task_pid_nr_ns NULL\n");
-        return -EFAULT;
-    }
+    if (!p_task_pid_nr_ns) return -EFAULT;
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    kpm_info("caller_pid from current task: %d\n", caller_pid);
     
-    if (caller_pid <= 0) {
-        kpm_err("Invalid caller_pid: %d\n", caller_pid);
-        return -ESRCH;
-    }
+    if (caller_pid <= 0) return -ESRCH;
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user) {
-        kpm_err("copy_to_user NULL\n");
-        return -EFAULT;
-    }
+    if (!p_copy_to_user) return -EFAULT;
     
     if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_to_user failed\n");
         return -EFAULT;
     }
 
-    kpm_info("*** proc_write_handler SUCCESS\n");
     return (ssize_t)count;
 }
 
@@ -513,10 +480,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
-
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
@@ -532,7 +495,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 KERNEL phys_to_virt ACTIVE!\n");
     return 0;
 }
 
