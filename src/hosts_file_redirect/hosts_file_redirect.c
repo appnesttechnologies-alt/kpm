@@ -126,7 +126,6 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-// Simple bit definitions (no _AC macro)
 #define HFR_PTE_VALID   (1UL << 0)
 #define HFR_PTE_USER    (1UL << 6)
 #define HFR_PTE_RDONLY  (1UL << 7)
@@ -180,7 +179,6 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     if (!pgd)
         return -EFAULT;
     
-    // PGD
     unsigned long pgd_idx = (addr >> PGD_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pgd + pgd_idx);
     hfr_log("PGD[%lu] @ %px = 0x%llx", pgd_idx, (void *)(pgd + pgd_idx), val);
@@ -190,7 +188,6 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // PMD - convert physical to linear map virtual
     pmd = (unsigned long *)((val & ~0xFFFULL) + 0xffffff8000000000ULL);
     unsigned long pmd_idx = (addr >> PMD_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pmd + pmd_idx);
@@ -214,7 +211,6 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // PTE
     pte = (unsigned long *)((val & ~0xFFFULL) + 0xffffff8000000000ULL);
     unsigned long pte_idx = (addr >> PAGE_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pte + pte_idx);
@@ -263,7 +259,7 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
 static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
                           void *buffer, int size)
 {
-    unsigned long *entry, orig_val, new_val, irq_flags;
+    unsigned long *entry, entry_val, orig_val, new_val, irq_flags;
     int is_block, ret;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
@@ -280,7 +276,6 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     
     orig_val = entry_val;
     
-    // Check if already writable
     if (is_block) {
         if (!(entry_val & HFR_PMD_SECT_RDONLY)) {
             hfr_log("Block already writable");
@@ -295,11 +290,9 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
         }
     }
     
-    // Disable interrupts
     asm volatile("mrs %0, daif" : "=r"(irq_flags) : : "memory");
     asm volatile("msr daifset, #2" : : : "memory");
     
-    // Clear RDONLY bit
     if (is_block) {
         new_val = orig_val & ~HFR_PMD_SECT_RDONLY;
         hfr_log("Block: Clearing RDONLY (0x%llx -> 0x%llx)", orig_val, new_val);
@@ -312,11 +305,9 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     asm volatile("dsb ishst" ::: "memory");
     flush_tlb_entry(addr);
     
-    // Direct write to userspace address
     memcpy((void *)addr, buffer, size);
     hfr_log("WRITE OK: %d bytes to 0x%llx", size, addr);
     
-    // Restore
     *entry = orig_val;
     asm volatile("dsb ishst" ::: "memory");
     flush_tlb_entry(addr);
