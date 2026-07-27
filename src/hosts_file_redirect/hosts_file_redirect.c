@@ -112,9 +112,10 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-// SAFE function call - returns 0 if function pointer is NULL
-#define SAFE_CALL(func, ...) (func ? func(__VA_ARGS__) : 0)
-#define SAFE_CALL_PTR(func, ...) (func ? func(__VA_ARGS__) : NULL)
+static inline uint32_t min_u32(uint32_t a, uint32_t b)
+{
+    return (a < b) ? a : b;
+}
 
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
@@ -135,11 +136,10 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
     if (pkt->vaddr == 0 || pkt->vaddr >= (1ULL << 39)) {
-        pkt->status = STATUS_INVALID_ADDR;
+        pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
     
-    // Check all function pointers before using
     if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         hfr_err("Required symbols not available!");
         pkt->status = STATUS_NULL_SYMBOL;
@@ -152,8 +152,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // SAFE: find task
-    task = SAFE_CALL_PTR(p_find_task_by_vpid, target_pid);
+    task = (p_find_task_by_vpid)(target_pid);
     hfr_log("find_task_by_vpid(%d) = %px", target_pid, task);
     
     if (!task) {
@@ -161,7 +160,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // SAFE: get mm
     if (p_get_task_struct)
         p_get_task_struct(task);
     
@@ -175,18 +173,15 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // SKIP ALL PGD WALK - Just return dummy success for now
-    hfr_log("mm is valid, but skipping PGD walk for safety");
+    hfr_log("mm is valid, skipping all PGD walk for safety");
     
     memset(temp_buffer, 0, MAX_INLINE);
     pkt->status = STATUS_SUCCESS;
     
-    // Return empty data for read
     if (pkt->op_code == OP_READ_VM) {
-        memset(pkt->inline_data, 0xAA, min(pkt->size, MAX_INLINE));
+        memset(pkt->inline_data, 0xAA, min_u32(pkt->size, MAX_INLINE));
     }
 
-    // Cleanup
     if (p_mmput)
         p_mmput(mm);
     if (p_put_task_struct)
@@ -239,7 +234,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 {
     hfr_log("=== SAFE MODULE INIT ===");
     
-    // Resolve symbols with NULL checks
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     hfr_log("proc_create_data: %px", p_proc_create_data);
     
@@ -263,14 +257,10 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
     hfr_log("task_pid_nr_ns: %px", p_task_pid_nr_ns);
 
-    // Check critical symbols
     if (!p_proc_create_data) {
         hfr_err("proc_create_data not found!");
         return -EFAULT;
     }
-    
-    hfr_log("Available: find_task=%px get_task_mm=%px mmput=%px",
-             p_find_task_by_vpid, p_get_task_mm, p_mmput);
 
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
