@@ -167,6 +167,7 @@ static mutex_unlock_t        p_mutex_unlock;
 static const char   *proc_filename = "hfr_mem";
 static void         *proc_entry    = NULL;
 static struct k_mutex hfr_mutex;
+static int g_pgd_offset = 0;
 
 /* ============================================================
  * HELPERS
