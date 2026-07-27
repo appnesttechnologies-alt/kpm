@@ -9,6 +9,7 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+#include <linux/mm_types.h>    // ✅ ADD THIS - mm_struct definition
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
