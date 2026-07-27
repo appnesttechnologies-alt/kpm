@@ -18,7 +18,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ZERO TRACE - KERNEL LINEAR MAP ACCESS");
+KPM_DESCRIPTION("INFO COLLECTOR - NO CRASH");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -34,12 +34,6 @@ KPM_DESCRIPTION("ZERO TRACE - KERNEL LINEAR MAP ACCESS");
 #define OP_WRITE_VM    0x3000
 
 #define STATUS_SUCCESS        0x0000
-#define STATUS_INVALID_SIZE   0x1005
-#define STATUS_OUT_OF_RANGE   0x1006
-#define STATUS_BAD_OPCODE     0x1007
-#define STATUS_NO_TASK        0x1008
-#define STATUS_NO_MM          0x1009
-#define STATUS_VM_FAULT       0x100A
 #define STATUS_NULL_SYMBOL    0x100E
 
 struct k_packet {
@@ -82,321 +76,121 @@ struct mutex {
 
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
-typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
-typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
 typedef void (*put_task_struct_t)(struct task_struct *);
-typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
 
 static proc_create_data_t    p_proc_create_data = NULL;
 static remove_proc_entry_t   p_remove_proc_entry = NULL;
-static copy_from_user_t      p_copy_from_user = NULL;
-static copy_to_user_t        p_copy_to_user = NULL;
 static find_task_by_vpid_t   p_find_task_by_vpid = NULL;
 static get_task_mm_t         p_get_task_mm = NULL;
 static mmput_t               p_mmput = NULL;
 static get_task_struct_t     p_get_task_struct = NULL;
 static put_task_struct_t     p_put_task_struct = NULL;
-static task_pid_nr_ns_t      p_task_pid_nr_ns = NULL;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 
-static inline struct task_struct *hfr_get_current(void)
-{
-    struct task_struct *tsk;
-    asm volatile("mrs %0, sp_el0" : "=r" (tsk));
-    return tsk;
-}
-
-// Exact kernel definitions from source
-#define VA_BITS          39
-#define PAGE_OFFSET_VAL  (-(1UL << VA_BITS))
-#define PGD_OFFSET       0x48
-#define PGD_SHIFT        30
-#define PMD_SHIFT        21
-#define PAGE_SHIFT       12
-#define PTRS_PER_PT      512
-#define PTE_ADDR_MASK    0xFFFFFFFFFFFFF000ULL
-#define PMD_MASK         0xFFFFFFFFFFE00000ULL
-
-#define HFR_PTE_VALID        (1UL << 0)
-#define HFR_PTE_TYPE_TABLE   (3UL << 0)
-#define HFR_PTE_TYPE_BLOCK   (1UL << 0)
-
-static inline unsigned long phys_to_kvirt(unsigned long phys)
-{
-    return phys + PAGE_OFFSET_VAL;
-}
-
-static int walk_page_table(struct mm_struct *mm, unsigned long addr,
-                           unsigned long *entry_val, int *is_block)
-{
-    unsigned long *pgd, *pmd, *pte;
-    unsigned long val, idx;
-    
-    pgd = *(unsigned long **)((char *)mm + PGD_OFFSET);
-    hfr_log("PGD base = %px", (void *)pgd);
-    
-    if (!pgd || (unsigned long)pgd < PAGE_OFFSET_VAL) {
-        hfr_err("Invalid PGD pointer: %px", (void *)pgd);
-        return -EFAULT;
-    }
-    
-    // PGD
-    idx = (addr >> PGD_SHIFT) & 0x1FF;
-    val = *(volatile unsigned long *)(pgd + idx);
-    hfr_log("PGD[%lu] = 0x%llx", idx, val);
-    
-    if ((val & 0x3) != HFR_PTE_TYPE_TABLE) {
-        hfr_err("PGD not table type: 0x%llx", val);
-        return -EFAULT;
-    }
-    
-    // PMD
-    pmd = (unsigned long *)phys_to_kvirt(val & ~0xFFFULL);
-    idx = (addr >> PMD_SHIFT) & 0x1FF;
-    val = *(volatile unsigned long *)(pmd + idx);
-    hfr_log("PMD[%lu] = 0x%llx", idx, val);
-    
-    if (!(val & HFR_PTE_VALID)) {
-        hfr_err("PMD not valid");
-        return -EFAULT;
-    }
-    
-    // Block mapping (2MB)
-    if ((val & 0x3) == HFR_PTE_TYPE_BLOCK) {
-        hfr_log("Block mapping found");
-        *entry_val = val;
-        *is_block = 1;
-        return 0;
-    }
-    
-    if ((val & 0x3) != HFR_PTE_TYPE_TABLE) {
-        hfr_err("PMD invalid type: 0x%llx", val);
-        return -EFAULT;
-    }
-    
-    // PTE
-    pte = (unsigned long *)phys_to_kvirt(val & ~0xFFFULL);
-    idx = (addr >> PAGE_SHIFT) & 0x1FF;
-    val = *(volatile unsigned long *)(pte + idx);
-    hfr_log("PTE[%lu] = 0x%llx", idx, val);
-    
-    if (!(val & HFR_PTE_VALID)) {
-        hfr_err("PTE not valid");
-        return -EFAULT;
-    }
-    
-    *entry_val = val;
-    *is_block = 0;
-    return 0;
-}
-
-// ============================================================
-// 🔥 UNIVERSAL ACCESS - READ & WRITE through KERNEL LINEAR MAP
-// NO PTE MODIFICATION NEEDED!
-// ============================================================
-static int mem_access(struct mm_struct *mm, unsigned long addr,
-                      void *buffer, int size, int is_write)
-{
-    unsigned long entry_val, phys_addr, kvirt_addr;
-    int is_block, ret;
-    
-    if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
-        return -EINVAL;
-    
-    hfr_log("%s: addr=0x%llx size=%d", is_write ? "WRITE" : "READ", addr, size);
-    
-    ret = walk_page_table(mm, addr, &entry_val, &is_block);
-    if (ret < 0)
-        return ret;
-    
-    if (!is_block && (addr & 0xFFF) + size > 4096) {
-        hfr_err("Cross-page access not supported");
-        return -EFAULT;
-    }
-    
-    // Calculate physical address
-    if (is_block)
-        phys_addr = (entry_val & PMD_MASK) | (addr & 0x1FFFFF);
-    else
-        phys_addr = (entry_val & PTE_ADDR_MASK) | (addr & 0xFFF);
-    
-    // Convert to kernel linear virtual address
-    kvirt_addr = phys_to_kvirt(phys_addr);
-    hfr_log("phys=0x%llx kvirt=0x%llx", phys_addr, kvirt_addr);
-    
-    // 🔥 DIRECT ACCESS through kernel linear map - bypasses userspace protection!
-    if (is_write)
-        memcpy((void *)kvirt_addr, buffer, size);
-    else
-        memcpy(buffer, (void *)kvirt_addr, size);
-    
-    hfr_log("%s OK: %d bytes", is_write ? "WRITE" : "READ", size);
-    return size;
-}
-
-static void process_packet(struct k_packet *pkt, pid_t caller_pid)
-{
-    struct task_struct *task = NULL;
-    struct mm_struct *mm = NULL;
-    pid_t target_pid;
-    int transferred, is_write_op;
-    uint8_t temp_buffer[MAX_INLINE];
-
-    hfr_log(">>> op=0x%x pid=%u addr=0x%llx size=%u caller=%d",
-             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
-
-    if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        pkt->status = STATUS_BAD_OPCODE;
-        return;
-    }
-    if (!pkt->size || pkt->size > MAX_INLINE) {
-        pkt->status = STATUS_INVALID_SIZE;
-        return;
-    }
-    if (pkt->vaddr == 0 || pkt->vaddr >= (1ULL << VA_BITS)) {
-        pkt->status = STATUS_OUT_OF_RANGE;
-        return;
-    }
-    
-    if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        hfr_err("Required symbols missing!");
-        pkt->status = STATUS_NULL_SYMBOL;
-        return;
-    }
-
-    target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    if (target_pid <= 0) {
-        pkt->status = STATUS_OUT_OF_RANGE;
-        return;
-    }
-
-    task = p_find_task_by_vpid(target_pid);
-    hfr_log("find_task_by_vpid(%d) = %px", target_pid, task);
-    
-    if (!task) {
-        pkt->status = STATUS_NO_TASK;
-        return;
-    }
-
-    if (p_get_task_struct)
-        p_get_task_struct(task);
-    
-    mm = p_get_task_mm(task);
-    hfr_log("get_task_mm = %px", mm);
-    
-    if (!mm) {
-        pkt->status = STATUS_NO_MM;
-        if (p_put_task_struct)
-            p_put_task_struct(task);
-        return;
-    }
-
-    is_write_op = (pkt->op_code == OP_WRITE_VM);
-    memset(temp_buffer, 0, MAX_INLINE);
-    if (is_write_op)
-        memcpy(temp_buffer, pkt->inline_data, pkt->size);
-
-    transferred = mem_access(mm, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
-
-    hfr_log("Result: %d", transferred);
-    pkt->status = (transferred > 0) ? STATUS_SUCCESS : STATUS_VM_FAULT;
-
-    if (p_mmput)
-        p_mmput(mm);
-    if (p_put_task_struct)
-        p_put_task_struct(task);
-
-    if (!is_write_op && transferred > 0) {
-        memset(pkt->inline_data, 0, MAX_INLINE);
-        memcpy(pkt->inline_data, temp_buffer, transferred);
-    }
-    if (transferred > 0 && (uint32_t)transferred != pkt->size)
-        pkt->size = (uint32_t)transferred;
-}
-
-static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
-static int proc_release_handler(struct inode *inode, struct file *file) { return 0; }
-static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos) { return 0; }
-
-static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
-{
-    struct k_packet local_pkt;
-    pid_t caller_pid;
-    struct task_struct *curr_task;
-
-    if (count != sizeof(struct k_packet)) return -EINVAL;
-    if (!p_copy_from_user) return -EFAULT;
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) return -EFAULT;
-
-    curr_task = hfr_get_current();
-    if (!curr_task) return -ESRCH;
-    if (!p_task_pid_nr_ns) return -EFAULT;
-
-    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) return -ESRCH;
-
-    process_packet(&local_pkt, caller_pid);
-
-    if (!p_copy_to_user) return -EFAULT;
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) return -EFAULT;
-    return (ssize_t)count;
-}
-
-static const struct proc_ops p_ops = {
-    .proc_flags   = 0,
-    .proc_open    = proc_open_handler,
-    .proc_read    = proc_read_handler,
-    .proc_read_iter = NULL,
-    .proc_write   = proc_write_handler,
-    .proc_lseek   = NULL,
-    .proc_release = proc_release_handler,
-    .proc_poll    = NULL,
-    .proc_ioctl   = NULL,
-    .proc_mmap    = NULL,
-    .proc_get_unmapped_area = NULL,
-};
-
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    hfr_log("=== ZERO TRACE KERNEL LINEAR MAP ===");
-    hfr_log("PAGE_OFFSET: 0x%llx", PAGE_OFFSET_VAL);
-    hfr_log("PGD offset: 0x%x", PGD_OFFSET);
-    hfr_log("NO PTE MODIFICATION - SAFE & FAST!");
+    hfr_log("========================================");
+    hfr_log("=== INFO COLLECTOR START ===");
+    hfr_log("========================================");
     
+    // 1. Resolve basic symbols
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
-    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
-    if (!p_copy_from_user) p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
-    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
-    if (!p_copy_to_user) p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
     p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get_task_mm = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
     p_mmput = (mmput_t)kallsyms_lookup_name("mmput");
     p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
-
-    hfr_log("Symbols: proc=%px find=%px mm=%px mmput=%px",
+    
+    hfr_log("Symbols: proc=%px find=%px get_mm=%px mmput=%px",
              p_proc_create_data, p_find_task_by_vpid, p_get_task_mm, p_mmput);
-
-    if (!p_proc_create_data) {
-        hfr_err("proc_create_data missing!");
-        return -EFAULT;
+    
+    // 2. Get memstart_addr VALUE
+    unsigned long *memstart_ptr = (unsigned long *)kallsyms_lookup_name("memstart_addr");
+    if (memstart_ptr) {
+        unsigned long memstart_val = *memstart_ptr;
+        hfr_log("memstart_addr ptr=%px value=0x%llx", memstart_ptr, memstart_val);
+    } else {
+        hfr_log("memstart_addr: NOT FOUND");
     }
-
-    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
-    if (!proc_entry) {
-        hfr_err("proc_create FAILED");
-        return -EFAULT;
+    
+    // 3. Get kimage_voffset
+    unsigned long *kimage_ptr = (unsigned long *)kallsyms_lookup_name("kimage_voffset");
+    if (kimage_ptr) {
+        hfr_log("kimage_voffset ptr=%px value=0x%llx", kimage_ptr, *kimage_ptr);
+    } else {
+        hfr_log("kimage_voffset: NOT FOUND");
     }
-
-    hfr_log("=== /proc/%s CREATED ===", proc_filename);
+    
+    // 4. Get physvirt_offset
+    unsigned long *physvirt_ptr = (unsigned long *)kallsyms_lookup_name("physvirt_offset");
+    if (physvirt_ptr) {
+        hfr_log("physvirt_offset ptr=%px value=0x%llx", physvirt_ptr, *physvirt_ptr);
+    } else {
+        hfr_log("physvirt_offset: NOT FOUND");
+    }
+    
+    // 5. Get swapper_pg_dir
+    unsigned long *swapper_ptr = (unsigned long *)kallsyms_lookup_name("swapper_pg_dir");
+    if (swapper_ptr) {
+        hfr_log("swapper_pg_dir: %px", swapper_ptr);
+    } else {
+        hfr_log("swapper_pg_dir: NOT FOUND");
+    }
+    
+    // 6. Get PAGE_OFFSET from swapper_pg_dir
+    // swapper_pg_dir is in kernel image, its virtual address = phys + kimage_voffset
+    // But it's also accessible via linear map at phys + PAGE_OFFSET
+    if (swapper_ptr && kimage_ptr) {
+        hfr_log("swapper_pg_dir VA: %px", swapper_ptr);
+        hfr_log("kimage_voffset: 0x%llx", *kimage_ptr);
+        // Rough PAGE_OFFSET = swapper_pg_dir_va - (swapper_pg_dir_phys)
+        // But we need phys which we don't have directly
+    }
+    
+    // 7. Try to read PAGE_OFFSET directly from kernel config
+    unsigned long page_offset_calc = -(1UL << 39); // 39-bit VA
+    hfr_log("Calculated PAGE_OFFSET (39-bit): 0x%llx", page_offset_calc);
+    
+    // 8. Dump current task's mm_struct to find pgd offset
+    struct task_struct *curr = get_current();
+    if (curr) {
+        hfr_log("Current task: %px, pid=%d", curr, curr->pid);
+        struct mm_struct *mm = p_get_task_mm ? p_get_task_mm(curr) : NULL;
+        if (mm) {
+            hfr_log("mm_struct: %px", mm);
+            hfr_log("Dumping mm_struct first 20 unsigned longs:");
+            unsigned long *mm_ptr = (unsigned long *)mm;
+            for (int i = 0; i < 20; i++) {
+                hfr_log("  mm[%2d] @ +0x%02x = 0x%016llx", i, i*8, mm_ptr[i]);
+            }
+            p_mmput(mm);
+        } else {
+            hfr_log("get_task_mm returned NULL!");
+        }
+    } else {
+        hfr_log("get_current returned NULL!");
+    }
+    
+    // 9. Create proc entry (just for testing)
+    if (p_proc_create_data) {
+        proc_entry = p_proc_create_data(proc_filename, 0666, NULL, NULL, NULL);
+        if (proc_entry) {
+            hfr_log("/proc/%s created successfully", proc_filename);
+        } else {
+            hfr_log("proc_create FAILED");
+        }
+    }
+    
+    hfr_log("========================================");
+    hfr_log("=== INFO COLLECTOR DONE ===");
+    hfr_log("========================================");
     return 0;
 }
 
