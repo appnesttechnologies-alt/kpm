@@ -12,7 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/pagemap.h>
 
 // 🔥 Tera pgtable.h - isme phys_to_virt() hai!
 #include "pgtable.h"
@@ -21,7 +20,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE NO TRACE - Without highmem");
+KPM_DESCRIPTION("ULTIMATE NO TRACE - Raw Page Walk");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -140,21 +139,16 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO TRACE 🔥🔥🔥
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - RAW PAGE WALK 🔥🔥🔥
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
 {
     struct mm_struct *mm;
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
+    unsigned long pgd_ptr, pud_ptr, pmd_ptr, pte_ptr;
+    unsigned long pgd_val, pud_val, pmd_val, pte_val;
+    unsigned long pfn, phys_addr, offset;
     void *kaddr;
-    unsigned long pfn;
-    unsigned long phys_addr;
-    unsigned long offset;
     int ret = 0;
 
     if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
@@ -168,102 +162,106 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: PGD (Page Global Directory)
-    pgd = pgd_offset(mm, addr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) {
-        kpm_err("ULTIMATE: Invalid PGD at 0x%llx\n", addr);
+    // 🔥 STEP 1: PGD from mm_struct (Direct pointer access)
+    pgd_ptr = (unsigned long)mm->pgd;
+    if (!pgd_ptr) {
+        kpm_err("ULTIMATE: Invalid PGD pointer\n");
         mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: mm->pgd = 0x%llx\n", pgd_ptr);
 
-    // 🔥 STEP 2: P4D (Page 4-level Directory)
-    p4d = p4d_offset(pgd, addr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) {
-        kpm_err("ULTIMATE: Invalid P4D at 0x%llx\n", addr);
+    // 🔥 STEP 2: PGD Entry (ARM64: 9 bits, shift 39)
+    unsigned long pgd_idx = (addr >> 39) & 0x1FF;
+    pgd_val = *(unsigned long *)(pgd_ptr + pgd_idx * 8);
+    if (!(pgd_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PGD entry\n");
         mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
 
-    // 🔥 STEP 3: PUD (Page Upper Directory)
-    pud = pud_offset(p4d, addr);
-    if (pud_none(*pud) || pud_bad(*pud)) {
-        kpm_err("ULTIMATE: Invalid PUD at 0x%llx\n", addr);
+    // 🔥 STEP 3: PUD Entry (ARM64: 9 bits, shift 30)
+    unsigned long pud_idx = (addr >> 30) & 0x1FF;
+    pud_ptr = pgd_val & ~0xFFF;
+    pud_val = *(unsigned long *)(pud_ptr + pud_idx * 8);
+    if (!(pud_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PUD entry\n");
         mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: pud_val = 0x%llx\n", pud_val);
 
-    // 🔥 STEP 4: PMD (Page Middle Directory)
-    pmd = pmd_offset(pud, addr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) {
-        kpm_err("ULTIMATE: Invalid PMD at 0x%llx\n", addr);
+    // 🔥 STEP 4: PMD Entry (ARM64: 9 bits, shift 21)
+    unsigned long pmd_idx = (addr >> 21) & 0x1FF;
+    pmd_ptr = pud_val & ~0xFFF;
+    pmd_val = *(unsigned long *)(pmd_ptr + pmd_idx * 8);
+    if (!(pmd_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PMD entry\n");
         mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
 
-    // 🔥 STEP 5: Check for Huge Page (2MB)
-    if (pmd_huge(*pmd)) {
-        pfn = pmd_pfn(*pmd);
-        if (!pfn_valid(pfn)) {
-            kpm_err("ULTIMATE: Invalid PFN for huge page\n");
-            mmput(mm);
-            return -EFAULT;
-        }
-        
-        phys_addr = (pfn << PAGE_SHIFT) | (addr & (PMD_SIZE - 1));
-        kaddr = (void *)phys_to_virt(phys_addr);
+    // 🔥 STEP 5: Check Huge Page (2MB) - PMD_SECT bit (bit 1)
+    if (pmd_val & (1 << 1)) {
+        pfn = pmd_val >> 12;
+        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
+        kaddr = phys_to_virt(phys_addr);  // ✅ Tera function from pgtable.h
         if (!kaddr) {
             mmput(mm);
             return -EFAULT;
         }
-        
-        offset = addr & (PMD_SIZE - 1);
         if (is_write) {
-            memcpy(kaddr + offset, buffer, size);
+            memcpy(kaddr + (addr & 0x1FFFFF), buffer, size);
+            kpm_info("ULTIMATE: Huge page WRITE %d bytes\n", size);
         } else {
-            memcpy(buffer, kaddr + offset, size);
+            memcpy(buffer, kaddr + (addr & 0x1FFFFF), size);
+            kpm_info("ULTIMATE: Huge page READ %d bytes\n", size);
         }
-        ret = size;
         mmput(mm);
-        kpm_info("ULTIMATE: Huge page access OK\n");
-        return ret;
+        return size;
     }
 
-    // 🔥 STEP 6: PTE (Page Table Entry) for normal 4KB page
-    pte = pte_offset_kernel(pmd, addr);
-    if (!pte || pte_none(*pte)) {
-        kpm_err("ULTIMATE: Invalid PTE at 0x%llx\n", addr);
+    // 🔥 STEP 6: PTE Entry (ARM64: 9 bits, shift 12)
+    unsigned long pte_idx = (addr >> 12) & 0x1FF;
+    pte_ptr = pmd_val & ~0xFFF;
+    pte_val = *(unsigned long *)(pte_ptr + pte_idx * 8);
+    if (!(pte_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PTE entry\n");
         mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
 
-    // 🔥 STEP 7: PFN (Page Frame Number)
-    pfn = pte_pfn(*pte);
-    if (!pfn_valid(pfn)) {
+    // 🔥 STEP 7: PFN direct from PTE (bits 12-47)
+    pfn = pte_val >> 12;
+    if (pfn == 0) {
         kpm_err("ULTIMATE: Invalid PFN\n");
         mmput(mm);
         return -EFAULT;
     }
 
     // 🔥 STEP 8: Physical Address
-    phys_addr = (pfn << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
-    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
+    phys_addr = (pfn << 12) | (addr & 0xFFF);
+    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
 
     // 🔥 STEP 9: phys_to_virt (Tera function from pgtable.h)
-    kaddr = (void *)phys_to_virt(phys_addr);
+    kaddr = phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: phys_to_virt failed\n");
         mmput(mm);
         return -EFAULT;
     }
 
-    // 🔥 STEP 10: DIRECT READ/WRITE - NO PERMISSION CHECK!
-    offset = addr & (PAGE_SIZE - 1);
+    // 🔥 STEP 10: DIRECT ACCESS - NO PERMISSION CHECK!
+    offset = addr & 0xFFF;
     if (is_write) {
         memcpy(kaddr + offset, buffer, size);
-        kpm_info("ULTIMATE: Wrote %d bytes at 0x%llx\n", size, addr);
+        kpm_info("ULTIMATE: Wrote %d bytes at offset 0x%lx\n", size, offset);
     } else {
         memcpy(buffer, kaddr + offset, size);
-        kpm_info("ULTIMATE: Read %d bytes from 0x%llx\n", size, addr);
+        kpm_info("ULTIMATE: Read %d bytes from offset 0x%lx\n", size, offset);
     }
     ret = size;
 
@@ -367,8 +365,9 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     } else {
         kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
         // Fallback to access_process_vm if ultimate fails
+        unsigned int gup_flags = is_write_op ? 0x01 : 0x00;
         kpm_info("Fallback: Using access_process_vm\n");
-        transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, 0);
+        transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
         kpm_info("access_process_vm returned: %d\n", transferred);
         if (transferred > 0) {
             pkt->status = STATUS_SUCCESS;
@@ -528,7 +527,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 NO TRACE MEMORY ACCESS ACTIVE! (Without highmem)\n");
+    kpm_info("🔥 RAW PAGE WALK ACTIVE! No headers needed!\n");
     return 0;
 }
 
