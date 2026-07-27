@@ -14,29 +14,13 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <pgtable.h>
-
-// ============================================================
-// ✅ PHYS_TO_VIRT - Direct ARM64 formula
-// ============================================================
-#ifndef PHYS_OFFSET
-#define PHYS_OFFSET 0x0000000000000000ULL
-#endif
-
-#ifndef PAGE_OFFSET
-#define PAGE_OFFSET 0xffffffc000000000ULL
-#endif
-
-static inline void *phys_to_virt_arm64(unsigned long phys) {
-    return (void *)((phys - PHYS_OFFSET) | PAGE_OFFSET);
-}
-
-#define phys_to_virt(phys) phys_to_virt_arm64(phys)
+#include <page.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE ZERO TRACE - kallsyms PGD offset");
+KPM_DESCRIPTION("ULTIMATE ZERO TRACE - Clean Page Walk");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -140,11 +124,6 @@ static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
-// 🔥 GLOBALS - init_mm and swapper_pg_dir addresses
-static unsigned long g_init_mm_addr = 0;
-static unsigned long g_swapper_pg_dir_addr = 0;
-static int g_pgd_offset = -1;
-
 static inline struct task_struct *hfr_get_current(void)
 {
     struct task_struct *tsk;
@@ -160,62 +139,21 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥 PGD OFFSET FINDER - kallsyms_lookup_name se
-// ============================================================
-static int get_pgd_offset_from_init_mm(void)
-{
-    unsigned long *ptr;
-    int offset;
-    unsigned long val;
-    
-    if (!g_init_mm_addr || !g_swapper_pg_dir_addr) {
-        kpm_err("❌ init_mm or swapper_pg_dir not resolved!\n");
-        return -1;
-    }
-    
-    kpm_info("🔍 init_mm addr: 0x%llx\n", g_init_mm_addr);
-    kpm_info("🔍 swapper_pg_dir addr: 0x%llx\n", g_swapper_pg_dir_addr);
-    
-    // Calculate offset
-    offset = g_swapper_pg_dir_addr - g_init_mm_addr;
-    kpm_info("🔍 Calculated PGD offset: 0x%x\n", offset);
-    
-    // Verify: init_mm + offset should point to swapper_pg_dir
-    ptr = (unsigned long *)(g_init_mm_addr + offset);
-    val = *ptr;
-    
-    if (val == g_swapper_pg_dir_addr) {
-        kpm_info("✅ PGD offset verification SUCCESS: 0x%x\n", offset);
-        g_pgd_offset = offset;
-        return offset;
-    }
-    
-    // Fallback: Scan init_mm
-    kpm_info("🔍 Verification failed, scanning init_mm...\n");
-    for (int i = 0; i < 64; i++) {
-        ptr = (unsigned long *)(g_init_mm_addr + (i * 8));
-        if (*ptr == g_swapper_pg_dir_addr) {
-            offset = i * 8;
-            kpm_info("✅ Found PGD at offset 0x%x (scan)\n", offset);
-            g_pgd_offset = offset;
-            return offset;
-        }
-    }
-    
-    kpm_err("❌ Could not find PGD offset!\n");
-    return -1;
-}
-
-// ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - RAW PAGE WALK 🔥🔥🔥
+// 🔥 FINAL FIXED - Page Table Walk (3-Level)
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
 {
     struct mm_struct *mm;
-    unsigned long pgd_ptr, pud_ptr, pmd_ptr, pte_ptr;
-    unsigned long pgd_val, pud_val, pmd_val, pte_val;
-    unsigned long pfn, phys_addr, offset;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    unsigned long pfn;
+    unsigned long phys_addr;
+    unsigned long offset;
+    struct page *page;
     void *kaddr;
     int ret = 0;
 
@@ -223,114 +161,141 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EINVAL;
     }
 
+    // Get mm_struct (single reference)
     mm = p_get_task_mm(task);
     if (!mm) {
         kpm_err("ULTIMATE: No mm for task\n");
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: Get PGD offset if not cached
-    if (g_pgd_offset < 0) {
-        if (get_pgd_offset_from_init_mm() < 0) {
+    // 🔥 STEP 1: PGD - Direct from mm_struct
+    pgd = mm->pgd;
+    if (!pgd) {
+        kpm_err("ULTIMATE: mm->pgd is NULL\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+    kpm_info("ULTIMATE: mm->pgd = 0x%llx\n", (unsigned long long)pgd);
+
+    // 🔥 STEP 2: PGD Index (ARM64: shift 39 for 3-level)
+    unsigned long pgd_idx = pgd_index(addr);
+    pgd += pgd_idx;
+    if (pgd_none(*pgd)) {
+        kpm_err("ULTIMATE: PGD none\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 3: P4D (Folded for 3-level)
+    p4d = p4d_offset(pgd, addr);
+    if (p4d_none(*p4d)) {
+        kpm_err("ULTIMATE: P4D none\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 4: PUD (Folded for 3-level)
+    pud = pud_offset(p4d, addr);
+    if (pud_none(*pud)) {
+        kpm_err("ULTIMATE: PUD none\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 5: PMD
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd)) {
+        kpm_err("ULTIMATE: PMD none\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 6: Check Huge Page (2MB)
+    if (pmd_huge(*pmd)) {
+        pfn = pmd_pfn(*pmd);
+        if (!pfn_valid(pfn)) {
+            kpm_err("ULTIMATE: Huge page invalid PFN\n");
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
-    }
-
-    // 🔥 STEP 2: PGD pointer using init_mm offset
-    pgd_ptr = (unsigned long)((char *)mm + g_pgd_offset);
-    if (!pgd_ptr || *(unsigned long *)pgd_ptr == 0) {
-        kpm_err("ULTIMATE: Invalid PGD pointer at offset 0x%x\n", g_pgd_offset);
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: mm->pgd at offset 0x%x = 0x%llx\n", g_pgd_offset, pgd_ptr);
-
-    // 🔥 STEP 3: PGD Entry (ARM64: 9 bits, shift 39)
-    unsigned long pgd_idx = (addr >> 39) & 0x1FF;
-    pgd_val = *(unsigned long *)(pgd_ptr + pgd_idx * 8);
-    if (!(pgd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PGD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 4: PUD Entry (ARM64: 9 bits, shift 30)
-    unsigned long pud_idx = (addr >> 30) & 0x1FF;
-    pud_ptr = pgd_val & ~0xFFF;
-    pud_val = *(unsigned long *)(pud_ptr + pud_idx * 8);
-    if (!(pud_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PUD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 5: PMD Entry (ARM64: 9 bits, shift 21)
-    unsigned long pmd_idx = (addr >> 21) & 0x1FF;
-    pmd_ptr = pud_val & ~0xFFF;
-    pmd_val = *(unsigned long *)(pmd_ptr + pmd_idx * 8);
-    if (!(pmd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PMD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 6: Huge Page (2MB)
-    if (pmd_val & (1 << 1)) {
-        pfn = pmd_val >> 12;
-        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = phys_to_virt(phys_addr);
+        phys_addr = (pfn << PAGE_SHIFT) | (addr & (PMD_SIZE - 1));
+        page = pfn_to_page(pfn);
+        if (!page) {
+            if (p_mmput) p_mmput(mm);
+            return -EFAULT;
+        }
+        kaddr = page_address(page);
         if (!kaddr) {
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
+        offset = addr & (PMD_SIZE - 1);
+        if (offset + size > PMD_SIZE) {
+            kpm_err("ULTIMATE: Huge page boundary crossed\n");
+            if (p_mmput) p_mmput(mm);
+            return -EFAULT;
+        }
         if (is_write) {
-            memcpy(kaddr + (addr & 0x1FFFFF), buffer, size);
+            memcpy((char *)kaddr + offset, buffer, size);
         } else {
-            memcpy(buffer, kaddr + (addr & 0x1FFFFF), size);
+            memcpy(buffer, (char *)kaddr + offset, size);
         }
         if (p_mmput) p_mmput(mm);
         return size;
     }
 
-    // 🔥 STEP 7: PTE Entry (ARM64: 9 bits, shift 12)
-    unsigned long pte_idx = (addr >> 12) & 0x1FF;
-    pte_ptr = pmd_val & ~0xFFF;
-    pte_val = *(unsigned long *)(pte_ptr + pte_idx * 8);
-    if (!(pte_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PTE entry\n");
+    // 🔥 STEP 7: PTE
+    pte = pte_offset_kernel(pmd, addr);
+    if (!pte || pte_none(*pte)) {
+        kpm_err("ULTIMATE: PTE none\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
     // 🔥 STEP 8: PFN from PTE
-    pfn = pte_val >> 12;
-    if (pfn == 0) {
+    pfn = pte_pfn(*pte);
+    if (!pfn_valid(pfn)) {
         kpm_err("ULTIMATE: Invalid PFN\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
     // 🔥 STEP 9: Physical Address
-    phys_addr = (pfn << 12) | (addr & 0xFFF);
-    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
+    phys_addr = (pfn << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
+    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
 
-    // 🔥 STEP 10: phys_to_virt
-    kaddr = phys_to_virt(phys_addr);
-    if (!kaddr) {
-        kpm_err("ULTIMATE: phys_to_virt failed\n");
+    // 🔥 STEP 10: Page structure
+    page = pfn_to_page(pfn);
+    if (!page) {
+        kpm_err("ULTIMATE: pfn_to_page failed\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
-    // 🔥 STEP 11: DIRECT ACCESS - NO PERMISSION CHECK!
-    offset = addr & 0xFFF;
+    // 🔥 STEP 11: Kernel virtual address (page_address)
+    kaddr = page_address(page);
+    if (!kaddr) {
+        kpm_err("ULTIMATE: page_address failed\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 12: Check page boundary
+    offset = addr & (PAGE_SIZE - 1);
+    if (offset + size > PAGE_SIZE) {
+        kpm_err("ULTIMATE: Page boundary crossed\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 13: DIRECT ACCESS
     if (is_write) {
-        memcpy(kaddr + offset, buffer, size);
-        kpm_info("ULTIMATE: Wrote %d bytes at offset 0x%lx\n", size, offset);
+        memcpy((char *)kaddr + offset, buffer, size);
+        set_page_dirty(page);
+        kpm_info("ULTIMATE: Wrote %d bytes\n", size);
     } else {
-        memcpy(buffer, kaddr + offset, size);
-        kpm_info("ULTIMATE: Read %d bytes from offset 0x%lx\n", size, offset);
+        memcpy(buffer, (char *)kaddr + offset, size);
+        kpm_info("ULTIMATE: Read %d bytes\n", size);
     }
     ret = size;
 
@@ -419,7 +384,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     // ============================================================
-    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO FALLBACK! 🔥🔥🔥
+    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - FIXED 🔥🔥🔥
     // ============================================================
     transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
@@ -431,7 +396,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         pkt->status = STATUS_PROTECTION;
     }
 
-    if (mm) p_mmput(mm);
+    // ✅ Single mmput (already done inside ultimate_memory_access)
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
@@ -539,17 +504,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    // 🔥🔥🔥 FETCH init_mm AND swapper_pg_dir FROM KALLSYMS 🔥🔥🔥
-    g_init_mm_addr = (unsigned long)kallsyms_lookup_name("init_mm");
-    g_swapper_pg_dir_addr = (unsigned long)kallsyms_lookup_name("swapper_pg_dir");
-    
-    if (!g_init_mm_addr || !g_swapper_pg_dir_addr) {
-        kpm_err("❌ init_mm or swapper_pg_dir not found!\n");
-        return -EFAULT;
-    }
-    kpm_info("✅ init_mm = 0x%llx\n", g_init_mm_addr);
-    kpm_info("✅ swapper_pg_dir = 0x%llx\n", g_swapper_pg_dir_addr);
-
     kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
              p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
@@ -569,7 +523,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 kallsyms PGD offset finder ACTIVE!\n");
+    kpm_info("🔥 3-LEVEL PAGE WALK ACTIVE! No fallback!\n");
     return 0;
 }
 
