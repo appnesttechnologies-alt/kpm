@@ -14,27 +14,15 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 
-// ============================================================
-// ✅ PHYS_TO_VIRT - memstart_addr se resolve
-// ============================================================
-#ifndef PAGE_OFFSET
-#define PAGE_OFFSET 0xffffffc000000000ULL
-#endif
-
-static unsigned long g_memstart_addr = 0;
-
-static inline void *phys_to_virt_arm64(unsigned long phys)
-{
-    return (void *)(phys + (PAGE_OFFSET - g_memstart_addr));
-}
-#define phys_to_virt(phys) phys_to_virt_arm64(phys)
-
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
+KPM_DESCRIPTION("3-LEVEL PAGE WALK - CONFIG_PGTABLE_LEVELS=3");
 
+/* ============================================================
+ * DEBUG
+ * ============================================================ */
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
 #define kpm_info(fmt, ...) pr_info("HFR: " fmt, ##__VA_ARGS__)
@@ -44,9 +32,26 @@ KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
 #define kpm_err(fmt, ...)
 #endif
 
-#define MAX_INLINE     256
-#define OP_READ_VM     0x2000
-#define OP_WRITE_VM    0x3000
+/* ============================================================
+ * PHYS_TO_VIRT — memstart_addr resolved at init
+ * Used ONLY for final PFN → kernel VA conversion.
+ * mm->pgd and all intermediate page table pointers coming
+ * out of the walk are already kernel virtual addresses.
+ * ============================================================ */
+static unsigned long g_memstart_addr = 0;
+static unsigned long g_page_offset   = 0xffffffc000000000ULL; /* ARM64 default */
+
+static inline void *phys_to_virt_resolved(unsigned long phys)
+{
+    return (void *)(phys - g_memstart_addr + g_page_offset);
+}
+
+/* ============================================================
+ * CONSTANTS
+ * ============================================================ */
+#define MAX_INLINE      256
+#define OP_READ_VM      0x2000
+#define OP_WRITE_VM     0x3000
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_SIZE   0x1005
@@ -59,17 +64,30 @@ KPM_DESCRIPTION("ULTIMATE ZERO TRACE - memstart_addr");
 #define STATUS_PROTECTION     0x100C
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
-#define STATUS_ULTIMATE_OK    0x2000
 
-struct k_packet {
-    uint32_t op_code;
-    uint32_t target_pid;
-    uint64_t vaddr;
-    uint32_t size;
-    uint32_t status;
-    uint8_t  inline_data[MAX_INLINE];
-} __attribute__((aligned(8), packed));
+/*
+ * ARM64, 4KB pages, CONFIG_PGTABLE_LEVELS=3:
+ *
+ *   VA[38:30] → PGD index  (512 entries, each 8 bytes)
+ *   VA[29:21] → PMD index  (512 entries, each 8 bytes)
+ *   VA[20:12] → PTE index  (512 entries, each 8 bytes)
+ *   VA[11:0]  → page offset
+ *
+ * PUD level does NOT EXIST — it is folded into PGD.
+ * mm->pgd is a kernel virtual address. Walk entries directly.
+ * Only the final PFN needs phys_to_virt conversion.
+ */
+#define PGD_SHIFT   39
+#define PMD_SHIFT   21
+#define PTE_SHIFT   12
+#define IDX_MASK    0x1FFUL
+#define PHYS_MASK   (~0xFFFUL)   /* strip low 12 bits to get next table PA */
+#define PTE_VALID   (1UL << 0)
+#define PMD_TABLE   (1UL << 1)   /* bit1=1 → table, bit1=0 → block (2MB huge) */
 
+/* ============================================================
+ * FORWARD DECLARATIONS — kernel fn pointers
+ * ============================================================ */
 struct inode;
 struct file;
 struct kiocb;
@@ -89,38 +107,40 @@ struct proc_ops {
     __poll_t (*proc_poll)(struct file *, struct poll_table_struct *);
     long     (*proc_ioctl)(struct file *, unsigned int, unsigned long);
     int      (*proc_mmap)(struct file *, struct vm_area_struct *);
-    unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+    unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long,
+                                            unsigned long, unsigned long,
+                                            unsigned long);
 };
 
-struct mutex {
+struct k_mutex {
     void *owner;
-    int count;
+    int   count;
     void *wait_lock;
     void *wait_list;
 };
 
-typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
+typedef void *(*proc_create_data_t)(const char *, uint16_t, void *,
+                                    const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
 typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
-typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
 typedef void (*put_task_struct_t)(struct task_struct *);
-typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
+typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type,
+                                   struct pid_namespace *);
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
-typedef void (*mutex_init_t)(struct mutex *);
-typedef void (*mutex_lock_t)(struct mutex *);
-typedef void (*mutex_unlock_t)(struct mutex *);
+typedef void (*mutex_init_t)(struct k_mutex *);
+typedef void (*mutex_lock_t)(struct k_mutex *);
+typedef void (*mutex_unlock_t)(struct k_mutex *);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
 static copy_to_user_t        p_copy_to_user;
-static access_process_vm_t   p_access_process_vm;
 static find_task_by_vpid_t   p_find_task_by_vpid;
 static get_task_mm_t         p_get_task_mm;
 static mmput_t               p_mmput;
@@ -133,406 +153,395 @@ static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
 
-static const char *proc_filename = "hfr_mem";
-static void       *proc_entry    = NULL;
-static struct mutex hfr_mutex;
+static const char   *proc_filename = "hfr_mem";
+static void         *proc_entry    = NULL;
+static struct k_mutex hfr_mutex;
 
+/* ============================================================
+ * HELPERS
+ * ============================================================ */
 static inline struct task_struct *hfr_get_current(void)
 {
     struct task_struct *tsk;
-    asm volatile("mrs %0, sp_el0" : "=r" (tsk));
+    asm volatile("mrs %0, sp_el0" : "=r"(tsk));
     return tsk;
 }
 
-static inline int is_valid_user_address(uint64_t addr)
+static inline int is_valid_user_addr(uint64_t addr)
 {
-    if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;
-    return 1;
+    /* userspace on ARM64 lives below bit 55; reject NULL and kernel VAs */
+    return (addr != 0) && (addr < (1ULL << 55));
 }
 
-// ============================================================
-// 🔥 ULTIMATE MEMORY ACCESS - 3-Level Page Walk
-// ============================================================
-static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
-                                   void *buffer, int size, int is_write)
+/*
+ * safe_read_ulong — read one unsigned long from a kernel virtual address.
+ * Returns 0 and sets *ok=0 on any failure.
+ */
+static inline unsigned long safe_read_ulong(unsigned long kva, int *ok)
 {
-    struct mm_struct *mm;
-    unsigned long pgd_table_phys, pgd_table_virt;
-    unsigned long pmd_table_phys, pmd_table_virt;
-    unsigned long pte_table_phys, pte_table_virt;
-    unsigned long pgd_val, pmd_val, pte_val;
-    unsigned long pfn, phys_addr, offset;
-    void *kaddr;
-    int ret = 0;
-    
-    if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
-        return -EINVAL;
+    /* Basic sanity: must be a kernel VA */
+    if (kva < 0xffffffc000000000ULL) {
+        *ok = 0;
+        return 0;
     }
-    
-    mm = p_get_task_mm(task);
-    if (!mm) {
-        kpm_err("ULTIMATE: No mm for task\n");
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 1: PGD table - PHYSICAL from mm_struct (offset 0x48)
-    pgd_table_phys = *(unsigned long *)((char *)mm + 0x48);
-    if (!pgd_table_phys) {
-        kpm_err("ULTIMATE: pgd_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_table_phys = 0x%llx\n", pgd_table_phys);
-    
-    // 🔥 STEP 2: PHYSICAL → VIRTUAL
-    pgd_table_virt = (unsigned long)phys_to_virt(pgd_table_phys);
-    if (!pgd_table_virt) {
-        kpm_err("ULTIMATE: pgd_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_table_virt = 0x%llx\n", pgd_table_virt);
-    
-    // 🔥 STEP 3: PGD Entry (shift 39, 9 bits)
-    unsigned long pgd_idx = (addr >> 39) & 0x1FF;
-    pgd_val = *(unsigned long *)(pgd_table_virt + pgd_idx * 8);
-    if (!(pgd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PGD entry at idx %lu\n", pgd_idx);
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
-    
-    // 🔥 STEP 4: PMD Table - PHYSICAL from PGD
-    pmd_table_phys = pgd_val & ~0xFFF;
-    if (!pmd_table_phys) {
-        kpm_err("ULTIMATE: pmd_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 5: PHYSICAL → VIRTUAL
-    pmd_table_virt = (unsigned long)phys_to_virt(pmd_table_phys);
-    if (!pmd_table_virt) {
-        kpm_err("ULTIMATE: pmd_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 6: PMD Entry (shift 30, 9 bits)
-    unsigned long pmd_idx = (addr >> 30) & 0x1FF;
-    pmd_val = *(unsigned long *)(pmd_table_virt + pmd_idx * 8);
-    if (!(pmd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PMD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
-    
-    // 🔥 STEP 7: Check Huge Page (PMD_SECT bit - bit 1)
-    if (pmd_val & (1 << 1)) {
-        pfn = pmd_val >> 12;
-        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = phys_to_virt(phys_addr);
-        if (!kaddr) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        offset = addr & 0x1FFFFF;
-        if (offset + size > 0x200000) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        if (is_write) {
-            memcpy((char *)kaddr + offset, buffer, size);
-        } else {
-            memcpy(buffer, (char *)kaddr + offset, size);
-        }
-        if (p_mmput) p_mmput(mm);
-        return size;
-    }
-    
-    // 🔥 STEP 8: PTE Table - PHYSICAL from PMD
-    pte_table_phys = pmd_val & ~0xFFF;
-    if (!pte_table_phys) {
-        kpm_err("ULTIMATE: pte_table_phys is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 9: PHYSICAL → VIRTUAL
-    pte_table_virt = (unsigned long)phys_to_virt(pte_table_phys);
-    if (!pte_table_virt) {
-        kpm_err("ULTIMATE: pte_table_virt is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 10: PTE Entry (shift 21, 9 bits)
-    unsigned long pte_idx = (addr >> 21) & 0x1FF;
-    pte_val = *(unsigned long *)(pte_table_virt + pte_idx * 8);
-    if (!(pte_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PTE entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
-    
-    // 🔥 STEP 11: PFN from PTE
-    pfn = pte_val >> 12;
-    if (pfn == 0) {
-        kpm_err("ULTIMATE: Invalid PFN\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 12: Physical Address
-    phys_addr = (pfn << 12) | (addr & 0xFFF);
-    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
-    
-    // 🔥 STEP 13: phys_to_virt se kernel virtual address
-    kaddr = phys_to_virt(phys_addr);
-    if (!kaddr) {
-        kpm_err("ULTIMATE: kaddr is NULL\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 14: Check page boundary
-    offset = addr & 0xFFF;
-    if (offset + size > 0x1000) {
-        kpm_err("ULTIMATE: Page boundary crossed\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-    
-    // 🔥 STEP 15: DIRECT ACCESS
-    if (is_write) {
-        memcpy((char *)kaddr + offset, buffer, size);
-        kpm_info("ULTIMATE: Wrote %d bytes\n", size);
-    } else {
-        memcpy(buffer, (char *)kaddr + offset, size);
-        kpm_info("ULTIMATE: Read %d bytes\n", size);
-    }
-    ret = size;
-    
-    if (p_mmput) p_mmput(mm);
-    return ret;
+    *ok = 1;
+    return *(volatile unsigned long *)kva;
 }
 
-// ============================================================
-// PROCESS PACKET - Ultimate Access (No Fallback!)
-// ============================================================
+/* ============================================================
+ * 3-LEVEL PAGE WALK
+ * CONFIG_PGTABLE_LEVELS=3 → PGD folds PUD, walk is PGD→PMD→PTE
+ *
+ * All intermediate table addresses produced by the walk are
+ * physical addresses stored inside page table entries.
+ * They must be converted to kernel VAs before dereferencing.
+ *
+ * mm->pgd itself is already a kernel VA (set by pgd_alloc).
+ * ============================================================ */
+static int walk_page_table(struct mm_struct *mm, unsigned long addr,
+                            void *buffer, int size, int is_write)
+{
+    unsigned long pgd_kva;   /* kernel VA of PGD table base  */
+    unsigned long pgd_entry; /* raw entry read from PGD       */
+    unsigned long pmd_phys;  /* physical addr of PMD table    */
+    unsigned long pmd_kva;   /* kernel VA of PMD table base   */
+    unsigned long pmd_entry; /* raw entry read from PMD       */
+    unsigned long pte_phys;  /* physical addr of PTE table    */
+    unsigned long pte_kva;   /* kernel VA of PTE table base   */
+    unsigned long pte_entry; /* raw entry read from PTE       */
+    unsigned long pfn;
+    unsigned long phys_addr;
+    unsigned long page_kva;
+    unsigned long page_offset;
+    int ok;
+
+    /* ---- PGD ------------------------------------------------
+     * mm->pgd is a kernel virtual address.
+     * index = VA[38:30], 9 bits.
+     */
+    pgd_kva = (unsigned long)mm->pgd;
+    if (!pgd_kva) {
+        kpm_err("WALK: mm->pgd is NULL\n");
+        return -EFAULT;
+    }
+
+    {
+        unsigned long idx = (addr >> PGD_SHIFT) & IDX_MASK;
+        pgd_entry = safe_read_ulong(pgd_kva + idx * 8, &ok);
+        if (!ok || !(pgd_entry & PTE_VALID)) {
+            kpm_err("WALK: PGD entry invalid (idx=%lu entry=0x%lx)\n",
+                    idx, pgd_entry);
+            return -EFAULT;
+        }
+        kpm_info("WALK: PGD[%lu]=0x%lx\n", idx, pgd_entry);
+    }
+
+    /* ---- PMD ------------------------------------------------
+     * PGD entry bits[47:12] = physical base of PMD table.
+     * Convert phys → kernel VA before dereferencing.
+     * index = VA[29:21], 9 bits.
+     *
+     * With PGTABLE_LEVELS=3, PUD is folded: the PGD entry
+     * points directly to the PMD table.
+     */
+    pmd_phys = pgd_entry & PHYS_MASK;
+    pmd_kva  = (unsigned long)phys_to_virt_resolved(pmd_phys);
+    if (!pmd_kva) {
+        kpm_err("WALK: PMD table phys→virt failed (phys=0x%lx)\n", pmd_phys);
+        return -EFAULT;
+    }
+
+    {
+        unsigned long idx = (addr >> PMD_SHIFT) & IDX_MASK;
+        pmd_entry = safe_read_ulong(pmd_kva + idx * 8, &ok);
+        if (!ok || !(pmd_entry & PTE_VALID)) {
+            kpm_err("WALK: PMD entry invalid (idx=%lu entry=0x%lx)\n",
+                    idx, pmd_entry);
+            return -EFAULT;
+        }
+        kpm_info("WALK: PMD[%lu]=0x%lx\n", idx, pmd_entry);
+
+        /* 2MB block mapping: bit1=0 in a valid PMD means block, not table */
+        if (!(pmd_entry & PMD_TABLE)) {
+            kpm_info("WALK: 2MB huge page detected\n");
+            pfn      = (pmd_entry & PHYS_MASK) >> PTE_SHIFT;
+            phys_addr = (pfn << PTE_SHIFT) | (addr & 0x1FFFFFUL);
+            page_kva  = (unsigned long)phys_to_virt_resolved(phys_addr);
+            if (!page_kva) return -EFAULT;
+            if ((addr & 0x1FFFFFUL) + (unsigned long)size > 0x200000UL) {
+                kpm_err("WALK: 2MB page boundary crossed\n");
+                return -EFAULT;
+            }
+            if (is_write)
+                memcpy((void *)page_kva, buffer, size);
+            else
+                memcpy(buffer, (void *)page_kva, size);
+            return size;
+        }
+    }
+
+    /* ---- PTE ------------------------------------------------
+     * PMD entry bits[47:12] = physical base of PTE table.
+     * Convert phys → kernel VA before dereferencing.
+     * index = VA[20:12], 9 bits.
+     */
+    pte_phys = pmd_entry & PHYS_MASK;
+    pte_kva  = (unsigned long)phys_to_virt_resolved(pte_phys);
+    if (!pte_kva) {
+        kpm_err("WALK: PTE table phys→virt failed (phys=0x%lx)\n", pte_phys);
+        return -EFAULT;
+    }
+
+    {
+        unsigned long idx = (addr >> PTE_SHIFT) & IDX_MASK;
+        pte_entry = safe_read_ulong(pte_kva + idx * 8, &ok);
+        if (!ok || !(pte_entry & PTE_VALID)) {
+            kpm_err("WALK: PTE entry invalid (idx=%lu entry=0x%lx)\n",
+                    idx, pte_entry);
+            return -EFAULT;
+        }
+        kpm_info("WALK: PTE[%lu]=0x%lx\n", idx, pte_entry);
+    }
+
+    /* ---- Final page access ----------------------------------
+     * PTE bits[47:12] = PFN.
+     * Physical address = (PFN << 12) | VA[11:0].
+     */
+    pfn         = (pte_entry & PHYS_MASK) >> PTE_SHIFT;
+    page_offset = addr & 0xFFFUL;
+    phys_addr   = (pfn << PTE_SHIFT) | page_offset;
+
+    kpm_info("WALK: virt=0x%lx → phys=0x%lx (pfn=0x%lx offset=0x%lx)\n",
+             addr, phys_addr, pfn, page_offset);
+
+    page_kva = (unsigned long)phys_to_virt_resolved(phys_addr);
+    if (!page_kva) {
+        kpm_err("WALK: final phys→virt failed (phys=0x%lx)\n", phys_addr);
+        return -EFAULT;
+    }
+
+    /* Verify the result is a valid kernel VA before touching it */
+    if (page_kva < 0xffffffc000000000ULL) {
+        kpm_err("WALK: final kva looks wrong: 0x%lx\n", page_kva);
+        return -EFAULT;
+    }
+
+    /* Guard page boundary */
+    if (page_offset + (unsigned long)size > 0x1000UL) {
+        kpm_err("WALK: 4KB page boundary crossed (offset=0x%lx size=%d)\n",
+                page_offset, size);
+        return -EFAULT;
+    }
+
+    if (is_write)
+        memcpy((void *)page_kva, buffer, size);
+    else
+        memcpy(buffer, (void *)page_kva, size);
+
+    kpm_info("WALK: %s %d bytes OK\n", is_write ? "wrote" : "read", size);
+    return size;
+}
+
+/* ============================================================
+ * PROCESS PACKET
+ * ============================================================ */
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
     struct task_struct *task = NULL;
-    struct mm_struct *mm = NULL;
-    pid_t target_pid;
-    int transferred;
-    int is_write_op = 0;
-    uint8_t temp_buffer[MAX_INLINE];
+    struct mm_struct   *mm   = NULL;
+    pid_t  target_pid;
+    int    transferred;
+    int    is_write_op;
+    uint8_t temp_buf[MAX_INLINE];
 
-    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
+    kpm_info("PKT: op=0x%x pid=%u addr=0x%llx size=%u caller=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
-
     if (!pkt->size || pkt->size > MAX_INLINE) {
-        kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
-
-    if (!is_valid_user_address(pkt->vaddr)) {
-        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
+    if (!is_valid_user_addr(pkt->vaddr)) {
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
-
     if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid resolved: %d\n", target_pid);
-    
     if (target_pid <= 0) {
-        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
 
+    /* ---- task lookup (RCU) ---- */
     if (p_rcu_read_lock) p_rcu_read_lock();
-
     task = p_find_task_by_vpid(target_pid);
-    kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
-    
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
-
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
-    kpm_info("get_task_mm = %px\n", mm);
-
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
-        kpm_err("NO_MM\n");
         pkt->status = STATUS_NO_MM;
-        if (p_put_task_struct && task) p_put_task_struct(task);
+        if (p_put_task_struct) p_put_task_struct(task);
         return;
     }
 
+    /* ---- memory access ---- */
     is_write_op = (pkt->op_code == OP_WRITE_VM);
-    memset(temp_buffer, 0, MAX_INLINE);
-    
-    if (is_write_op) {
-        memcpy(temp_buffer, pkt->inline_data, pkt->size);
-    }
+    memset(temp_buf, 0, MAX_INLINE);
+    if (is_write_op)
+        memcpy(temp_buf, pkt->inline_data, pkt->size);
 
-    transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
+    transferred = walk_page_table(mm, (unsigned long)pkt->vaddr,
+                                  temp_buf, (int)pkt->size, is_write_op);
 
-    if (transferred > 0) {
-        kpm_info("✅ ULTIMATE SUCCESS: %d bytes\n", transferred);
-        pkt->status = STATUS_ULTIMATE_OK;
-    } else {
-        kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
-        pkt->status = STATUS_PROTECTION;
-    }
-
-    if (p_put_task_struct && task) p_put_task_struct(task);
+    /* mmput and put_task_struct always happen here — single exit point */
+    p_mmput(mm);
+    if (p_put_task_struct) p_put_task_struct(task);
 
     if (transferred < 0) {
         pkt->status = STATUS_VM_FAULT;
         return;
     }
-
-    if (transferred == 0 && pkt->size > 0) {
+    if (transferred == 0) {
         pkt->status = STATUS_PROTECTION;
         return;
     }
-
-    if (!is_write_op && transferred > 0) {
+    if (!is_write_op) {
         memset(pkt->inline_data, 0, MAX_INLINE);
-        memcpy(pkt->inline_data, temp_buffer, transferred);
+        memcpy(pkt->inline_data, temp_buf, (size_t)transferred);
     }
-
-    if ((uint32_t)transferred != pkt->size) {
-        pkt->size = (uint32_t)transferred;
-        pkt->status = STATUS_PARTIAL_IO;
-        return;
-    }
-
-    if (pkt->status == STATUS_ULTIMATE_OK) {
-        pkt->status = STATUS_SUCCESS;
-    }
+    pkt->size   = (uint32_t)transferred;
+    pkt->status = ((uint32_t)transferred == pkt->size) ? STATUS_SUCCESS
+                                                        : STATUS_PARTIAL_IO;
 }
 
-static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
-static int proc_release_handler(struct inode *inode, struct file *file) { return 0; }
-static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos) { return 0; }
+/* ============================================================
+ * PROC HANDLERS
+ * ============================================================ */
+static int proc_open_handler(struct inode *inode, struct file *file)
+{
+    return 0;
+}
 
-static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
+static int proc_release_handler(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static ssize_t proc_read_handler(struct file *file, char __user *buf,
+                                  size_t count, loff_t *pos)
+{
+    return 0;
+}
+
+static ssize_t proc_write_handler(struct file *file, const char __user *buf,
+                                   size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
+    struct task_struct *curr;
     pid_t caller_pid;
-    struct task_struct *curr_task;
 
-    if (count != sizeof(struct k_packet)) {
+    if (count != sizeof(struct k_packet))
         return -EINVAL;
-    }
-
-    if (!p_copy_from_user) return -EFAULT;
-    
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+    if (!p_copy_from_user)
         return -EFAULT;
-    }
+    if (p_copy_from_user(&local_pkt, buf, sizeof(struct k_packet)) != 0)
+        return -EFAULT;
 
-    curr_task = hfr_get_current();
-    if (!curr_task) return -ESRCH;
+    curr = hfr_get_current();
+    if (!curr)
+        return -ESRCH;
+    if (!p_task_pid_nr_ns)
+        return -EFAULT;
 
-    if (!p_task_pid_nr_ns) return -EFAULT;
+    caller_pid = p_task_pid_nr_ns(curr, PIDTYPE_PID, NULL);
+    if (caller_pid <= 0)
+        return -ESRCH;
 
-    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    
-    if (caller_pid <= 0) return -ESRCH;
-
-    if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
+    if (p_mutex_lock)   p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user) return -EFAULT;
-    
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+    if (!p_copy_to_user)
         return -EFAULT;
-    }
+    if (p_copy_to_user((void __user *)buf, &local_pkt,
+                        sizeof(struct k_packet)) != 0)
+        return -EFAULT;
 
     return (ssize_t)count;
 }
 
 static const struct proc_ops p_ops = {
-    .proc_flags   = 0,
-    .proc_open    = proc_open_handler,
-    .proc_read    = proc_read_handler,
-    .proc_read_iter = NULL,
-    .proc_write   = proc_write_handler,
-    .proc_lseek   = NULL,
-    .proc_release = proc_release_handler,
-    .proc_poll    = NULL,
-    .proc_ioctl   = NULL,
-    .proc_mmap    = NULL,
+    .proc_flags             = 0,
+    .proc_open              = proc_open_handler,
+    .proc_read              = proc_read_handler,
+    .proc_read_iter         = NULL,
+    .proc_write             = proc_write_handler,
+    .proc_lseek             = NULL,
+    .proc_release           = proc_release_handler,
+    .proc_poll              = NULL,
+    .proc_ioctl             = NULL,
+    .proc_mmap              = NULL,
     .proc_get_unmapped_area = NULL,
 };
 
-static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
+/* ============================================================
+ * INIT / EXIT
+ * ============================================================ */
+static long hfr_memory_init(const char *args, const char *event,
+                             void __user *reserved)
 {
-    kpm_info("=== ULTIMATE ZERO TRACE INIT START ===\n");
-    
-    p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
-    p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
-    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
-    if (!p_copy_from_user) p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
-    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
-    if (!p_copy_to_user) p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
-    p_access_process_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
-    p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
-    p_get_task_mm = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
-    p_mmput = (mmput_t)kallsyms_lookup_name("mmput");
-    p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
-    p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
-    p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
-    p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
-    p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
-    p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
-    p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
+    unsigned long *memstart_ptr;
 
-    // 🔥🔥🔥 GET memstart_addr FROM KALLSYMS 🔥🔥🔥
-    g_memstart_addr = (unsigned long)kallsyms_lookup_name("memstart_addr");
-    if (!g_memstart_addr) {
-        kpm_err("❌ memstart_addr not found!\n");
+    kpm_info("=== INIT START (PGTABLE_LEVELS=3) ===\n");
+
+    /* ---- resolve memstart_addr ---- */
+    memstart_ptr = (unsigned long *)kallsyms_lookup_name("memstart_addr");
+    if (!memstart_ptr) {
+        kpm_err("memstart_addr symbol not found\n");
         return -EFAULT;
     }
-    kpm_info("✅ memstart_addr = 0x%llx\n", g_memstart_addr);
-    kpm_info("✅ PAGE_OFFSET - memstart_addr = 0x%llx\n", (PAGE_OFFSET - g_memstart_addr));
+    g_memstart_addr = *memstart_ptr;   /* DEREFERENCE — get the actual value */
+    kpm_info("memstart_addr = 0x%lx\n", g_memstart_addr);
+    kpm_info("PAGE_OFFSET   = 0x%lx\n", g_page_offset);
+    kpm_info("phys_to_virt bias = 0x%lx\n", g_page_offset - g_memstart_addr);
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
+    /* ---- symbol resolution ---- */
+    p_proc_create_data  = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
+    p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
+    p_copy_from_user    = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    if (!p_copy_from_user)
+        p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
+    p_copy_to_user      = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+    if (!p_copy_to_user)
+        p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
+    p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
+    p_get_task_mm       = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
+    p_mmput             = (mmput_t)kallsyms_lookup_name("mmput");
+    p_get_task_struct   = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
+    p_put_task_struct   = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
+    p_task_pid_nr_ns    = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
+    p_rcu_read_lock     = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
+    p_rcu_read_unlock   = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
+    p_mutex_init        = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
+    p_mutex_lock        = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
+    p_mutex_unlock      = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    if (!p_proc_create_data || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
+    if (!p_proc_create_data || !p_find_task_by_vpid || !p_task_pid_nr_ns ||
+        !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
@@ -545,15 +554,16 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("=== ULTIMATE ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 3-LEVEL PAGE WALK ACTIVE! memstart_addr resolved!\n");
+    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("3-LEVEL WALK ACTIVE: PGD[38:30]→PMD[29:21]→PTE[20:12]\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== ULTIMATE EXIT ===\n");
-    if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
+    kpm_info("=== EXIT ===\n");
+    if (proc_entry && p_remove_proc_entry)
+        p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
 
