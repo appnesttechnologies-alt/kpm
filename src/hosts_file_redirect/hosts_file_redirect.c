@@ -14,9 +14,6 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 
-// 🔥 mm_struct_offset - dynamic offsets ke liye
-extern struct mm_struct_offset mm_struct_offset;
-
 // ============================================================
 // ✅ PHYS_TO_VIRT - Direct ARM64 formula (No header needed!)
 // ============================================================
@@ -38,7 +35,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE NO TRACE - Direct phys_to_virt");
+KPM_DESCRIPTION("ULTIMATE BRUTE FORCE - PGD Offset Finder");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -142,6 +139,12 @@ static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
+// ============================================================
+// 🔥 GLOBAL PGD OFFSET - Brute force will set this
+// ============================================================
+static int g_pgd_offset = 0;
+static int g_pgd_offset_found = 0;
+
 static inline struct task_struct *hfr_get_current(void)
 {
     struct task_struct *tsk;
@@ -157,7 +160,41 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Direct phys_to_virt 🔥🔥🔥
+// 🔥 BRUTE FORCE PGD OFFSET FINDER
+// ============================================================
+static int find_pgd_offset(struct mm_struct *mm)
+{
+    int offsets[] = {0x30, 0x38, 0x40, 0x28, 0x48, 0x50};
+    int num_offsets = sizeof(offsets) / sizeof(offsets[0]);
+    int i;
+    unsigned long pgd_ptr;
+    
+    kpm_info("🔍 Brute forcing PGD offset...\n");
+    
+    for (i = 0; i < num_offsets; i++) {
+        pgd_ptr = (unsigned long)((char *)mm + offsets[i]);
+        
+        // Check if pgd_ptr points to a valid PGD
+        if (pgd_ptr && *(unsigned long *)pgd_ptr != 0) {
+            unsigned long pgd_val = *(unsigned long *)pgd_ptr;
+            
+            // PGD entry should have valid bit (bit 0) set
+            if (pgd_val & 1) {
+                kpm_info("✅ Found valid PGD at offset 0x%x (pgd_val=0x%llx)\n", 
+                         offsets[i], pgd_val);
+                g_pgd_offset = offsets[i];
+                g_pgd_offset_found = 1;
+                return offsets[i];
+            }
+        }
+    }
+    
+    kpm_err("❌ No valid PGD offset found!\n");
+    return -1;
+}
+
+// ============================================================
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Brute Force PGD Offset
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
@@ -179,15 +216,24 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: PGD using mm_struct_offset
-    pgd_ptr = (unsigned long)((char *)mm + mm_struct_offset.pgd_offset);
+    // 🔥 STEP 1: Find PGD offset if not found yet
+    if (!g_pgd_offset_found) {
+        if (find_pgd_offset(mm) < 0) {
+            if (p_mmput) p_mmput(mm);
+            return -EFAULT;
+        }
+    }
+
+    // 🔥 STEP 2: PGD using found offset
+    pgd_ptr = (unsigned long)((char *)mm + g_pgd_offset);
     if (!pgd_ptr || *(unsigned long *)pgd_ptr == 0) {
-        kpm_err("ULTIMATE: Invalid PGD pointer\n");
+        kpm_err("ULTIMATE: Invalid PGD pointer at offset 0x%x\n", g_pgd_offset);
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
+    kpm_info("ULTIMATE: mm->pgd at offset 0x%x = 0x%llx\n", g_pgd_offset, pgd_ptr);
 
-    // 🔥 STEP 2: PGD Entry (ARM64: 9 bits, shift 39)
+    // 🔥 STEP 3: PGD Entry (ARM64: 9 bits, shift 39)
     unsigned long pgd_idx = (addr >> 39) & 0x1FF;
     pgd_val = *(unsigned long *)(pgd_ptr + pgd_idx * 8);
     if (!(pgd_val & 1)) {
@@ -196,7 +242,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 3: PUD Entry (ARM64: 9 bits, shift 30)
+    // 🔥 STEP 4: PUD Entry (ARM64: 9 bits, shift 30)
     unsigned long pud_idx = (addr >> 30) & 0x1FF;
     pud_ptr = pgd_val & ~0xFFF;
     pud_val = *(unsigned long *)(pud_ptr + pud_idx * 8);
@@ -206,7 +252,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 4: PMD Entry (ARM64: 9 bits, shift 21)
+    // 🔥 STEP 5: PMD Entry (ARM64: 9 bits, shift 21)
     unsigned long pmd_idx = (addr >> 21) & 0x1FF;
     pmd_ptr = pud_val & ~0xFFF;
     pmd_val = *(unsigned long *)(pmd_ptr + pmd_idx * 8);
@@ -216,7 +262,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 5: Huge Page (2MB)
+    // 🔥 STEP 6: Huge Page (2MB)
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
@@ -234,7 +280,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return size;
     }
 
-    // 🔥 STEP 6: PTE Entry (ARM64: 9 bits, shift 12)
+    // 🔥 STEP 7: PTE Entry (ARM64: 9 bits, shift 12)
     unsigned long pte_idx = (addr >> 12) & 0x1FF;
     pte_ptr = pmd_val & ~0xFFF;
     pte_val = *(unsigned long *)(pte_ptr + pte_idx * 8);
@@ -244,7 +290,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 7: PFN from PTE
+    // 🔥 STEP 8: PFN from PTE
     pfn = pte_val >> 12;
     if (pfn == 0) {
         kpm_err("ULTIMATE: Invalid PFN\n");
@@ -252,7 +298,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 8: Physical Address
+    // 🔥 STEP 9: Physical Address
     phys_addr = (pfn << 12) | (addr & 0xFFF);
 
     // ✅ Direct phys_to_virt
@@ -263,7 +309,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 9: DIRECT ACCESS - NO PERMISSION CHECK!
+    // 🔥 STEP 10: DIRECT ACCESS - NO PERMISSION CHECK!
     offset = addr & 0xFFF;
     if (is_write) {
         memcpy(kaddr + offset, buffer, size);
@@ -277,7 +323,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
 }
 
 // ============================================================
-// PROCESS PACKET - Ultimate Access
+// PROCESS PACKET - Ultimate Access (No Fallback!)
 // ============================================================
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
@@ -287,7 +333,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int transferred;
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
-    int ultimate_used = 0;
 
     kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
@@ -357,19 +402,17 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
     }
 
+    // ============================================================
+    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO FALLBACK! 🔥🔥🔥
+    // ============================================================
     transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     if (transferred > 0) {
         kpm_info("✅ ULTIMATE SUCCESS: %d bytes\n", transferred);
         pkt->status = STATUS_ULTIMATE_OK;
-        ultimate_used = 1;
     } else {
         kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
-        unsigned int gup_flags = is_write_op ? 0x01 : 0x00;
-        transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-        if (transferred > 0) {
-            pkt->status = STATUS_SUCCESS;
-        }
+        pkt->status = STATUS_PROTECTION;
     }
 
     if (mm) p_mmput(mm);
@@ -459,7 +502,7 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== ULTIMATE NO TRACE INIT START ===\n");
+    kpm_info("=== ULTIMATE BRUTE FORCE INIT START ===\n");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -494,7 +537,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("=== ULTIMATE BRUTE FORCE INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("🔥 Brute force PGD offset finder ACTIVE!\n");
     return 0;
 }
 
