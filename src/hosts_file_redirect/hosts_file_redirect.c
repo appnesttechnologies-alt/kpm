@@ -14,7 +14,7 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <pgtable.h>
-#include <processor.h>
+#include <asm/processor.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
