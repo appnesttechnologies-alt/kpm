@@ -156,43 +156,41 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// SAFE MEMORY PROBE - Check if address is readable
+// SAFE MEMORY PROBE - Check if address is in linear map range
 // ============================================================
-static int is_address_readable(void *addr)
+static int is_address_in_range(void *addr)
 {
-    unsigned long dummy;
+    unsigned long va = (unsigned long)addr;
     
     if (!addr)
         return 0;
     
-    if ((unsigned long)addr < PAGE_OFFSET)
+    // ARM64 linear mapping is always above PAGE_OFFSET
+    if (va < PAGE_OFFSET)
         return 0;
     
-    __try {
-        asm volatile(
-            "1: ldr %0, [%1]\n"
-            "2:\n"
-            _ASM_EXTABLE(1b, 2b)
-            : "=r" (dummy)
-            : "r" (addr)
-        );
-        return 1;
-    } __catch {
+    // Check if it's within reasonable kernel virtual address space
+    if (va > 0xffffffffffffffffULL)
         return 0;
-    }
-    return 0;
+    
+    // Additional check: linear map typically starts at PAGE_OFFSET
+    // and goes up to PAGE_END (PAGE_OFFSET + max physical memory)
+    // For a phone with < 256GB RAM, limit to reasonable range
+    if (va > PAGE_OFFSET + (1ULL << 38))  // 256GB max
+        return 0;
+    
+    return 1;
 }
 
 // ============================================================
 // DYNAMIC PHYS_TO_VIRT OFFSET DISCOVERY
-// Method: Use linear mapping properties of ARM64
 // ============================================================
 static int resolve_phys_to_virt_offset(void)
 {
     unsigned long *memstart_ptr;
     unsigned long *kimage_ptr;
     unsigned long *swapper_ptr;
-    unsigned long swapper_phys;
+    unsigned long *physvirt_ptr;
     unsigned long test_offset;
     void *test_addr;
     
@@ -216,94 +214,63 @@ static int resolve_phys_to_virt_offset(void)
     if (kimage_ptr) {
         kpm_info("kimage_voffset ptr: %px, value: 0x%llx\n", kimage_ptr, *kimage_ptr);
         if (*kimage_ptr != 0 && *kimage_ptr < PAGE_OFFSET) {
-            // kimage_voffset = kernel virtual base - kernel physical base
-            // For linear map: virt = phys + PAGE_OFFSET
-            // We need to find PAGE_OFFSET
-            // Try using _text symbol
-            unsigned long *_text = (unsigned long *)kallsyms_lookup_name("_text");
-            if (_text) {
-                // _text virtual address = _text physical + kimage_voffset
-                // We know _text virtual from _text symbol itself
-                // Linear map of _text = _text physical + PAGE_OFFSET
-                // This doesn't directly help, need another approach
-                kpm_info("_text: %px\n", _text);
-            }
+            kpm_info("kimage_voffset found but need PAGE_OFFSET calculation\n");
         }
     }
     
-    // Method 3: Use swapper_pg_dir to calculate offset
+    // Method 3: Try physvirt_offset
+    physvirt_ptr = (unsigned long *)kallsyms_lookup_name("physvirt_offset");
+    if (physvirt_ptr) {
+        kpm_info("physvirt_offset ptr: %px, value: 0x%llx\n", physvirt_ptr, *physvirt_ptr);
+        if (*physvirt_ptr != 0) {
+            // physvirt_offset = PHYS_OFFSET - PAGE_OFFSET
+            // We want PAGE_OFFSET for phys_to_virt
+            // phys_to_virt(phys) = phys + PAGE_OFFSET
+            // If PHYS_OFFSET = physvirt_offset + PAGE_OFFSET
+            // Use default PAGE_OFFSET
+            g_phys_offset = PAGE_OFFSET;
+            g_offset_resolved = 1;
+            kpm_info("Method 3 SUCCESS: using PAGE_OFFSET=0x%llx\n", g_phys_offset);
+            return 0;
+        }
+    }
+    
+    // Method 4: Use swapper_pg_dir to verify PAGE_OFFSET
     swapper_ptr = (unsigned long *)kallsyms_lookup_name("swapper_pg_dir");
-    if (swapper_ptr && is_address_readable(swapper_ptr)) {
+    if (swapper_ptr) {
         kpm_info("swapper_pg_dir virtual: %px\n", swapper_ptr);
         
-        // Try common PAGE_OFFSET values for ARM64
+        // Try common PAGE_OFFSET values for ARM64 39-bit
         unsigned long possible_offsets[] = {
-            0xffffff8000000000ULL,  // 39-bit VA
+            0xffffff8000000000ULL,  // 39-bit VA, 4KB pages
             0xffffffc000000000ULL,  // Default in header
             0xffff800000000000ULL,  // Another common
             0xffffff0000000000ULL,  // Another variant
         };
         
-        // For each possible offset, check if linear map works
         for (int i = 0; i < 4; i++) {
             test_offset = possible_offsets[i];
-            
-            // Check if PAGE_OFFSET itself is mappable
             test_addr = (void *)test_offset;
-            if (is_address_readable(test_addr)) {
-                // This offset seems valid
-                // Now try to find memstart_addr by scanning low physical memory
-                // Physical 0 should be at PAGE_OFFSET
-                // Check if reading from PAGE_OFFSET + some known physical address works
-                
-                // Try reading at PAGE_OFFSET (physical 0 if memstart_addr=0)
-                if (is_address_readable(test_addr)) {
-                    kpm_info("Testing PAGE_OFFSET=0x%llx - readable\n", test_offset);
-                    
-                    // Assume memstart_addr = 0 (physical 0 at PAGE_OFFSET)
-                    g_phys_offset = test_offset;
-                    g_offset_resolved = 1;
-                    kpm_info("Method 3 SUCCESS: phys_offset=0x%llx\n", g_phys_offset);
-                    return 0;
-                }
-            }
-        }
-    }
-    
-    // Method 4: Try to calculate from kernel symbols
-    // Find a symbol we know both virtual and can compute physical
-    // __START_KERNEL_map and physvirt_offset
-    {
-        unsigned long *physvirt_ptr;
-        physvirt_ptr = (unsigned long *)kallsyms_lookup_name("physvirt_offset");
-        if (physvirt_ptr) {
-            kpm_info("physvirt_offset: %px, value: 0x%llx\n", physvirt_ptr, *physvirt_ptr);
-            if (*physvirt_ptr != 0) {
-                // physvirt_offset = PHYS_OFFSET - PAGE_OFFSET
-                // We want phys_to_virt: virt = phys + PAGE_OFFSET
-                // From physvirt_offset: PHYS_OFFSET = PAGE_OFFSET + physvirt_offset
-                // But we need PAGE_OFFSET itself
-                // Actually: physvirt_offset = PHYS_OFFSET - PAGE_OFFSET
-                // PAGE_OFFSET is typically fixed per VA bits
-                // Try default PAGE_OFFSET
-                g_phys_offset = PAGE_OFFSET;
+            
+            // Check if this address is in valid kernel range
+            if (is_address_in_range(test_addr)) {
+                kpm_info("Testing PAGE_OFFSET=0x%llx - in range\n", test_offset);
+                g_phys_offset = test_offset;
                 g_offset_resolved = 1;
-                kpm_info("Method 4 SUCCESS: using default PAGE_OFFSET=0x%llx\n", g_phys_offset);
+                kpm_info("Method 4 SUCCESS: phys_offset=0x%llx\n", g_phys_offset);
                 return 0;
             }
         }
     }
     
-    // Method 5: Last resort - try default PAGE_OFFSET and verify
-    {
-        test_addr = (void *)PAGE_OFFSET;
-        if (is_address_readable(test_addr)) {
-            kpm_info("Default PAGE_OFFSET 0x%llx is readable, using it\n", PAGE_OFFSET);
-            g_phys_offset = PAGE_OFFSET;
-            g_offset_resolved = 1;
-            kpm_info("Method 5 SUCCESS: using PAGE_OFFSET=0x%llx\n", g_phys_offset);
-            return 0;
-        }
+    // Method 5: Use default PAGE_OFFSET
+    test_addr = (void *)PAGE_OFFSET;
+    if (is_address_in_range(test_addr)) {
+        kpm_info("Default PAGE_OFFSET 0x%llx is in range, using it\n", PAGE_OFFSET);
+        g_phys_offset = PAGE_OFFSET;
+        g_offset_resolved = 1;
+        kpm_info("Method 5 SUCCESS: using PAGE_OFFSET=0x%llx\n", g_phys_offset);
+        return 0;
     }
     
     kpm_err("ALL METHODS FAILED to resolve phys_to_virt offset!\n");
@@ -334,31 +301,41 @@ static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
     int pgd_found = 0;
     unsigned long possible_offsets[] = {0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80};
     
+    pgd_phys = 0;
     for (int i = 0; i < 8; i++) {
         pgd_phys = *(unsigned long *)((char *)mm + possible_offsets[i]);
-        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 40)) {
-            // Looks like a valid physical address (page-aligned, reasonable range)
-            kpm_info("pgd offset try 0x%lx: pgd_phys=0x%llx\n", possible_offsets[i], pgd_phys);
+        // Check if it looks like a valid physical address:
+        // - Non-zero
+        // - Page aligned (bottom 12 bits = 0)
+        // - Within reasonable physical memory range (< 256GB)
+        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 38)) {
+            kpm_info("pgd offset try 0x%lx: pgd_phys=0x%llx (valid)\n", 
+                     possible_offsets[i], pgd_phys);
             pgd_found = 1;
             break;
+        } else {
+            kpm_info("pgd offset try 0x%lx: pgd_phys=0x%llx (invalid)\n", 
+                     possible_offsets[i], pgd_phys);
         }
     }
     
     if (!pgd_found) {
-        kpm_err("Cannot find PGD in mm_struct\n");
+        kpm_err("Cannot find valid PGD in mm_struct\n");
         return -EFAULT;
     }
     
     // Step 2: Convert PGD physical to virtual
     pgd_virt = (unsigned long)phys_to_virt(pgd_phys);
-    if (!pgd_virt || !is_address_readable((void *)pgd_virt)) {
-        kpm_err("PGD virtual address 0x%llx not readable\n", pgd_virt);
+    if (!pgd_virt || !is_address_in_range((void *)pgd_virt)) {
+        kpm_err("PGD virtual address 0x%llx not in valid range\n", pgd_virt);
         return -EFAULT;
     }
+    kpm_info("PGD virtual: 0x%llx\n", pgd_virt);
     
     // Step 3: Walk PGD -> PMD -> PTE (3-level for 39-bit VA)
     pgd_idx = (addr >> 30) & 0x1FF;
     pgd_val = *(unsigned long *)(pgd_virt + pgd_idx * 8);
+    kpm_info("PGD[%lu] = 0x%llx\n", pgd_idx, pgd_val);
     
     // Check if PGD entry is valid table descriptor (bits[1:0] = 0b11)
     if ((pgd_val & 0x3) != 0x3) {
@@ -370,13 +347,15 @@ static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
     // Step 4: Get PMD table
     pmd_phys = pgd_val & ~0xFFFULL;
     pmd_virt = (unsigned long)phys_to_virt(pmd_phys);
-    if (!pmd_virt || !is_address_readable((void *)pmd_virt)) {
-        kpm_err("PMD virtual address 0x%llx not readable\n", pmd_virt);
+    if (!pmd_virt || !is_address_in_range((void *)pmd_virt)) {
+        kpm_err("PMD virtual address 0x%llx not in valid range\n", pmd_virt);
         return -EFAULT;
     }
+    kpm_info("PMD virtual: 0x%llx\n", pmd_virt);
     
     pmd_idx = (addr >> 21) & 0x1FF;
     pmd_val = *(unsigned long *)(pmd_virt + pmd_idx * 8);
+    kpm_info("PMD[%lu] = 0x%llx\n", pmd_idx, pmd_val);
     
     // Check if PMD entry is valid
     if (!(pmd_val & 0x1)) {
@@ -398,12 +377,13 @@ static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
         }
         
         kaddr = phys_to_virt(phys_addr);
-        if (!kaddr || !is_address_readable(kaddr)) {
-            kpm_err("Block physical 0x%llx not readable\n", phys_addr);
+        if (!kaddr || !is_address_in_range(kaddr)) {
+            kpm_err("Block physical 0x%llx maps to invalid virtual\n", phys_addr);
             return -EFAULT;
         }
         
         memcpy(buffer, (char *)kaddr, size);
+        kpm_info("Block read success: %d bytes\n", size);
         return size;
     }
     
@@ -416,13 +396,15 @@ static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
     // Step 5: Get PTE table
     pte_phys = pmd_val & ~0xFFFULL;
     pte_virt = (unsigned long)phys_to_virt(pte_phys);
-    if (!pte_virt || !is_address_readable((void *)pte_virt)) {
-        kpm_err("PTE virtual address 0x%llx not readable\n", pte_virt);
+    if (!pte_virt || !is_address_in_range((void *)pte_virt)) {
+        kpm_err("PTE virtual address 0x%llx not in valid range\n", pte_virt);
         return -EFAULT;
     }
+    kpm_info("PTE virtual: 0x%llx\n", pte_virt);
     
     pte_idx = (addr >> 12) & 0x1FF;
     pte_val = *(unsigned long *)(pte_virt + pte_idx * 8);
+    kpm_info("PTE[%lu] = 0x%llx\n", pte_idx, pte_val);
     
     // Check if PTE is valid and present
     if (!(pte_val & 0x1)) {
@@ -446,12 +428,14 @@ static int safe_page_walk_read(struct mm_struct *mm, unsigned long addr,
     }
     
     kaddr = phys_to_virt(phys_addr);
-    if (!kaddr || !is_address_readable(kaddr)) {
-        kpm_err("Physical 0x%llx not readable\n", phys_addr);
+    if (!kaddr || !is_address_in_range(kaddr)) {
+        kpm_err("Physical 0x%llx maps to invalid virtual\n", phys_addr);
         return -EFAULT;
     }
+    kpm_info("Final kaddr: %px\n", kaddr);
     
     memcpy(buffer, (char *)kaddr, size);
+    kpm_info("Page read success: %d bytes\n", size);
     return size;
 }
 
@@ -471,26 +455,29 @@ static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
     if (!g_offset_resolved)
         return -EFAULT;
     
-    // Same walk as read but with write at the end
+    // Same walk as read
     int pgd_found = 0;
     unsigned long possible_offsets[] = {0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80};
     
+    pgd_phys = 0;
     for (int i = 0; i < 8; i++) {
         pgd_phys = *(unsigned long *)((char *)mm + possible_offsets[i]);
-        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 40)) {
+        if (pgd_phys != 0 && (pgd_phys & 0xFFF) == 0 && pgd_phys < (1ULL << 38)) {
+            kpm_info("pgd offset try 0x%lx: pgd_phys=0x%llx (valid)\n", 
+                     possible_offsets[i], pgd_phys);
             pgd_found = 1;
             break;
         }
     }
     
     if (!pgd_found) {
-        kpm_err("Cannot find PGD in mm_struct\n");
+        kpm_err("Cannot find valid PGD in mm_struct\n");
         return -EFAULT;
     }
     
     pgd_virt = (unsigned long)phys_to_virt(pgd_phys);
-    if (!pgd_virt || !is_address_readable((void *)pgd_virt)) {
-        kpm_err("PGD virtual address 0x%llx not readable\n", pgd_virt);
+    if (!pgd_virt || !is_address_in_range((void *)pgd_virt)) {
+        kpm_err("PGD virtual address 0x%llx not in valid range\n", pgd_virt);
         return -EFAULT;
     }
     
@@ -504,8 +491,8 @@ static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
     
     pmd_phys = pgd_val & ~0xFFFULL;
     pmd_virt = (unsigned long)phys_to_virt(pmd_phys);
-    if (!pmd_virt || !is_address_readable((void *)pmd_virt)) {
-        kpm_err("PMD virtual address 0x%llx not readable\n", pmd_virt);
+    if (!pmd_virt || !is_address_in_range((void *)pmd_virt)) {
+        kpm_err("PMD virtual address 0x%llx not in valid range\n", pmd_virt);
         return -EFAULT;
     }
     
@@ -529,12 +516,13 @@ static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
         }
         
         kaddr = phys_to_virt(phys_addr);
-        if (!kaddr || !is_address_readable(kaddr)) {
-            kpm_err("Block physical 0x%llx not readable\n", phys_addr);
+        if (!kaddr || !is_address_in_range(kaddr)) {
+            kpm_err("Block physical 0x%llx maps to invalid virtual\n", phys_addr);
             return -EFAULT;
         }
         
         memcpy((char *)kaddr, buffer, size);
+        kpm_info("Block write success: %d bytes\n", size);
         return size;
     }
     
@@ -545,8 +533,8 @@ static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
     
     pte_phys = pmd_val & ~0xFFFULL;
     pte_virt = (unsigned long)phys_to_virt(pte_phys);
-    if (!pte_virt || !is_address_readable((void *)pte_virt)) {
-        kpm_err("PTE virtual address 0x%llx not readable\n", pte_virt);
+    if (!pte_virt || !is_address_in_range((void *)pte_virt)) {
+        kpm_err("PTE virtual address 0x%llx not in valid range\n", pte_virt);
         return -EFAULT;
     }
     
@@ -573,12 +561,13 @@ static int safe_page_walk_write(struct mm_struct *mm, unsigned long addr,
     }
     
     kaddr = phys_to_virt(phys_addr);
-    if (!kaddr || !is_address_readable(kaddr)) {
-        kpm_err("Physical 0x%llx not readable\n", phys_addr);
+    if (!kaddr || !is_address_in_range(kaddr)) {
+        kpm_err("Physical 0x%llx maps to invalid virtual\n", phys_addr);
         return -EFAULT;
     }
     
     memcpy((char *)kaddr, buffer, size);
+    kpm_info("Page write success: %d bytes\n", size);
     return size;
 }
 
