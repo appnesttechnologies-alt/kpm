@@ -13,7 +13,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <pgtable.h>
+#include <asm/pgtable.h>
 #include <asm/processor.h>
 
 KPM_NAME("hosts_file_redirect");
@@ -104,7 +104,7 @@ typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned lo
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
 typedef void (*mmput_t)(struct mm_struct *);
-typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
+typedef void (*get_task_struct_t)(struct task_struct *);
 typedef void (*put_task_struct_t)(struct task_struct *);
 typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type,
                                   struct pid_namespace *);
@@ -159,11 +159,13 @@ static int hfr_copy_pte_page(pte_t *pte, unsigned long addr,
     void *base;
     unsigned long off;
 
-    if (!pte_present(*pte) || !pte_valid(*pte))
+    if (!pte_present(*pte))
         return -EFAULT;
 
+#ifdef pte_write
     if (is_write && !pte_write(*pte))
         return -EACCES;
+#endif
 
     page = pte_page(*pte);
     if (!page)
@@ -178,9 +180,9 @@ static int hfr_copy_pte_page(pte_t *pte, unsigned long addr,
         return -EFAULT;
 
     if (is_write)
-        memcpy((void *)((unsigned long)base + off), buffer, size);
+        memcpy((char *)base + off, buffer, size);
     else
-        memcpy(buffer, (void *)((unsigned long)base + off), size);
+        memcpy(buffer, (char *)base + off, size);
 
     return size;
 }
@@ -198,6 +200,11 @@ static int hfr_copy_pmd_huge(pmd_t *pmd, unsigned long addr,
     off = addr & ~PMD_MASK;
     if (off + (unsigned long)size > PMD_SIZE)
         return -EFAULT;
+
+#ifdef pmd_write
+    if (is_write && !pmd_write(*pmd))
+        return -EACCES;
+#endif
 
     pfn  = pmd_pfn(*pmd);
     phys = (pfn << PAGE_SHIFT) | off;
@@ -230,6 +237,11 @@ static int hfr_copy_pud_huge(pud_t *pud, unsigned long addr,
     if (off + (unsigned long)size > PUD_SIZE)
         return -EFAULT;
 
+#ifdef pud_write
+    if (is_write && !pud_write(*pud))
+        return -EACCES;
+#endif
+
     pfn  = pud_pfn(*pud);
     phys = (pfn << PAGE_SHIFT) | off;
     kaddr = phys_to_virt(phys);
@@ -258,8 +270,8 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     pud_t *pud;
     pmd_t *pmd;
     pte_t *pte;
-    spinlock_t *ptl = NULL;
-    int ret = -EFAULT;
+    spinlock_t *ptl;
+    int ret;
 
     if (!mm || !buffer || size <= 0)
         return -EINVAL;
@@ -267,69 +279,37 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     if (!is_valid_user_addr(addr))
         return -EFAULT;
 
-    if ((addr & (PAGE_SIZE - 1)) + (unsigned long)size > PAGE_SIZE) {
-        kpm_err("WALK: page boundary crossed addr=0x%lx size=%d
-", addr, size);
+    if ((addr & (PAGE_SIZE - 1)) + (unsigned long)size > PAGE_SIZE)
         return -EFAULT;
-    }
 
     pgd = pgd_offset(mm, addr);
-    if (!pgd) {
-        kpm_err("WALK: pgd_offset NULL addr=0x%lx
-", addr);
+    if (!pgd || pgd_none(*pgd) || pgd_bad(*pgd))
         return -EFAULT;
-    }
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) {
-        kpm_err("WALK: bad/none pgd addr=0x%lx
-", addr);
-        return -EFAULT;
-    }
 
     p4d = p4d_offset(pgd, addr);
-    if (!p4d) {
-        kpm_err("WALK: p4d_offset NULL addr=0x%lx
-", addr);
+    if (!p4d || p4d_none(*p4d) || p4d_bad(*p4d))
         return -EFAULT;
-    }
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) {
-        kpm_err("WALK: bad/none p4d addr=0x%lx
-", addr);
-        return -EFAULT;
-    }
 
     pud = pud_offset(p4d, addr);
-    if (!pud) {
-        kpm_err("WALK: pud_offset NULL addr=0x%lx
-", addr);
+    if (!pud || pud_none(*pud) || pud_bad(*pud))
         return -EFAULT;
-    }
-    if (pud_none(*pud) || pud_bad(*pud) || !pud_present(*pud)) {
-        kpm_err("WALK: bad/none pud addr=0x%lx
-", addr);
+#ifdef pud_present
+    if (!pud_present(*pud))
         return -EFAULT;
-    }
+#endif
 
-#ifdef pud_leaf
-    if (pud_leaf(*pud)) {
-        ret = hfr_copy_pud_huge(pud, addr, buffer, size, is_write);
-        if (ret < 0)
-            kpm_err("WALK: pud leaf access failed addr=0x%lx ret=%d
-", addr, ret);
-        return ret;
-    }
+#if defined(pud_leaf)
+    if (pud_leaf(*pud))
+        return hfr_copy_pud_huge(pud, addr, buffer, size, is_write);
 #endif
 
     pmd = pmd_offset(pud, addr);
-    if (!pmd) {
-        kpm_err("WALK: pmd_offset NULL addr=0x%lx
-", addr);
+    if (!pmd || pmd_none(*pmd) || pmd_bad(*pmd))
         return -EFAULT;
-    }
-    if (pmd_none(*pmd) || pmd_bad(*pmd) || !pmd_present(*pmd)) {
-        kpm_err("WALK: bad/none pmd addr=0x%lx
-", addr);
+#ifdef pmd_present
+    if (!pmd_present(*pmd))
         return -EFAULT;
-    }
+#endif
 
 #if defined(pmd_leaf) || defined(pmd_trans_huge) || defined(pmd_huge)
     if (
@@ -342,33 +322,16 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
 #ifdef pmd_huge
         pmd_huge(*pmd) ||
 #endif
-        0) {
-        ret = hfr_copy_pmd_huge(pmd, addr, buffer, size, is_write);
-        if (ret < 0)
-            kpm_err("WALK: pmd huge access failed addr=0x%lx ret=%d
-", addr, ret);
-        return ret;
-    }
+        0)
+        return hfr_copy_pmd_huge(pmd, addr, buffer, size, is_write);
 #endif
 
     pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
-    if (!pte) {
-        kpm_err("WALK: pte_offset_map_lock failed addr=0x%lx
-", addr);
+    if (!pte)
         return -EFAULT;
-    }
 
     ret = hfr_copy_pte_page(pte, addr, buffer, size, is_write);
-
     pte_unmap_unlock(pte, ptl);
-
-    if (ret < 0)
-        kpm_err("WALK: pte access failed addr=0x%lx ret=%d
-", addr, ret);
-    else
-        kpm_info("WALK: %s %d bytes OK addr=0x%lx
-",
-                 is_write ? "wrote" : "read", ret, addr);
 
     return ret;
 }
@@ -380,33 +343,33 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
     struct task_struct *task = NULL;
     struct mm_struct   *mm   = NULL;
-    pid_t  target_pid;
-    int    transferred;
-    int    is_write_op;
+    pid_t target_pid;
+    int transferred;
+    int is_write_op;
     uint32_t requested;
     uint8_t temp_buf[MAX_INLINE];
 
-    if (!pkt) return;
+    if (!pkt)
+        return;
 
-    kpm_info("PKT: op=0x%x pid=%u addr=0x%llx size=%u caller=%d
-",
-             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
-
-    pkt->status = STATUS_VM_FAULT;
     requested = pkt->size;
+    pkt->status = STATUS_VM_FAULT;
 
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
+
     if (!pkt->size || pkt->size > MAX_INLINE) {
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
+
     if (!is_valid_user_addr(pkt->vaddr)) {
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
+
     if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         pkt->status = STATUS_NULL_SYMBOL;
         return;
@@ -418,20 +381,29 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    if (p_rcu_read_lock) p_rcu_read_lock();
+    if (p_rcu_read_lock)
+        p_rcu_read_lock();
+
     task = p_find_task_by_vpid(target_pid);
     if (!task) {
-        if (p_rcu_read_unlock) p_rcu_read_unlock();
+        if (p_rcu_read_unlock)
+            p_rcu_read_unlock();
         pkt->status = STATUS_NO_TASK;
         return;
     }
-    if (p_get_task_struct) p_get_task_struct(task);
+
+    if (p_get_task_struct)
+        p_get_task_struct(task);
+
     mm = p_get_task_mm(task);
-    if (p_rcu_read_unlock) p_rcu_read_unlock();
+
+    if (p_rcu_read_unlock)
+        p_rcu_read_unlock();
 
     if (!mm) {
         pkt->status = STATUS_NO_MM;
-        if (p_put_task_struct) p_put_task_struct(task);
+        if (p_put_task_struct)
+            p_put_task_struct(task);
         return;
     }
 
@@ -445,7 +417,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
                                   temp_buf, (int)requested, is_write_op);
 
     p_mmput(mm);
-    if (p_put_task_struct) p_put_task_struct(task);
+    if (p_put_task_struct)
+        p_put_task_struct(task);
 
     if (transferred < 0) {
         if (transferred == -EACCES)
@@ -513,9 +486,13 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buf,
     if (caller_pid <= 0)
         return -ESRCH;
 
-    if (p_mutex_lock)   p_mutex_lock(&hfr_mutex);
+    if (p_mutex_lock)
+        p_mutex_lock(&hfr_mutex);
+
     process_packet(&local_pkt, caller_pid);
-    if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
+
+    if (p_mutex_unlock)
+        p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user)
         return -EFAULT;
@@ -547,9 +524,6 @@ static const struct proc_ops p_ops = {
 static long hfr_memory_init(const char *args, const char *event,
                             void __user *reserved)
 {
-    kpm_info("=== INIT START ===
-");
-
     p_proc_create_data  = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user    = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -573,31 +547,21 @@ static long hfr_memory_init(const char *args, const char *event,
     p_mutex_unlock      = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
     if (!p_proc_create_data || !p_find_task_by_vpid || !p_task_pid_nr_ns ||
-        !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
-        kpm_err("CRITICAL SYMBOL MISSING
-");
+        !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user)
         return -EFAULT;
-    }
 
     if (p_mutex_init)
         p_mutex_init(&hfr_mutex);
 
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
-    if (!proc_entry) {
-        kpm_err("proc_create FAILED
-");
+    if (!proc_entry)
         return -EFAULT;
-    }
 
-    kpm_info("=== INIT SUCCESS /proc/%s ===
-", proc_filename);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===
-");
     if (proc_entry && p_remove_proc_entry)
         p_remove_proc_entry(proc_filename, NULL);
     return 0;
