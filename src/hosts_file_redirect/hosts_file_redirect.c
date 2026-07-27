@@ -13,7 +13,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-
+#include <pgtable.h>
 // ============================================================
 // ✅ PHYS_TO_VIRT - Direct ARM64 formula
 // ============================================================
@@ -35,7 +35,7 @@ static inline void *phys_to_virt_arm64(unsigned long phys) {
 // 🔥 EXPORTED SYMBOLS - init_mm and swapper_pg_dir
 // ============================================================
 extern struct mm_struct init_mm;
-extern pgd_t swapper_pg_dir[];
+extern unsigned long swapper_pg_dir[];
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
