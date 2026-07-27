@@ -12,12 +12,16 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/pagemap.h>
+
+// 🔥 Tera pgtable.h - isme phys_to_virt() hai!
+#include "pgtable.h"
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
+KPM_DESCRIPTION("ULTIMATE NO TRACE - Without highmem");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -43,10 +47,8 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 #define STATUS_PROTECTION     0x100C
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
+#define STATUS_ULTIMATE_OK    0x2000
 
-
-#define HFR_FOLL_WRITE        0x01
-#define FOLL_FORCE            0x10  
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
@@ -137,15 +139,150 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 
+// ============================================================
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO TRACE 🔥🔥🔥
+// ============================================================
+static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
+                                   void *buffer, int size, int is_write)
+{
+    struct mm_struct *mm;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    void *kaddr;
+    unsigned long pfn;
+    unsigned long phys_addr;
+    unsigned long offset;
+    int ret = 0;
+
+    if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
+        return -EINVAL;
+    }
+
+    // Get mm_struct
+    mm = get_task_mm(task);
+    if (!mm) {
+        kpm_err("ULTIMATE: No mm for task\n");
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 1: PGD (Page Global Directory)
+    pgd = pgd_offset(mm, addr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) {
+        kpm_err("ULTIMATE: Invalid PGD at 0x%llx\n", addr);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 2: P4D (Page 4-level Directory)
+    p4d = p4d_offset(pgd, addr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) {
+        kpm_err("ULTIMATE: Invalid P4D at 0x%llx\n", addr);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 3: PUD (Page Upper Directory)
+    pud = pud_offset(p4d, addr);
+    if (pud_none(*pud) || pud_bad(*pud)) {
+        kpm_err("ULTIMATE: Invalid PUD at 0x%llx\n", addr);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 4: PMD (Page Middle Directory)
+    pmd = pmd_offset(pud, addr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) {
+        kpm_err("ULTIMATE: Invalid PMD at 0x%llx\n", addr);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 5: Check for Huge Page (2MB)
+    if (pmd_huge(*pmd)) {
+        pfn = pmd_pfn(*pmd);
+        if (!pfn_valid(pfn)) {
+            kpm_err("ULTIMATE: Invalid PFN for huge page\n");
+            mmput(mm);
+            return -EFAULT;
+        }
+        
+        phys_addr = (pfn << PAGE_SHIFT) | (addr & (PMD_SIZE - 1));
+        kaddr = (void *)phys_to_virt(phys_addr);
+        if (!kaddr) {
+            mmput(mm);
+            return -EFAULT;
+        }
+        
+        offset = addr & (PMD_SIZE - 1);
+        if (is_write) {
+            memcpy(kaddr + offset, buffer, size);
+        } else {
+            memcpy(buffer, kaddr + offset, size);
+        }
+        ret = size;
+        mmput(mm);
+        kpm_info("ULTIMATE: Huge page access OK\n");
+        return ret;
+    }
+
+    // 🔥 STEP 6: PTE (Page Table Entry) for normal 4KB page
+    pte = pte_offset_kernel(pmd, addr);
+    if (!pte || pte_none(*pte)) {
+        kpm_err("ULTIMATE: Invalid PTE at 0x%llx\n", addr);
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 7: PFN (Page Frame Number)
+    pfn = pte_pfn(*pte);
+    if (!pfn_valid(pfn)) {
+        kpm_err("ULTIMATE: Invalid PFN\n");
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 8: Physical Address
+    phys_addr = (pfn << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
+    kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
+
+    // 🔥 STEP 9: phys_to_virt (Tera function from pgtable.h)
+    kaddr = (void *)phys_to_virt(phys_addr);
+    if (!kaddr) {
+        kpm_err("ULTIMATE: phys_to_virt failed\n");
+        mmput(mm);
+        return -EFAULT;
+    }
+
+    // 🔥 STEP 10: DIRECT READ/WRITE - NO PERMISSION CHECK!
+    offset = addr & (PAGE_SIZE - 1);
+    if (is_write) {
+        memcpy(kaddr + offset, buffer, size);
+        kpm_info("ULTIMATE: Wrote %d bytes at 0x%llx\n", size, addr);
+    } else {
+        memcpy(buffer, kaddr + offset, size);
+        kpm_info("ULTIMATE: Read %d bytes from 0x%llx\n", size, addr);
+    }
+    ret = size;
+
+    mmput(mm);
+    return ret;
+}
+
+// ============================================================
+// PROCESS PACKET - Ultimate Access
+// ============================================================
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
     struct task_struct *task = NULL;
     struct mm_struct *mm = NULL;
     pid_t target_pid;
     int transferred;
-    unsigned int gup_flags;
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
+    int ultimate_used = 0;
 
     kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
@@ -212,17 +349,31 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     memset(temp_buffer, 0, MAX_INLINE);
     
     if (is_write_op) {
-    memcpy(temp_buffer, pkt->inline_data, pkt->size);
-    gup_flags = HFR_FOLL_WRITE | FOLL_FORCE; 
-} else {
-    gup_flags = FOLL_FORCE;                  
-}
+        memcpy(temp_buffer, pkt->inline_data, pkt->size);
+    }
 
-    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
-             task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
-    
-    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-    kpm_info("access_process_vm returned: %d\n", transferred);
+    // ============================================================
+    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO TRACE 🔥🔥🔥
+    // ============================================================
+    kpm_info("ULTIMATE: Accessing addr 0x%llx, size %d, write=%d\n", 
+             pkt->vaddr, pkt->size, is_write_op);
+
+    transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
+
+    if (transferred > 0) {
+        kpm_info("✅ ULTIMATE SUCCESS: %d bytes\n", transferred);
+        pkt->status = STATUS_ULTIMATE_OK;
+        ultimate_used = 1;
+    } else {
+        kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
+        // Fallback to access_process_vm if ultimate fails
+        kpm_info("Fallback: Using access_process_vm\n");
+        transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, 0);
+        kpm_info("access_process_vm returned: %d\n", transferred);
+        if (transferred > 0) {
+            pkt->status = STATUS_SUCCESS;
+        }
+    }
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
@@ -251,8 +402,10 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS\n");
-    pkt->status = STATUS_SUCCESS;
+    kpm_info("<<< process_packet SUCCESS (Ultimate: %d)\n", ultimate_used);
+    if (pkt->status == STATUS_ULTIMATE_OK) {
+        pkt->status = STATUS_SUCCESS;
+    }
 }
 
 static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
@@ -335,7 +488,7 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT START ===\n");
+    kpm_info("=== ULTIMATE NO TRACE INIT START ===\n");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -374,13 +527,14 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("🔥 NO TRACE MEMORY ACCESS ACTIVE! (Without highmem)\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===\n");
+    kpm_info("=== ULTIMATE EXIT ===\n");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
