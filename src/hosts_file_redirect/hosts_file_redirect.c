@@ -29,20 +29,13 @@ KPM_DESCRIPTION("INFO COLLECTOR - NO CRASH");
 #define hfr_err(fmt, ...)
 #endif
 
-#define MAX_INLINE     256
-#define OP_READ_VM     0x2000
-#define OP_WRITE_VM    0x3000
-
-#define STATUS_SUCCESS        0x0000
-#define STATUS_NULL_SYMBOL    0x100E
-
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
     uint64_t vaddr;
     uint32_t size;
     uint32_t status;
-    uint8_t  inline_data[MAX_INLINE];
+    uint8_t  inline_data[256];
 } __attribute__((aligned(8), packed));
 
 struct inode;
@@ -93,13 +86,20 @@ static put_task_struct_t     p_put_task_struct = NULL;
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 
+static inline struct task_struct *hfr_get_current(void)
+{
+    struct task_struct *tsk;
+    asm volatile("mrs %0, sp_el0" : "=r" (tsk));
+    return tsk;
+}
+
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     hfr_log("========================================");
     hfr_log("=== INFO COLLECTOR START ===");
     hfr_log("========================================");
     
-    // 1. Resolve basic symbols
+    // 1. Resolve symbols
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
@@ -136,55 +136,50 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         hfr_log("physvirt_offset: NOT FOUND");
     }
     
-    // 5. Get swapper_pg_dir
+    // 5. Get _text (kernel start)
+    unsigned long *text_ptr = (unsigned long *)kallsyms_lookup_name("_text");
+    if (text_ptr) {
+        hfr_log("_text: %px", text_ptr);
+    }
+    
+    // 6. Get swapper_pg_dir
     unsigned long *swapper_ptr = (unsigned long *)kallsyms_lookup_name("swapper_pg_dir");
     if (swapper_ptr) {
         hfr_log("swapper_pg_dir: %px", swapper_ptr);
-    } else {
-        hfr_log("swapper_pg_dir: NOT FOUND");
     }
     
-    // 6. Get PAGE_OFFSET from swapper_pg_dir
-    // swapper_pg_dir is in kernel image, its virtual address = phys + kimage_voffset
-    // But it's also accessible via linear map at phys + PAGE_OFFSET
-    if (swapper_ptr && kimage_ptr) {
-        hfr_log("swapper_pg_dir VA: %px", swapper_ptr);
-        hfr_log("kimage_voffset: 0x%llx", *kimage_ptr);
-        // Rough PAGE_OFFSET = swapper_pg_dir_va - (swapper_pg_dir_phys)
-        // But we need phys which we don't have directly
-    }
-    
-    // 7. Try to read PAGE_OFFSET directly from kernel config
-    unsigned long page_offset_calc = -(1UL << 39); // 39-bit VA
+    // 7. Calculated PAGE_OFFSET
+    unsigned long page_offset_calc = -(1UL << 39);
     hfr_log("Calculated PAGE_OFFSET (39-bit): 0x%llx", page_offset_calc);
     
-    // 8. Dump current task's mm_struct to find pgd offset
-    struct task_struct *curr = get_current();
+    // 8. Dump current task's mm_struct
+    struct task_struct *curr = hfr_get_current();
     if (curr) {
-        hfr_log("Current task: %px, pid=%d", curr, curr->pid);
-        struct mm_struct *mm = p_get_task_mm ? p_get_task_mm(curr) : NULL;
-        if (mm) {
-            hfr_log("mm_struct: %px", mm);
-            hfr_log("Dumping mm_struct first 20 unsigned longs:");
-            unsigned long *mm_ptr = (unsigned long *)mm;
-            for (int i = 0; i < 20; i++) {
-                hfr_log("  mm[%2d] @ +0x%02x = 0x%016llx", i, i*8, mm_ptr[i]);
+        hfr_log("Current task: %px", curr);
+        
+        if (p_get_task_mm) {
+            struct mm_struct *mm = p_get_task_mm(curr);
+            if (mm) {
+                hfr_log("mm_struct: %px", mm);
+                hfr_log("Dumping mm_struct first 20 unsigned longs:");
+                unsigned long *mm_ptr = (unsigned long *)mm;
+                for (int i = 0; i < 20; i++) {
+                    hfr_log("  mm[%2d] @ +0x%02x = 0x%016llx", i, i*8, mm_ptr[i]);
+                }
+                p_mmput(mm);
+            } else {
+                hfr_log("get_task_mm returned NULL!");
             }
-            p_mmput(mm);
-        } else {
-            hfr_log("get_task_mm returned NULL!");
         }
     } else {
         hfr_log("get_current returned NULL!");
     }
     
-    // 9. Create proc entry (just for testing)
+    // 9. Create proc entry
     if (p_proc_create_data) {
         proc_entry = p_proc_create_data(proc_filename, 0666, NULL, NULL, NULL);
         if (proc_entry) {
-            hfr_log("/proc/%s created successfully", proc_filename);
-        } else {
-            hfr_log("proc_create FAILED");
+            hfr_log("/proc/%s created", proc_filename);
         }
     }
     
