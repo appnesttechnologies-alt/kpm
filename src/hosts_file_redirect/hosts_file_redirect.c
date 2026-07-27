@@ -13,9 +13,11 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/highmem.h>
+#include <linux/pagemap.h>
 
 // ============================================================
-// ✅ PHYS_TO_VIRT - Direct ARM64 formula (No header needed!)
+// ✅ PHYS_TO_VIRT - ARM64 Direct Formula
 // ============================================================
 #ifndef PHYS_OFFSET
 #define PHYS_OFFSET 0x0000000000000000ULL
@@ -35,7 +37,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE BRUTE FORCE - PGD Offset Finder");
+KPM_DESCRIPTION("ZERO TRACE - get_user_pages + phys_to_virt");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -118,6 +120,12 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 
+// 🔥 get_user_pages function pointers
+typedef int (*get_user_pages_t)(struct task_struct *task, struct mm_struct *mm,
+                                unsigned long start, int nr_pages,
+                                unsigned int gup_flags, struct page **pages,
+                                struct vm_area_struct **vmas);
+
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
@@ -134,16 +142,11 @@ static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
+static get_user_pages_t      p_get_user_pages;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
-
-// ============================================================
-// 🔥 GLOBAL PGD OFFSET - Brute force will set this
-// ============================================================
-static int g_pgd_offset = 0;
-static int g_pgd_offset_found = 0;
 
 static inline struct task_struct *hfr_get_current(void)
 {
@@ -160,170 +163,74 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥 BRUTE FORCE PGD OFFSET FINDER
+// 🔥🔥🔥 ULTIMATE ZERO TRACE - get_user_pages + phys_to_virt
 // ============================================================
-static int find_pgd_offset(struct mm_struct *mm)
-{
-    int offsets[] = {0x30, 0x38, 0x40, 0x28, 0x48, 0x50};
-    int num_offsets = sizeof(offsets) / sizeof(offsets[0]);
-    int i;
-    unsigned long pgd_ptr;
-    
-    kpm_info("🔍 Brute forcing PGD offset...\n");
-    
-    for (i = 0; i < num_offsets; i++) {
-        pgd_ptr = (unsigned long)((char *)mm + offsets[i]);
-        
-        // Check if pgd_ptr points to a valid PGD
-        if (pgd_ptr && *(unsigned long *)pgd_ptr != 0) {
-            unsigned long pgd_val = *(unsigned long *)pgd_ptr;
-            
-            // PGD entry should have valid bit (bit 0) set
-            if (pgd_val & 1) {
-                kpm_info("✅ Found valid PGD at offset 0x%x (pgd_val=0x%llx)\n", 
-                         offsets[i], pgd_val);
-                g_pgd_offset = offsets[i];
-                g_pgd_offset_found = 1;
-                return offsets[i];
-            }
-        }
-    }
-    
-    kpm_err("❌ No valid PGD offset found!\n");
-    return -1;
-}
-
-// ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Brute Force PGD Offset
-// ============================================================
-static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
-                                   void *buffer, int size, int is_write)
+static int ultimate_zero_trace_access(struct task_struct *task, unsigned long addr,
+                                       void *buffer, int size, int is_write)
 {
     struct mm_struct *mm;
-    unsigned long pgd_ptr, pud_ptr, pmd_ptr, pte_ptr;
-    unsigned long pgd_val, pud_val, pmd_val, pte_val;
-    unsigned long pfn, phys_addr, offset;
+    struct page *pages[1];
+    int ret;
+    unsigned long pfn, phys_addr;
     void *kaddr;
-    int ret = 0;
-
+    unsigned long offset;
+    
     if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
         return -EINVAL;
     }
-
+    
     mm = p_get_task_mm(task);
     if (!mm) {
-        kpm_err("ULTIMATE: No mm for task\n");
+        kpm_err("ZT: No mm for task\n");
         return -EFAULT;
     }
-
-    // 🔥 STEP 1: Find PGD offset if not found yet
-    if (!g_pgd_offset_found) {
-        if (find_pgd_offset(mm) < 0) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-    }
-
-    // 🔥 STEP 2: PGD using found offset
-    pgd_ptr = (unsigned long)((char *)mm + g_pgd_offset);
-    if (!pgd_ptr || *(unsigned long *)pgd_ptr == 0) {
-        kpm_err("ULTIMATE: Invalid PGD pointer at offset 0x%x\n", g_pgd_offset);
+    
+    // 🔥 STEP 1: get_user_pages - Direct PFN (No page table walk needed!)
+    unsigned int gup_flags = is_write ? (FOLL_WRITE | FOLL_FORCE | FOLL_GET) : (FOLL_FORCE | FOLL_GET);
+    
+    ret = p_get_user_pages(task, mm, addr & PAGE_MASK, 1, gup_flags, pages, NULL);
+    
+    if (ret != 1) {
+        kpm_err("ZT: get_user_pages failed: %d\n", ret);
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: mm->pgd at offset 0x%x = 0x%llx\n", g_pgd_offset, pgd_ptr);
-
-    // 🔥 STEP 3: PGD Entry (ARM64: 9 bits, shift 39)
-    unsigned long pgd_idx = (addr >> 39) & 0x1FF;
-    pgd_val = *(unsigned long *)(pgd_ptr + pgd_idx * 8);
-    if (!(pgd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PGD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 4: PUD Entry (ARM64: 9 bits, shift 30)
-    unsigned long pud_idx = (addr >> 30) & 0x1FF;
-    pud_ptr = pgd_val & ~0xFFF;
-    pud_val = *(unsigned long *)(pud_ptr + pud_idx * 8);
-    if (!(pud_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PUD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 5: PMD Entry (ARM64: 9 bits, shift 21)
-    unsigned long pmd_idx = (addr >> 21) & 0x1FF;
-    pmd_ptr = pud_val & ~0xFFF;
-    pmd_val = *(unsigned long *)(pmd_ptr + pmd_idx * 8);
-    if (!(pmd_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PMD entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 6: Huge Page (2MB)
-    if (pmd_val & (1 << 1)) {
-        pfn = pmd_val >> 12;
-        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = phys_to_virt(phys_addr);
-        if (!kaddr) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        if (is_write) {
-            memcpy(kaddr + (addr & 0x1FFFFF), buffer, size);
-        } else {
-            memcpy(buffer, kaddr + (addr & 0x1FFFFF), size);
-        }
-        if (p_mmput) p_mmput(mm);
-        return size;
-    }
-
-    // 🔥 STEP 7: PTE Entry (ARM64: 9 bits, shift 12)
-    unsigned long pte_idx = (addr >> 12) & 0x1FF;
-    pte_ptr = pmd_val & ~0xFFF;
-    pte_val = *(unsigned long *)(pte_ptr + pte_idx * 8);
-    if (!(pte_val & 1)) {
-        kpm_err("ULTIMATE: Invalid PTE entry\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 8: PFN from PTE
-    pfn = pte_val >> 12;
-    if (pfn == 0) {
-        kpm_err("ULTIMATE: Invalid PFN\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 9: Physical Address
-    phys_addr = (pfn << 12) | (addr & 0xFFF);
-
-    // ✅ Direct phys_to_virt
+    
+    // 🔥 STEP 2: PFN → Physical Address
+    pfn = page_to_pfn(pages[0]);
+    phys_addr = (pfn << PAGE_SHIFT) | (addr & ~PAGE_MASK);
+    kpm_info("ZT: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
+    
+    // 🔥 STEP 3: Physical → Kernel Virtual
     kaddr = phys_to_virt(phys_addr);
     if (!kaddr) {
-        kpm_err("ULTIMATE: phys_to_virt failed\n");
+        kpm_err("ZT: phys_to_virt failed\n");
+        put_page(pages[0]);
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 10: DIRECT ACCESS - NO PERMISSION CHECK!
-    offset = addr & 0xFFF;
+    
+    // 🔥 STEP 4: DIRECT ACCESS - NO PERMISSION CHECK!
+    offset = addr & ~PAGE_MASK;
     if (is_write) {
         memcpy(kaddr + offset, buffer, size);
+        // Mark page dirty
+        set_page_dirty(pages[0]);
+        kpm_info("ZT: Wrote %d bytes at offset 0x%lx\n", size, offset);
     } else {
         memcpy(buffer, kaddr + offset, size);
+        kpm_info("ZT: Read %d bytes from offset 0x%lx\n", size, offset);
     }
-    ret = size;
-
+    
+    // 🔥 STEP 5: Cleanup
+    put_page(pages[0]);
     if (p_mmput) p_mmput(mm);
-    return ret;
+    
+    return size;
 }
 
 // ============================================================
-// PROCESS PACKET - Ultimate Access (No Fallback!)
+// PROCESS PACKET - Ultimate Zero Trace (No Fallback!)
 // ============================================================
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
@@ -355,7 +262,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+    if (!p_get_user_pages || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
@@ -403,15 +310,15 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     // ============================================================
-    // 🔥🔥🔥 ULTIMATE MEMORY ACCESS - NO FALLBACK! 🔥🔥🔥
+    // 🔥🔥🔥 ULTIMATE ZERO TRACE - NO FALLBACK! 🔥🔥🔥
     // ============================================================
-    transferred = ultimate_memory_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
+    transferred = ultimate_zero_trace_access(task, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     if (transferred > 0) {
-        kpm_info("✅ ULTIMATE SUCCESS: %d bytes\n", transferred);
+        kpm_info("✅ ZERO TRACE SUCCESS: %d bytes\n", transferred);
         pkt->status = STATUS_ULTIMATE_OK;
     } else {
-        kpm_err("❌ ULTIMATE FAILED: %d\n", transferred);
+        kpm_err("❌ ZERO TRACE FAILED: %d\n", transferred);
         pkt->status = STATUS_PROTECTION;
     }
 
@@ -502,7 +409,7 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== ULTIMATE BRUTE FORCE INIT START ===\n");
+    kpm_info("=== ZERO TRACE INIT START ===\n");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -522,8 +429,20 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
+    
+    // 🔥 get_user_pages - Sabse important!
+    p_get_user_pages = (get_user_pages_t)kallsyms_lookup_name("get_user_pages");
+    if (!p_get_user_pages) {
+        kpm_err("❌ get_user_pages NOT FOUND!\n");
+        return -EFAULT;
+    }
+    kpm_info("✅ get_user_pages resolved: %px\n", p_get_user_pages);
 
-    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
+
+    if (!p_proc_create_data || !p_get_user_pages || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
@@ -537,14 +456,14 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    kpm_info("=== ULTIMATE BRUTE FORCE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 Brute force PGD offset finder ACTIVE!\n");
+    kpm_info("=== ZERO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("🔥 get_user_pages + phys_to_virt ACTIVE! Zero Trace!\n");
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== ULTIMATE EXIT ===\n");
+    kpm_info("=== ZERO TRACE EXIT ===\n");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
