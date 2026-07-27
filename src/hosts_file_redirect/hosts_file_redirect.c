@@ -13,9 +13,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-
-// 🔥 Tera pgtable.h - isme phys_to_virt() hai!
-#include "pgtable.h"
+#include <asm/memory.h>          // ✅ phys_to_virt, __va
 
 // 🔥 mm_struct_offset - dynamic offsets ke liye
 extern struct mm_struct_offset mm_struct_offset;
@@ -24,7 +22,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE NO TRACE - Dynamic mm_struct_offset");
+KPM_DESCRIPTION("ULTIMATE NO TRACE - Kernel phys_to_virt");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -143,7 +141,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - DYNAMIC mm_struct_offset 🔥🔥🔥
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - Kernel phys_to_virt 🔥🔥🔥
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
@@ -212,7 +210,8 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = (void *)phys_to_virt(phys_addr);
+        // ✅ KERNEL phys_to_virt
+        kaddr = phys_to_virt(phys_addr);
         if (!kaddr) {
             kpm_err("ULTIMATE: phys_to_virt failed for huge page\n");
             if (p_mmput) p_mmput(mm);
@@ -252,15 +251,15 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     phys_addr = (pfn << 12) | (addr & 0xFFF);
     kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
 
-    // 🔥 STEP 9: phys_to_virt
-    kaddr = (void *)phys_to_virt(phys_addr);
+    // ✅ KERNEL phys_to_virt
+    kaddr = phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: phys_to_virt failed\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
-    // 🔥 STEP 10: DIRECT ACCESS - NO PERMISSION CHECK!
+    // 🔥 STEP 9: DIRECT ACCESS - NO PERMISSION CHECK!
     offset = addr & 0xFFF;
     if (is_write) {
         memcpy(kaddr + offset, buffer, size);
@@ -533,7 +532,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 DYNAMIC mm_struct_offset ACTIVE!\n");
+    kpm_info("🔥 KERNEL phys_to_virt ACTIVE!\n");
     return 0;
 }
 
