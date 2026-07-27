@@ -13,8 +13,8 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <asm/pgtable.h>
-#include <asm/processor.h>
+#include <pgtable.h>
+#include <processor.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
