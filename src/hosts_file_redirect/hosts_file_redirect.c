@@ -18,7 +18,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ZERO TRACE - EXACT OFFSETS");
+KPM_DESCRIPTION("ZERO TRACE - KERNEL LINEAR MAP ACCESS");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -112,58 +112,32 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-static inline uint32_t min_u32(uint32_t a, uint32_t b)
-{
-    return (a < b) ? a : b;
-}
-
 // Exact kernel definitions from source
 #define VA_BITS          39
-#define PAGE_OFFSET_VAL  (-(1UL << VA_BITS))  // 0xffffff8000000000
-#define PGD_OFFSET       0x48  // Exact offset from mm_types.h
+#define PAGE_OFFSET_VAL  (-(1UL << VA_BITS))
+#define PGD_OFFSET       0x48
 #define PGD_SHIFT        30
 #define PMD_SHIFT        21
 #define PAGE_SHIFT       12
 #define PTRS_PER_PT      512
+#define PTE_ADDR_MASK    0xFFFFFFFFFFFFF000ULL
+#define PMD_MASK         0xFFFFFFFFFFE00000ULL
 
-// ARM64 PTE bits from pgtable-hwdef.h
 #define HFR_PTE_VALID        (1UL << 0)
 #define HFR_PTE_TYPE_TABLE   (3UL << 0)
 #define HFR_PTE_TYPE_BLOCK   (1UL << 0)
-#define HFR_PTE_USER         (1UL << 6)
-#define HFR_PTE_RDONLY       (1UL << 7)
-#define HFR_PTE_AF           (1UL << 10)
-#define HFR_PTE_DBM          (1UL << 51)
-#define HFR_PMD_SECT_RDONLY  (1UL << 7)
 
-// Convert physical to kernel virtual using linear map
 static inline unsigned long phys_to_kvirt(unsigned long phys)
 {
     return phys + PAGE_OFFSET_VAL;
 }
 
-// Flush TLB on all cores
-static inline void flush_tlb_entry(unsigned long addr)
-{
-    asm volatile(
-        "dsb ishst\n"
-        "tlbi vaae1is, %0\n"
-        "dsb ish\n"
-        "isb\n"
-        : : "r"(addr) : "memory"
-    );
-}
-
-// Walk page table - returns pointer to PTE/PMD entry
 static int walk_page_table(struct mm_struct *mm, unsigned long addr,
-                           unsigned long **entry_ptr, unsigned long *entry_val,
-                           int *is_block)
+                           unsigned long *entry_val, int *is_block)
 {
     unsigned long *pgd, *pmd, *pte;
-    unsigned long val;
-    unsigned long idx;
+    unsigned long val, idx;
     
-    // Get PGD from exact offset 0x48
     pgd = *(unsigned long **)((char *)mm + PGD_OFFSET);
     hfr_log("PGD base = %px", (void *)pgd);
     
@@ -172,7 +146,7 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // PGD entry (bits 38:30)
+    // PGD
     idx = (addr >> PGD_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pgd + idx);
     hfr_log("PGD[%lu] = 0x%llx", idx, val);
@@ -182,7 +156,7 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    // PMD table
+    // PMD
     pmd = (unsigned long *)phys_to_kvirt(val & ~0xFFFULL);
     idx = (addr >> PMD_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pmd + idx);
@@ -196,18 +170,17 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     // Block mapping (2MB)
     if ((val & 0x3) == HFR_PTE_TYPE_BLOCK) {
         hfr_log("Block mapping found");
-        *entry_ptr = (unsigned long *)(pmd + idx);
         *entry_val = val;
         *is_block = 1;
         return 0;
     }
     
     if ((val & 0x3) != HFR_PTE_TYPE_TABLE) {
-        hfr_err("PMD invalid type");
+        hfr_err("PMD invalid type: 0x%llx", val);
         return -EFAULT;
     }
     
-    // PTE table
+    // PTE
     pte = (unsigned long *)phys_to_kvirt(val & ~0xFFFULL);
     idx = (addr >> PAGE_SHIFT) & 0x1FF;
     val = *(volatile unsigned long *)(pte + idx);
@@ -218,110 +191,52 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    *entry_ptr = (unsigned long *)(pte + idx);
     *entry_val = val;
     *is_block = 0;
     return 0;
 }
 
-// READ using linear map
-static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
-                        void *buffer, int size)
+// ============================================================
+// 🔥 UNIVERSAL ACCESS - READ & WRITE through KERNEL LINEAR MAP
+// NO PTE MODIFICATION NEEDED!
+// ============================================================
+static int mem_access(struct mm_struct *mm, unsigned long addr,
+                      void *buffer, int size, int is_write)
 {
-    unsigned long *entry, entry_val, phys_addr, kvirt_addr;
+    unsigned long entry_val, phys_addr, kvirt_addr;
     int is_block, ret;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
     
-    hfr_log("READ: addr=0x%llx size=%d", addr, size);
+    hfr_log("%s: addr=0x%llx size=%d", is_write ? "WRITE" : "READ", addr, size);
     
-    ret = walk_page_table(mm, addr, &entry, &entry_val, &is_block);
+    ret = walk_page_table(mm, addr, &entry_val, &is_block);
     if (ret < 0)
         return ret;
     
     if (!is_block && (addr & 0xFFF) + size > 4096) {
-        hfr_err("Cross-page read");
+        hfr_err("Cross-page access not supported");
         return -EFAULT;
     }
     
+    // Calculate physical address
     if (is_block)
-        phys_addr = (entry_val & 0xFFFFFFFFFFE00000ULL) | (addr & 0x1FFFFF);
+        phys_addr = (entry_val & PMD_MASK) | (addr & 0x1FFFFF);
     else
-        phys_addr = (entry_val & 0xFFFFFFFFFFFFF000ULL) | (addr & 0xFFF);
+        phys_addr = (entry_val & PTE_ADDR_MASK) | (addr & 0xFFF);
     
+    // Convert to kernel linear virtual address
     kvirt_addr = phys_to_kvirt(phys_addr);
-    memcpy(buffer, (void *)kvirt_addr, size);
-    hfr_log("READ OK: %d bytes", size);
-    return size;
-}
-
-// WRITE using PTE modification
-static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
-                          void *buffer, int size)
-{
-    unsigned long *entry, entry_val, orig_val, new_val, irq_flags;
-    int is_block, ret;
+    hfr_log("phys=0x%llx kvirt=0x%llx", phys_addr, kvirt_addr);
     
-    if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
-        return -EINVAL;
+    // 🔥 DIRECT ACCESS through kernel linear map - bypasses userspace protection!
+    if (is_write)
+        memcpy((void *)kvirt_addr, buffer, size);
+    else
+        memcpy(buffer, (void *)kvirt_addr, size);
     
-    hfr_log("WRITE: addr=0x%llx size=%d", addr, size);
-    
-    ret = walk_page_table(mm, addr, &entry, &entry_val, &is_block);
-    if (ret < 0)
-        return ret;
-    
-    if (!is_block && (addr & 0xFFF) + size > 4096) {
-        hfr_err("Cross-page write");
-        return -EFAULT;
-    }
-    
-    orig_val = entry_val;
-    
-    // Check if already writable
-    if (is_block) {
-        if (!(entry_val & HFR_PMD_SECT_RDONLY)) {
-            hfr_log("Block already writable");
-            memcpy((void *)addr, buffer, size);
-            return size;
-        }
-    } else {
-        if (!(entry_val & HFR_PTE_RDONLY)) {
-            hfr_log("PTE already writable");
-            memcpy((void *)addr, buffer, size);
-            return size;
-        }
-    }
-    
-    // Disable interrupts
-    asm volatile("mrs %0, daif" : "=r"(irq_flags) : : "memory");
-    asm volatile("msr daifset, #2" : : : "memory");
-    
-    // Clear RDONLY bit
-    if (is_block) {
-        new_val = orig_val & ~HFR_PMD_SECT_RDONLY;
-        hfr_log("Block: Clear RDONLY (0x%llx -> 0x%llx)", orig_val, new_val);
-    } else {
-        new_val = orig_val & ~HFR_PTE_RDONLY;
-        hfr_log("PTE: Clear RDONLY (0x%llx -> 0x%llx)", orig_val, new_val);
-    }
-    
-    *entry = new_val;
-    asm volatile("dsb ishst" ::: "memory");
-    flush_tlb_entry(addr);
-    
-    // Direct write to userspace virtual address
-    memcpy((void *)addr, buffer, size);
-    hfr_log("WRITE OK: %d bytes", size);
-    
-    // Restore
-    *entry = orig_val;
-    asm volatile("dsb ishst" ::: "memory");
-    flush_tlb_entry(addr);
-    
-    asm volatile("msr daif, %0" : : "r"(irq_flags) : "memory");
-    
+    hfr_log("%s OK: %d bytes", is_write ? "WRITE" : "READ", size);
     return size;
 }
 
@@ -387,11 +302,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (is_write_op)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
 
-    // CALL REAL PTE MOD FUNCTIONS
-    if (is_write_op)
-        transferred = pte_mod_write(mm, pkt->vaddr, temp_buffer, pkt->size);
-    else
-        transferred = pte_mod_read(mm, pkt->vaddr, temp_buffer, pkt->size);
+    transferred = mem_access(mm, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     hfr_log("Result: %d", transferred);
     pkt->status = (transferred > 0) ? STATUS_SUCCESS : STATUS_VM_FAULT;
@@ -453,10 +364,10 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    hfr_log("=== ZERO TRACE PTE MOD - EXACT ===");
+    hfr_log("=== ZERO TRACE KERNEL LINEAR MAP ===");
     hfr_log("PAGE_OFFSET: 0x%llx", PAGE_OFFSET_VAL);
     hfr_log("PGD offset: 0x%x", PGD_OFFSET);
-    hfr_log("VA_BITS: %d", VA_BITS);
+    hfr_log("NO PTE MODIFICATION - SAFE & FAST!");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
