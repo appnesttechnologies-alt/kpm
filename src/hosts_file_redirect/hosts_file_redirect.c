@@ -13,7 +13,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/irqflags.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -134,8 +133,21 @@ static inline struct task_struct *hfr_get_current(void)
 #define PTE_AP2              (1UL << 6)
 #define PTE_ADDR_MASK        0xFFFFFFFFF000ULL
 
+// Simple interrupt disable/enable using DAIF
+static inline unsigned long arch_local_irq_save(void)
+{
+    unsigned long flags;
+    asm volatile("mrs %0, daif" : "=r"(flags) : : "memory");
+    asm volatile("msr daifset, #2" : : : "memory");
+    return flags;
+}
+
+static inline void arch_local_irq_restore(unsigned long flags)
+{
+    asm volatile("msr daif, %0" : : "r"(flags) : "memory");
+}
+
 // Convert physical address to kernel virtual using linear map
-// Only for accessing page TABLE pages, NOT userspace data!
 static unsigned long phys_to_kvirt(unsigned long phys)
 {
     return phys + 0xffffff8000000000ULL;
@@ -162,10 +174,8 @@ static unsigned long find_pgd_phys(struct mm_struct *mm)
     for (int i = 0; i < 10; i++) {
         val = *(unsigned long *)((char *)mm + possible_offsets[i]);
         if (val != 0 && (val & 0xFFF) == 0 && val < (1ULL << 40)) {
-            if (val < (1ULL << 40)) {
-                kpm_info("PGD found at mm+0x%lx = 0x%llx\n", possible_offsets[i], val);
-                return val;
-            }
+            kpm_info("PGD found at mm+0x%lx = 0x%llx\n", possible_offsets[i], val);
+            return val;
         }
     }
     kpm_err("Could not find PGD in mm_struct\n");
@@ -182,7 +192,6 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
     unsigned long pgd_val, pmd_val, pte_val;
     unsigned long pmd_table, pte_table;
     unsigned long pgd_idx, pmd_idx, pte_idx;
-    int ret = -EFAULT;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
@@ -192,21 +201,18 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     
     pgd_table = phys_to_kvirt(pgd_phys);
-    kpm_info("PGD table: virt=0x%llx (from phys=0x%llx)\n", pgd_table, pgd_phys);
     
     pgd_idx = (addr >> 30) & 0x1FF;
     pgd_val = *(volatile unsigned long *)(pgd_table + pgd_idx * 8);
-    kpm_info("PGD[%lu] = 0x%llx\n", pgd_idx, pgd_val);
     
     if ((pgd_val & 0x3) != 0x3) {
-        kpm_err("Invalid PGD entry (not table descriptor)\n");
+        kpm_err("Invalid PGD entry\n");
         return -EFAULT;
     }
     
     pmd_table = phys_to_kvirt(pgd_val & ~0xFFFULL);
     pmd_idx = (addr >> 21) & 0x1FF;
     pmd_val = *(volatile unsigned long *)(pmd_table + pmd_idx * 8);
-    kpm_info("PMD[%lu] = 0x%llx\n", pmd_idx, pmd_val);
     
     if (!(pmd_val & PTE_VALID)) {
         kpm_err("PMD entry not present\n");
@@ -214,7 +220,6 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
     }
     
     if ((pmd_val & 0x3) == PTE_TYPE_BLOCK) {
-        kpm_info("Block mapping detected - reading directly\n");
         unsigned long block_phys = (pmd_val & PTE_ADDR_MASK) | (addr & 0x1FFFFF);
         unsigned long block_virt = phys_to_kvirt(block_phys);
         memcpy(buffer, (void *)block_virt, size);
@@ -229,28 +234,24 @@ static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
     pte_table = phys_to_kvirt(pmd_val & ~0xFFFULL);
     pte_idx = (addr >> 12) & 0x1FF;
     pte_val = *(volatile unsigned long *)(pte_table + pte_idx * 8);
-    kpm_info("PTE[%lu] = 0x%llx\n", pte_idx, pte_val);
     
     if (!(pte_val & PTE_VALID)) {
         kpm_err("PTE entry not present\n");
         return -EFAULT;
     }
     
+    if ((addr & 0xFFF) + size > 0x1000) {
+        kpm_err("Cross-page access not supported\n");
+        return -EFAULT;
+    }
+    
     {
         unsigned long phys_addr = (pte_val & PTE_ADDR_MASK) | (addr & 0xFFF);
         unsigned long kvirt_addr = phys_to_kvirt(phys_addr);
-        
-        if ((addr & 0xFFF) + size > 0x1000) {
-            kpm_err("Cross-page access not supported\n");
-            return -EFAULT;
-        }
-        
         memcpy(buffer, (void *)kvirt_addr, size);
-        kpm_info("Read %d bytes from 0x%llx\n", size, addr);
-        ret = size;
     }
     
-    return ret;
+    return size;
 }
 
 // ============================================================
@@ -264,7 +265,7 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     unsigned long pmd_table, pte_table;
     unsigned long pgd_idx, pmd_idx, pte_idx;
     unsigned long *pte_entry_ptr;
-    int ret = -EFAULT;
+    unsigned long irq_flags;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
@@ -277,7 +278,6 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     
     pgd_idx = (addr >> 30) & 0x1FF;
     pgd_val = *(volatile unsigned long *)(pgd_table + pgd_idx * 8);
-    kpm_info("PGD[%lu] = 0x%llx\n", pgd_idx, pgd_val);
     
     if ((pgd_val & 0x3) != 0x3) {
         kpm_err("Invalid PGD entry\n");
@@ -287,7 +287,6 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     pmd_table = phys_to_kvirt(pgd_val & ~0xFFFULL);
     pmd_idx = (addr >> 21) & 0x1FF;
     pmd_val = *(volatile unsigned long *)(pmd_table + pmd_idx * 8);
-    kpm_info("PMD[%lu] = 0x%llx\n", pmd_idx, pmd_val);
     
     if (!(pmd_val & PTE_VALID)) {
         kpm_err("PMD not present\n");
@@ -296,26 +295,22 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     
     // Handle 2MB block mapping
     if ((pmd_val & 0x3) == PTE_TYPE_BLOCK) {
-        kpm_info("Block mapping write\n");
-        
         unsigned long orig_pmd = pmd_val;
         unsigned long *pmd_entry_ptr = (unsigned long *)(pmd_table + pmd_idx * 8);
-        unsigned long irq_flags;
         
-        local_irq_save(irq_flags);
+        irq_flags = arch_local_irq_save();
         
         pmd_val &= ~PTE_AP2;
         *pmd_entry_ptr = pmd_val;
-        
         flush_tlb_entry(addr);
         
         memcpy((void *)addr, buffer, size);
-        kpm_info("ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
+        kpm_info("ZERO TRACE BLOCK WRITE: %d bytes to 0x%llx\n", size, addr);
         
         *pmd_entry_ptr = orig_pmd;
         flush_tlb_entry(addr);
         
-        local_irq_restore(irq_flags);
+        arch_local_irq_restore(irq_flags);
         return size;
     }
     
@@ -329,7 +324,7 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
     pte_entry_ptr = (unsigned long *)(pte_table + pte_idx * 8);
     pte_val = *(volatile unsigned long *)pte_entry_ptr;
     orig_pte = pte_val;
-    kpm_info("PTE[%lu] = 0x%llx (AP[2]=%lu)\n", pte_idx, pte_val, (pte_val >> 6) & 1);
+    kpm_info("PTE[%lu] = 0x%llx\n", pte_idx, pte_val);
     
     if (!(pte_val & PTE_VALID)) {
         kpm_err("PTE not present\n");
@@ -341,30 +336,27 @@ static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
         return -EFAULT;
     }
     
-    {
-        unsigned long irq_flags;
-        
-        local_irq_save(irq_flags);
-        
-        pte_val &= ~PTE_AP2;
-        *pte_entry_ptr = pte_val;
-        
-        asm volatile("dsb ishst" ::: "memory");
-        flush_tlb_entry(addr);
-        
-        memcpy((void *)addr, buffer, size);
-        kpm_info("ZERO TRACE WRITE: %d bytes to 0x%llx\n", size, addr);
-        
-        *pte_entry_ptr = orig_pte;
-        
-        asm volatile("dsb ishst" ::: "memory");
-        flush_tlb_entry(addr);
-        
-        local_irq_restore(irq_flags);
-    }
+    // 🔥 PTE MODIFICATION
+    irq_flags = arch_local_irq_save();
     
-    ret = size;
-    return ret;
+    pte_val &= ~PTE_AP2;
+    *pte_entry_ptr = pte_val;
+    
+    asm volatile("dsb ishst" ::: "memory");
+    flush_tlb_entry(addr);
+    
+    // 🔥 DIRECT WRITE TO USERSAPCE ADDRESS
+    memcpy((void *)addr, buffer, size);
+    kpm_info("ZERO TRACE PTE WRITE: %d bytes to 0x%llx\n", size, addr);
+    
+    *pte_entry_ptr = orig_pte;
+    
+    asm volatile("dsb ishst" ::: "memory");
+    flush_tlb_entry(addr);
+    
+    arch_local_irq_restore(irq_flags);
+    
+    return size;
 }
 
 // ============================================================
