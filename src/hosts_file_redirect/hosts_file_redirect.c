@@ -144,93 +144,72 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
 {
     struct mm_struct *mm;
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-    unsigned long pfn;
-    unsigned long phys_addr;
-    unsigned long offset;
-    struct page *page;
+    unsigned long pgd_table, pmd_table, pte_table;
+    unsigned long pgd_val, pmd_val, pte_val;
+    unsigned long pfn, phys_addr, offset;
     void *kaddr;
     int ret = 0;
-
+    
     if (!task || !buffer || size <= 0 || size > MAX_INLINE) {
         return -EINVAL;
     }
-
-    // Get mm_struct (single reference)
+    
     mm = p_get_task_mm(task);
     if (!mm) {
         kpm_err("ULTIMATE: No mm for task\n");
         return -EFAULT;
     }
-
-    // 🔥 STEP 1: PGD - Direct from mm_struct
-    pgd = mm->pgd;
-    if (!pgd) {
-        kpm_err("ULTIMATE: mm->pgd is NULL\n");
+    
+    // 🔥 STEP 1: Get PGD table from mm_struct
+    // mm->pgd is at offset 0x48 (confirmed from source)
+    pgd_table = *(unsigned long *)((char *)mm + 0x48);
+    if (!pgd_table) {
+        kpm_err("ULTIMATE: pgd_table is NULL\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: mm->pgd = 0x%llx\n", (unsigned long long)pgd);
-
-    // 🔥 STEP 2: PGD Index (ARM64: shift 39 for 3-level)
-    unsigned long pgd_idx = pgd_index(addr);
-    pgd += pgd_idx;
-    if (pgd_none(*pgd)) {
-        kpm_err("ULTIMATE: PGD none\n");
+    kpm_info("ULTIMATE: pgd_table = 0x%llx\n", pgd_table);
+    
+    // 🔥 STEP 2: PGD Entry (shift 39, 9 bits)
+    unsigned long pgd_idx = (addr >> 39) & 0x1FF;
+    pgd_val = *(unsigned long *)(pgd_table + pgd_idx * 8);
+    if (!(pgd_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PGD entry\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 3: P4D (Folded for 3-level)
-    p4d = p4d_offset(pgd, addr);
-    if (p4d_none(*p4d)) {
-        kpm_err("ULTIMATE: P4D none\n");
+    kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
+    
+    // 🔥 STEP 3: PMD Table from PGD (3-level: PGD → PMD)
+    pmd_table = pgd_val & ~0xFFF;
+    if (!pmd_table) {
+        kpm_err("ULTIMATE: pmd_table is NULL\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 4: PUD (Folded for 3-level)
-    pud = pud_offset(p4d, addr);
-    if (pud_none(*pud)) {
-        kpm_err("ULTIMATE: PUD none\n");
+    
+    // 🔥 STEP 4: PMD Entry (shift 30, 9 bits)
+    unsigned long pmd_idx = (addr >> 30) & 0x1FF;
+    pmd_val = *(unsigned long *)(pmd_table + pmd_idx * 8);
+    if (!(pmd_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PMD entry\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 5: PMD
-    pmd = pmd_offset(pud, addr);
-    if (pmd_none(*pmd)) {
-        kpm_err("ULTIMATE: PMD none\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 6: Check Huge Page (2MB)
-    if (pmd_huge(*pmd)) {
-        pfn = pmd_pfn(*pmd);
-        if (!pfn_valid(pfn)) {
-            kpm_err("ULTIMATE: Huge page invalid PFN\n");
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        phys_addr = (pfn << PAGE_SHIFT) | (addr & (PMD_SIZE - 1));
-        page = pfn_to_page(pfn);
-        if (!page) {
-            if (p_mmput) p_mmput(mm);
-            return -EFAULT;
-        }
-        kaddr = page_address(page);
+    kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
+    
+    // 🔥 STEP 5: Check Huge Page (PMD_SECT bit - bit 1)
+    if (pmd_val & (1 << 1)) {
+        pfn = pmd_val >> 12;
+        phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
+        // Map physical to virtual (use direct mapping)
+        kaddr = (void *)(phys_addr + 0xffffffc000000000ULL);
         if (!kaddr) {
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
-        offset = addr & (PMD_SIZE - 1);
-        if (offset + size > PMD_SIZE) {
-            kpm_err("ULTIMATE: Huge page boundary crossed\n");
+        offset = addr & 0x1FFFFF;
+        if (offset + size > 0x200000) {
             if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
@@ -242,65 +221,67 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         if (p_mmput) p_mmput(mm);
         return size;
     }
-
-    // 🔥 STEP 7: PTE
-    pte = pte_offset_kernel(pmd, addr);
-    if (!pte || pte_none(*pte)) {
-        kpm_err("ULTIMATE: PTE none\n");
+    
+    // 🔥 STEP 6: PTE Table from PMD
+    pte_table = pmd_val & ~0xFFF;
+    if (!pte_table) {
+        kpm_err("ULTIMATE: pte_table is NULL\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
+    
+    // 🔥 STEP 7: PTE Entry (shift 21, 9 bits)
+    unsigned long pte_idx = (addr >> 21) & 0x1FF;
+    pte_val = *(unsigned long *)(pte_table + pte_idx * 8);
+    if (!(pte_val & 1)) {
+        kpm_err("ULTIMATE: Invalid PTE entry\n");
+        if (p_mmput) p_mmput(mm);
+        return -EFAULT;
+    }
+    kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
+    
     // 🔥 STEP 8: PFN from PTE
-    pfn = pte_pfn(*pte);
-    if (!pfn_valid(pfn)) {
+    pfn = pte_val >> 12;
+    if (pfn == 0) {
         kpm_err("ULTIMATE: Invalid PFN\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
+    
     // 🔥 STEP 9: Physical Address
-    phys_addr = (pfn << PAGE_SHIFT) | (addr & (PAGE_SIZE - 1));
+    phys_addr = (pfn << 12) | (addr & 0xFFF);
     kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx\n", addr, phys_addr);
-
-    // 🔥 STEP 10: Page structure
-    page = pfn_to_page(pfn);
-    if (!page) {
-        kpm_err("ULTIMATE: pfn_to_page failed\n");
-        if (p_mmput) p_mmput(mm);
-        return -EFAULT;
-    }
-
-    // 🔥 STEP 11: Kernel virtual address (page_address)
-    kaddr = page_address(page);
+    
+    // 🔥 STEP 10: Direct Mapping (ARM64 linear map)
+    kaddr = (void *)(phys_addr + 0xffffffc000000000ULL);
     if (!kaddr) {
-        kpm_err("ULTIMATE: page_address failed\n");
+        kpm_err("ULTIMATE: kaddr is NULL\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 12: Check page boundary
-    offset = addr & (PAGE_SIZE - 1);
-    if (offset + size > PAGE_SIZE) {
+    
+    // 🔥 STEP 11: Check page boundary
+    offset = addr & 0xFFF;
+    if (offset + size > 0x1000) {
         kpm_err("ULTIMATE: Page boundary crossed\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-
-    // 🔥 STEP 13: DIRECT ACCESS
+    
+    // 🔥 STEP 12: DIRECT ACCESS
     if (is_write) {
         memcpy((char *)kaddr + offset, buffer, size);
-        set_page_dirty(page);
         kpm_info("ULTIMATE: Wrote %d bytes\n", size);
     } else {
         memcpy(buffer, (char *)kaddr + offset, size);
         kpm_info("ULTIMATE: Read %d bytes\n", size);
     }
     ret = size;
-
+    
     if (p_mmput) p_mmput(mm);
     return ret;
 }
+
 
 // ============================================================
 // PROCESS PACKET - Ultimate Access (No Fallback!)
