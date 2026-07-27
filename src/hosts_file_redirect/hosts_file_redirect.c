@@ -18,7 +18,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ZERO TRACE PTE MODIFICATION");
+KPM_DESCRIPTION("ZERO TRACE PTE MOD - CORRECT");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -126,17 +126,51 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-#define HFR_PTE_VALID      (1UL << 0)
-#define HFR_PTE_TYPE_BLOCK (1UL << 0)
-#define HFR_PTE_AP2        (1UL << 6)
-#define HFR_PTE_ADDR_MASK  0xFFFFFFFFF000ULL
+// EXACT kernel definitions from pgtable-hwdef.h
+#define HFR_PTE_VALID   (_AC(unsigned long, 1) << 0)
+#define HFR_PTE_USER    (_AC(unsigned long, 1) << 6)
+#define HFR_PTE_RDONLY  (_AC(unsigned long, 1) << 7)
+#define HFR_PTE_AF      (_AC(unsigned long, 1) << 10)
+#define HFR_PTE_DBM     (_AC(unsigned long, 1) << 51)
+#define HFR_PMD_TYPE_TABLE  (3UL << 0)
+#define HFR_PMD_TYPE_BLOCK  (1UL << 0)
+#define HFR_PMD_SECT_RDONLY (_AC(unsigned long, 1) << 7)
 
-static unsigned long phys_to_kvirt(unsigned long phys)
+#define PGD_SHIFT   30
+#define PMD_SHIFT   21
+#define PAGE_SHIFT  12
+#define PTRS_PER_PT 512
+#define PAGE_MASK   (~(4096UL - 1))
+#define PMD_MASK    (~((1UL << PMD_SHIFT) - 1))
+
+// Get PGD pointer from mm_struct - find by scanning for valid kernel pointer
+static unsigned long *get_pgd_from_mm(struct mm_struct *mm)
 {
-    return phys + 0xffffff8000000000ULL;
+    unsigned long *mm_ptr = (unsigned long *)mm;
+    unsigned long *pgd = NULL;
+    int pgd_offset = -1;
+    
+    // Scan for pgd pointer - it's a kernel virtual address pointing to page tables
+    // mm_struct layout: skip first ~12 fields, pgd is around offset 0x58-0x68
+    unsigned long possible_offsets[] = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
+    
+    for (int i = 0; i < 12; i++) {
+        unsigned long val = mm_ptr[possible_offsets[i]];
+        // Check if it looks like a kernel virtual address (above PAGE_OFFSET)
+        if (val >= 0xffffff8000000000ULL && val < 0xfffffffffffff000ULL && (val & 0xFFF) == 0) {
+            pgd = (unsigned long *)val;
+            pgd_offset = possible_offsets[i] * 8;
+            hfr_log("Found PGD at mm+0x%x = %px", pgd_offset, pgd);
+            return pgd;
+        }
+    }
+    
+    hfr_err("Cannot find PGD in mm_struct!");
+    return NULL;
 }
 
-static inline void flush_tlb_all_cores(unsigned long addr)
+// Flush TLB on all cores
+static inline void flush_tlb_entry(unsigned long addr)
 {
     asm volatile(
         "dsb ishst\n"
@@ -147,155 +181,176 @@ static inline void flush_tlb_all_cores(unsigned long addr)
     );
 }
 
-static unsigned long find_pgd_phys(struct mm_struct *mm)
+// ============================================================
+// PAGE TABLE WALK - Uses kernel virtual addresses directly
+// ============================================================
+static int walk_page_table(struct mm_struct *mm, unsigned long addr,
+                           unsigned long **entry_ptr, unsigned long *entry_val,
+                           int *is_block)
 {
-    unsigned long possible_offsets[] = {0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88};
+    unsigned long *pgd, *pmd, *pte;
+    unsigned long pgd_idx, pmd_idx, pte_idx;
     unsigned long val;
     
-    for (int i = 0; i < 10; i++) {
-        val = *(unsigned long *)((char *)mm + possible_offsets[i]);
-        if (val != 0 && (val & 0xFFF) == 0 && val < (1ULL << 40)) {
-            hfr_log("PGD found at mm+0x%lx = 0x%llx", possible_offsets[i], val);
-            return val;
-        }
-    }
-    hfr_err("PGD not found in mm_struct");
-    return 0;
-}
-
-static int walk_page_table(struct mm_struct *mm, unsigned long addr,
-                           unsigned long **pte_ptr_out, unsigned long *pte_val_out)
-{
-    unsigned long pgd_phys, pgd_table, pgd_val, pmd_val;
-    unsigned long pmd_table, pte_table;
-    unsigned long pgd_idx, pmd_idx, pte_idx;
-    
-    pgd_phys = find_pgd_phys(mm);
-    if (!pgd_phys)
+    pgd = get_pgd_from_mm(mm);
+    if (!pgd)
         return -EFAULT;
     
-    pgd_table = phys_to_kvirt(pgd_phys);
-    pgd_idx = (addr >> 30) & 0x1FF;
-    pgd_val = *(volatile unsigned long *)(pgd_table + pgd_idx * 8);
-    hfr_log("PGD[%lu] = 0x%llx", pgd_idx, pgd_val);
+    // PGD walk (bits 38:30)
+    pgd_idx = (addr >> PGD_SHIFT) & 0x1FF;
+    val = *(volatile unsigned long *)(pgd + pgd_idx);
+    hfr_log("PGD[%lu] @ %px = 0x%llx", pgd_idx, pgd + pgd_idx, val);
     
-    if ((pgd_val & 0x3) != 0x3) {
-        hfr_err("Invalid PGD entry");
+    if ((val & 0x3) != HFR_PMD_TYPE_TABLE) {
+        hfr_err("Invalid PGD entry: 0x%llx (type=%llu)", val, val & 0x3);
         return -EFAULT;
     }
     
-    pmd_table = phys_to_kvirt(pgd_val & ~0xFFFULL);
-    pmd_idx = (addr >> 21) & 0x1FF;
-    pmd_val = *(volatile unsigned long *)(pmd_table + pmd_idx * 8);
-    hfr_log("PMD[%lu] = 0x%llx", pmd_idx, pmd_val);
+    // PMD walk (bits 29:21) - PMD table address is from PGD entry (physical -> linear map)
+    pmd = (unsigned long *)((val & ~0xFFFULL) + 0xffffff8000000000ULL);
+    pmd_idx = (addr >> PMD_SHIFT) & 0x1FF;
+    val = *(volatile unsigned long *)(pmd + pmd_idx);
+    hfr_log("PMD[%lu] @ %px = 0x%llx", pmd_idx, pmd + pmd_idx, val);
     
-    if (!(pmd_val & HFR_PTE_VALID)) {
-        hfr_err("PMD not present");
+    if (!(val & HFR_PTE_VALID)) {
+        hfr_err("PMD not valid");
         return -EFAULT;
     }
     
-    if ((pmd_val & 0x3) == HFR_PTE_TYPE_BLOCK) {
-        hfr_log("Block mapping at PMD");
-        *pte_ptr_out = (unsigned long *)(pmd_table + pmd_idx * 8);
-        *pte_val_out = pmd_val;
-        return 2;
+    // Check for 2MB block mapping
+    if ((val & 0x3) == HFR_PMD_TYPE_BLOCK) {
+        hfr_log("2MB Block mapping detected");
+        *entry_ptr = (unsigned long *)(pmd + pmd_idx);
+        *entry_val = val;
+        *is_block = 1;
+        return 0;
     }
     
-    if ((pmd_val & 0x3) != 0x3) {
+    if ((val & 0x3) != HFR_PMD_TYPE_TABLE) {
         hfr_err("Invalid PMD type");
         return -EFAULT;
     }
     
-    pte_table = phys_to_kvirt(pmd_val & ~0xFFFULL);
-    pte_idx = (addr >> 12) & 0x1FF;
-    *pte_ptr_out = (unsigned long *)(pte_table + pte_idx * 8);
-    *pte_val_out = *(volatile unsigned long *)(*pte_ptr_out);
-    hfr_log("PTE[%lu] = 0x%llx", pte_idx, *pte_val_out);
+    // PTE walk (bits 20:12)
+    pte = (unsigned long *)((val & ~0xFFFULL) + 0xffffff8000000000ULL);
+    pte_idx = (addr >> PAGE_SHIFT) & 0x1FF;
+    val = *(volatile unsigned long *)(pte + pte_idx);
+    hfr_log("PTE[%lu] @ %px = 0x%llx", pte_idx, pte + pte_idx, val);
     
-    if (!(*pte_val_out & HFR_PTE_VALID)) {
-        hfr_err("PTE not present");
+    if (!(val & HFR_PTE_VALID)) {
+        hfr_err("PTE not valid");
         return -EFAULT;
     }
     
+    *entry_ptr = (unsigned long *)(pte + pte_idx);
+    *entry_val = val;
+    *is_block = 0;
     return 0;
 }
 
+// ============================================================
+// READ - Direct kernel linear map access
+// ============================================================
 static int pte_mod_read(struct mm_struct *mm, unsigned long addr,
                         void *buffer, int size)
 {
-    unsigned long *pte_ptr, pte_val, phys_addr, kvirt_addr;
-    int ret;
+    unsigned long *entry;
+    unsigned long entry_val;
+    unsigned long phys_addr, kvirt_addr;
+    int is_block, ret;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
     
-    ret = walk_page_table(mm, addr, &pte_ptr, &pte_val);
+    ret = walk_page_table(mm, addr, &entry, &entry_val, &is_block);
     if (ret < 0)
         return ret;
     
-    if ((addr & 0xFFF) + size > 0x1000) {
+    if (!is_block && (addr & ~PAGE_MASK) + size > 4096) {
         hfr_err("Cross-page read not supported");
         return -EFAULT;
     }
     
-    if (ret == 2)
-        phys_addr = (pte_val & HFR_PTE_ADDR_MASK) | (addr & 0x1FFFFF);
+    // Get physical address from PTE/PMD and convert to kernel virtual
+    if (is_block)
+        phys_addr = (entry_val & ~0xFFFULL & PMD_MASK) | (addr & ~PMD_MASK);
     else
-        phys_addr = (pte_val & HFR_PTE_ADDR_MASK) | (addr & 0xFFF);
+        phys_addr = (entry_val & ~0xFFFULL & PAGE_MASK) | (addr & ~PAGE_MASK);
     
-    kvirt_addr = phys_to_kvirt(phys_addr);
+    kvirt_addr = phys_addr + 0xffffff8000000000ULL;
     memcpy(buffer, (void *)kvirt_addr, size);
-    hfr_log("READ OK: %d bytes", size);
+    hfr_log("READ: %d bytes from 0x%llx", size, addr);
     return size;
 }
 
+// ============================================================
+// WRITE - PTE MODIFICATION (using CORRECT bit 7: PTE_RDONLY)
+// ============================================================
 static int pte_mod_write(struct mm_struct *mm, unsigned long addr,
                           void *buffer, int size)
 {
-    unsigned long *pte_ptr, pte_val, orig_pte, irq_flags;
-    int ret, is_block;
+    unsigned long *entry;
+    unsigned long orig_val, new_val;
+    unsigned long irq_flags;
+    int is_block, ret;
     
     if (!mm || !buffer || size <= 0 || size > MAX_INLINE)
         return -EINVAL;
     
-    ret = walk_page_table(mm, addr, &pte_ptr, &pte_val);
+    ret = walk_page_table(mm, addr, &entry, &entry_val, &is_block);
     if (ret < 0)
         return ret;
     
-    is_block = (ret == 2);
-    orig_pte = pte_val;
-    
-    if (!is_block && (addr & 0xFFF) + size > 0x1000) {
+    if (!is_block && (addr & ~PAGE_MASK) + size > 4096) {
         hfr_err("Cross-page write not supported");
         return -EFAULT;
     }
     
-    if (!(pte_val & HFR_PTE_AP2)) {
-        hfr_log("Already writable");
-        memcpy((void *)addr, buffer, size);
-        return size;
+    orig_val = entry_val;
+    
+    // Check if already writable
+    if (is_block) {
+        if (!(entry_val & HFR_PMD_SECT_RDONLY)) {
+            hfr_log("Block already writable");
+            memcpy((void *)addr, buffer, size);
+            return size;
+        }
+    } else {
+        if (!(entry_val & HFR_PTE_RDONLY)) {
+            hfr_log("Page already writable");
+            memcpy((void *)addr, buffer, size);
+            return size;
+        }
     }
     
-    hfr_log("Making writable... AP[2]=%lu", (orig_pte >> 6) & 1);
-    
+    // 🔥 DISABLE INTERRUPTS
     asm volatile("mrs %0, daif" : "=r"(irq_flags) : : "memory");
     asm volatile("msr daifset, #2" : : : "memory");
     
-    pte_val &= ~HFR_PTE_AP2;
-    *pte_ptr = pte_val;
+    // Clear RDONLY bit (bit 7)
+    if (is_block) {
+        new_val = orig_val & ~HFR_PMD_SECT_RDONLY;
+        hfr_log("Block: Clearing RDONLY bit (0x%llx -> 0x%llx)", orig_val, new_val);
+    } else {
+        new_val = orig_val & ~HFR_PTE_RDONLY;
+        hfr_log("PTE: Clearing RDONLY bit (0x%llx -> 0x%llx)", orig_val, new_val);
+    }
     
+    *entry = new_val;
     asm volatile("dsb ishst" ::: "memory");
-    flush_tlb_all_cores(addr);
+    flush_tlb_entry(addr);
     
+    // 🔥 DIRECT WRITE
     memcpy((void *)addr, buffer, size);
+    hfr_log("WRITE OK: %d bytes to 0x%llx", size, addr);
     
-    *pte_ptr = orig_pte;
+    // Restore
+    *entry = orig_val;
     asm volatile("dsb ishst" ::: "memory");
-    flush_tlb_all_cores(addr);
+    flush_tlb_entry(addr);
     
     asm volatile("msr daif, %0" : : "r"(irq_flags) : "memory");
     
-    hfr_log("WRITE OK: %d bytes", size);
     return size;
 }
 
@@ -311,24 +366,20 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
-
     if (!pkt->size || pkt->size > MAX_INLINE) {
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
-
     if (pkt->vaddr == 0 || pkt->vaddr >= (1ULL << 39)) {
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
-
     if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    
     if (target_pid <= 0) {
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
@@ -336,17 +387,14 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(target_pid);
-    
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
         pkt->status = STATUS_NO_TASK;
         return;
     }
-
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
     if (p_rcu_read_unlock) p_rcu_read_unlock();
-
     if (!mm) {
         pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
@@ -355,7 +403,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     is_write_op = (pkt->op_code == OP_WRITE_VM);
     memset(temp_buffer, 0, MAX_INLINE);
-    
     if (is_write_op)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
 
@@ -364,12 +411,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     else
         transferred = pte_mod_read(mm, pkt->vaddr, temp_buffer, pkt->size);
 
-    if (transferred > 0)
-        pkt->status = STATUS_SUCCESS;
-    else if (transferred == -EFAULT)
-        pkt->status = STATUS_VM_FAULT;
-    else
-        pkt->status = STATUS_PROTECTION;
+    pkt->status = (transferred > 0) ? STATUS_SUCCESS : STATUS_VM_FAULT;
 
     if (p_mmput && mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
@@ -378,11 +420,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         memset(pkt->inline_data, 0, MAX_INLINE);
         memcpy(pkt->inline_data, temp_buffer, transferred);
     }
-
-    if (transferred > 0 && (uint32_t)transferred != pkt->size) {
+    if (transferred > 0 && (uint32_t)transferred != pkt->size)
         pkt->size = (uint32_t)transferred;
-        pkt->status = STATUS_PARTIAL_IO;
-    }
 }
 
 static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
@@ -395,37 +434,23 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    if (count != sizeof(struct k_packet))
-        return -EINVAL;
-
-    if (!p_copy_from_user)
-        return -EFAULT;
-    
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0)
-        return -EFAULT;
+    if (count != sizeof(struct k_packet)) return -EINVAL;
+    if (!p_copy_from_user) return -EFAULT;
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) return -EFAULT;
 
     curr_task = hfr_get_current();
-    if (!curr_task)
-        return -ESRCH;
-
-    if (!p_task_pid_nr_ns)
-        return -EFAULT;
+    if (!curr_task) return -ESRCH;
+    if (!p_task_pid_nr_ns) return -EFAULT;
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    
-    if (caller_pid <= 0)
-        return -ESRCH;
+    if (caller_pid <= 0) return -ESRCH;
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user)
-        return -EFAULT;
-    
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0)
-        return -EFAULT;
-
+    if (!p_copy_to_user) return -EFAULT;
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) return -EFAULT;
     return (ssize_t)count;
 }
 
@@ -465,15 +490,13 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    if (!p_proc_create_data || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || 
-        !p_copy_from_user || !p_copy_to_user) {
+    if (!p_proc_create_data || !p_find_task_by_vpid || !p_task_pid_nr_ns || 
+        !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         hfr_err("CRITICAL SYMBOL MISSING");
         return -EFAULT;
     }
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
-
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
         hfr_err("proc_create FAILED");
