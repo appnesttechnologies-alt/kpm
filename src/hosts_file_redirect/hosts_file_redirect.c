@@ -141,21 +141,29 @@ static inline struct task_struct *hfr_get_current(void)
 #define PAGE_MASK   0xFFFFFFFFFFFFF000ULL
 #define PMD_MASK    0xFFFFFFFFFFE00000ULL
 
+
 static unsigned long *get_pgd_from_mm(struct mm_struct *mm)
 {
     unsigned long *mm_ptr = (unsigned long *)mm;
-    unsigned long possible_offsets[] = {14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25};
+    // pgd is at offset 0x50 or 0x58 (8-byte aligned)
+    // 0x50/8 = 10, 0x58/8 = 11
+    unsigned long possible_offsets[] = {9, 10, 11, 12, 13};
     
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 5; i++) {
         unsigned long val = mm_ptr[possible_offsets[i]];
+        hfr_log("Checking mm[%lu] = 0x%llx", possible_offsets[i], val);
         if (val >= 0xffffff8000000000ULL && val < 0xfffffffffffff000ULL && (val & 0xFFF) == 0) {
-            hfr_log("Found PGD at mm+%lu = %px", possible_offsets[i] * 8, (void *)val);
+            hfr_log("Found PGD at mm[%lu] = %px", possible_offsets[i], (void *)val);
             return (unsigned long *)val;
         }
     }
-    hfr_err("Cannot find PGD in mm_struct!");
+    hfr_err("Cannot find PGD in mm_struct! Dumping first 20 fields:");
+    for (int i = 0; i < 20; i++) {
+        hfr_err("  mm[%d] = 0x%llx", i, mm_ptr[i]);
+    }
     return NULL;
 }
+
 
 static inline void flush_tlb_entry(unsigned long addr)
 {
