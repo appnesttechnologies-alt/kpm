@@ -65,6 +65,17 @@ static inline void *phys_to_virt_resolved(unsigned long phys)
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
 
+
+
+struct k_packet {
+    uint32_t op_code;
+    uint32_t target_pid;
+    uint64_t vaddr;
+    uint32_t size;
+    uint32_t status;
+    uint8_t  inline_data[MAX_INLINE];
+} __attribute__((aligned(8), packed));
+
 /*
  * ARM64, 4KB pages, CONFIG_PGTABLE_LEVELS=3:
  *
