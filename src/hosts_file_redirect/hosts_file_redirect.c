@@ -226,15 +226,16 @@ static int walk_page_table(struct mm_struct *mm, unsigned long addr,
     unsigned long page_offset;
     int ok;
 
-    /* ---- PGD ------------------------------------------------
-     * mm->pgd is a kernel virtual address.
-     * index = VA[38:30], 9 bits.
+   
+        /* ---- PGD ------------------------------------------------
+     * mm_struct se PGD pointer fetch karna (offset ya pointer cast ke through)
      */
-    pgd_kva = (unsigned long)mm->pgd;
+    pgd_kva = (unsigned long)*(unsigned long *)((char *)mm + g_pgd_offset);
     if (!pgd_kva) {
-        kpm_err("WALK: mm->pgd is NULL\n");
+        kpm_err("WALK: PGD pointer is NULL\n");
         return -EFAULT;
     }
+
 
     {
         unsigned long idx = (addr >> PGD_SHIFT) & IDX_MASK;
