@@ -46,7 +46,7 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 
 
 #define HFR_FOLL_WRITE        0x01
-#define FOLL_FORCE            0x20  
+#define FOLL_FORCE            0x10  
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
