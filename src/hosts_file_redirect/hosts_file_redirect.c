@@ -156,7 +156,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     }
 
     // Get mm_struct
-    mm = get_task_mm(task);
+    mm = p_get_task_mm(task);
     if (!mm) {
         kpm_err("ULTIMATE: No mm for task\n");
         return -EFAULT;
@@ -166,7 +166,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pgd_ptr = (unsigned long)mm->pgd;
     if (!pgd_ptr) {
         kpm_err("ULTIMATE: Invalid PGD pointer\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
     kpm_info("ULTIMATE: mm->pgd = 0x%llx\n", pgd_ptr);
@@ -176,7 +176,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pgd_val = *(unsigned long *)(pgd_ptr + pgd_idx * 8);
     if (!(pgd_val & 1)) {
         kpm_err("ULTIMATE: Invalid PGD entry\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
     kpm_info("ULTIMATE: pgd_val = 0x%llx\n", pgd_val);
@@ -187,7 +187,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pud_val = *(unsigned long *)(pud_ptr + pud_idx * 8);
     if (!(pud_val & 1)) {
         kpm_err("ULTIMATE: Invalid PUD entry\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
     kpm_info("ULTIMATE: pud_val = 0x%llx\n", pud_val);
@@ -198,7 +198,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pmd_val = *(unsigned long *)(pmd_ptr + pmd_idx * 8);
     if (!(pmd_val & 1)) {
         kpm_err("ULTIMATE: Invalid PMD entry\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
     kpm_info("ULTIMATE: pmd_val = 0x%llx\n", pmd_val);
@@ -207,9 +207,10 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = phys_to_virt(phys_addr);  // ✅ Tera function from pgtable.h
+        kaddr = (void *)phys_to_virt(phys_addr);  // ✅ CAST
         if (!kaddr) {
-            mmput(mm);
+            kpm_err("ULTIMATE: phys_to_virt failed for huge page\n");
+            if (p_mmput) p_mmput(mm);
             return -EFAULT;
         }
         if (is_write) {
@@ -219,7 +220,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
             memcpy(buffer, kaddr + (addr & 0x1FFFFF), size);
             kpm_info("ULTIMATE: Huge page READ %d bytes\n", size);
         }
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return size;
     }
 
@@ -229,7 +230,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pte_val = *(unsigned long *)(pte_ptr + pte_idx * 8);
     if (!(pte_val & 1)) {
         kpm_err("ULTIMATE: Invalid PTE entry\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
     kpm_info("ULTIMATE: pte_val = 0x%llx\n", pte_val);
@@ -238,7 +239,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     pfn = pte_val >> 12;
     if (pfn == 0) {
         kpm_err("ULTIMATE: Invalid PFN\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
@@ -246,11 +247,11 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     phys_addr = (pfn << 12) | (addr & 0xFFF);
     kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
 
-    // 🔥 STEP 9: phys_to_virt (Tera function from pgtable.h)
-    kaddr = phys_to_virt(phys_addr);
+    // 🔥 STEP 9: phys_to_virt with CAST
+    kaddr = (void *)phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: phys_to_virt failed\n");
-        mmput(mm);
+        if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
 
@@ -265,7 +266,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     }
     ret = size;
 
-    mmput(mm);
+    if (p_mmput) p_mmput(mm);
     return ret;
 }
 
