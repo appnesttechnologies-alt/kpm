@@ -9,7 +9,7 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
-#include <linux/mm_types.h>    // ✅ ADD THIS - mm_struct definition
+#include <linux/mm_types.h>
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -17,11 +17,14 @@
 // 🔥 Tera pgtable.h - isme phys_to_virt() hai!
 #include "pgtable.h"
 
+// 🔥 mm_struct_offset - dynamic offsets ke liye
+extern struct mm_struct_offset mm_struct_offset;
+
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ULTIMATE NO TRACE - Raw Page Walk");
+KPM_DESCRIPTION("ULTIMATE NO TRACE - Dynamic mm_struct_offset");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -140,7 +143,7 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - RAW PAGE WALK 🔥🔥🔥
+// 🔥🔥🔥 ULTIMATE MEMORY ACCESS - DYNAMIC mm_struct_offset 🔥🔥🔥
 // ============================================================
 static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
                                    void *buffer, int size, int is_write)
@@ -163,14 +166,15 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
         return -EFAULT;
     }
 
-    // 🔥 STEP 1: PGD from mm_struct (Direct pointer access)
-    pgd_ptr = (unsigned long)mm->pgd;
-    if (!pgd_ptr) {
+    // 🔥 STEP 1: PGD using mm_struct_offset (Dynamic!)
+    pgd_ptr = (unsigned long)((char *)mm + mm_struct_offset.pgd_offset);
+    if (!pgd_ptr || *(unsigned long *)pgd_ptr == 0) {
         kpm_err("ULTIMATE: Invalid PGD pointer\n");
         if (p_mmput) p_mmput(mm);
         return -EFAULT;
     }
-    kpm_info("ULTIMATE: mm->pgd = 0x%llx\n", pgd_ptr);
+    kpm_info("ULTIMATE: mm->pgd at offset 0x%x = 0x%llx\n", 
+             mm_struct_offset.pgd_offset, pgd_ptr);
 
     // 🔥 STEP 2: PGD Entry (ARM64: 9 bits, shift 39)
     unsigned long pgd_idx = (addr >> 39) & 0x1FF;
@@ -208,7 +212,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     if (pmd_val & (1 << 1)) {
         pfn = pmd_val >> 12;
         phys_addr = (pfn << 12) | (addr & 0x1FFFFF);
-        kaddr = (void *)phys_to_virt(phys_addr);  // ✅ CAST
+        kaddr = (void *)phys_to_virt(phys_addr);
         if (!kaddr) {
             kpm_err("ULTIMATE: phys_to_virt failed for huge page\n");
             if (p_mmput) p_mmput(mm);
@@ -248,7 +252,7 @@ static int ultimate_memory_access(struct task_struct *task, unsigned long addr,
     phys_addr = (pfn << 12) | (addr & 0xFFF);
     kpm_info("ULTIMATE: virt 0x%llx → phys 0x%llx (pfn=0x%lx)\n", addr, phys_addr, pfn);
 
-    // 🔥 STEP 9: phys_to_virt with CAST
+    // 🔥 STEP 9: phys_to_virt
     kaddr = (void *)phys_to_virt(phys_addr);
     if (!kaddr) {
         kpm_err("ULTIMATE: phys_to_virt failed\n");
@@ -529,7 +533,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== ULTIMATE NO TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("🔥 RAW PAGE WALK ACTIVE! No headers needed!\n");
+    kpm_info("🔥 DYNAMIC mm_struct_offset ACTIVE!\n");
     return 0;
 }
 
