@@ -12,15 +12,13 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-
-/* KPM built-in pgtable functions */
-#include <pgtable.h>
+#include <pgtable.h>  /* KPM built-in: pgtable_entry, PTE_*, phys_to_virt, flush_tlb_kernel_page */
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM Ultimate Write-Protection Bypass via Direct PTE Manipulation");
+KPM_DESCRIPTION("KPM Ultimate Write-Protection Bypass via Direct PTE");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -47,7 +45,7 @@ KPM_DESCRIPTION("KPM Ultimate Write-Protection Bypass via Direct PTE Manipulatio
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
 #define STATUS_PTE_NOT_FOUND  0x100F
-#define STATUS_PAGE_NOT_PRESENT 0x1010
+#define STATUS_WRITE_FAULT    0x1010
 
 struct k_packet {
     uint32_t op_code;
@@ -58,12 +56,8 @@ struct k_packet {
     uint8_t  inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-struct inode;
-struct file;
-struct kiocb;
-struct iov_iter;
-struct poll_table_struct;
-struct vm_area_struct;
+struct inode; struct file; struct kiocb; struct iov_iter;
+struct poll_table_struct; struct vm_area_struct;
 typedef unsigned int __poll_t;
 
 struct proc_ops {
@@ -80,12 +74,7 @@ struct proc_ops {
     unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 };
 
-struct mutex {
-    void *owner;
-    int count;
-    void *wait_lock;
-    void *wait_list;
-};
+struct mutex { void *owner; int count; void *wait_lock; void *wait_list; };
 
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
@@ -126,117 +115,87 @@ static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
 /* ================================================================
- * ULTIMATE WRITE FUNCTION - Direct PTE Manipulation
- * Uses KPM built-in pgtable.h:
+ * ULTIMATE WRITE - Direct PTE Manipulation using KPM pgtable.h
+ * 
+ * Uses KPM built-in:
  *   - pgtable_entry(pgd, va) → uint64_t* PTE pointer
- *   - phys_to_virt() → kernel virtual address
- *   - flush_tlb_kernel_page() → TLB invalidation
- *   - PTE_RDONLY, PTE_WRITE, PTE_VALID bit flags
+ *   - phys_to_virt() → kernel VA from physical address
+ *   - flush_tlb_kernel_page() → TLB invalidation  
+ *   - PTE_VALID, PTE_RDONLY, PTE_WRITE bit flags
+ *   - pgd_va → kernel PGD (KPM extern variable)
+ *   - page_size → KPM extern variable
  * ================================================================ */
-static int hfr_force_write_memory(struct mm_struct *mm, 
-                                   unsigned long user_addr,
-                                   const void *buf, 
-                                   size_t len)
+static int hfr_force_write_mem(uint64_t *pgd, unsigned long user_addr,
+                                const void *buf, size_t len)
 {
     uint64_t *pte_ptr;
-    uint64_t original_pte, writable_pte;
-    uint64_t page_pa, page_va;
+    uint64_t orig_pte, new_pte;
+    uint64_t page_pa, page_kva;
     uint64_t offset_in_page;
-    size_t bytes_to_write;
-    size_t total_written = 0;
-    unsigned long current_addr = user_addr;
+    size_t bytes, total = 0;
+    unsigned long addr = user_addr;
 
-    kpm_info(">>> hfr_force_write: mm=%px addr=0x%lx len=%zu\n", 
-             mm, user_addr, len);
+    kpm_info(">>> force_write: pgd=%px addr=0x%lx len=%zu\n", pgd, addr, len);
 
-    if (!mm || !buf || len == 0) {
-        kpm_err("Invalid params\n");
-        return -EINVAL;
-    }
+    if (!pgd || !buf || !len) return -EINVAL;
 
-    /* Get PGD from mm_struct using pgd_offset field */
-    uint64_t *pgd = *(uint64_t **)((char *)mm + ((struct mm_struct *)0)->pgd_offset);
-    
-    if (!pgd) {
-        /* Fallback: try pgd_va for kernel tasks, 
-           or get pgd from mm_struct using known offsets */
-        pgd = (uint64_t *)pgd_va;
-        kpm_info("Using pgd_va as fallback: %px\n", pgd);
-    }
+    while (total < len) {
+        addr = user_addr + total;
 
-    kpm_info("PGD: %px, pgd_offset: %d\n", pgd, ((struct mm_struct *)0)->pgd_offset);
-
-    while (total_written < len) {
-        /* Align to page boundary */
-        current_addr = user_addr + total_written;
-        
-        /* Find PTE for this user address */
-        pte_ptr = pgtable_entry((uint64_t)pgd, current_addr);
-        
+        /* Walk page table using KPM's pgtable_entry */
+        pte_ptr = pgtable_entry((uint64_t)pgd, addr);
         if (!pte_ptr) {
-            kpm_err("PTE not found for addr 0x%lx\n", current_addr);
-            return total_written > 0 ? (int)total_written : -EFAULT;
+            kpm_err("PTE not found: 0x%lx\n", addr);
+            return total ? (int)total : -EFAULT;
         }
 
-        original_pte = *pte_ptr;
-        
-        /* Check if PTE is valid */
-        if (!(original_pte & PTE_VALID)) {
-            kpm_err("PTE not valid at 0x%lx\n", current_addr);
-            return total_written > 0 ? (int)total_written : -EFAULT;
+        orig_pte = *pte_ptr;
+
+        /* Validate PTE */
+        if (!(orig_pte & PTE_VALID)) {
+            kpm_err("PTE invalid: 0x%lx\n", addr);
+            return total ? (int)total : -EFAULT;
         }
 
-        /* Get physical address from PTE (lower 48 bits typically) */
-        page_pa = original_pte & 0x0000FFFFFFFFF000ULL;
-        
+        /* Extract physical page address (bits 47:12) */
+        page_pa = orig_pte & 0x0000FFFFFFFFF000ULL;
         /* Convert to kernel virtual address */
-        page_va = phys_to_virt(page_pa);
-        
-        /* Calculate offset within page */
-        offset_in_page = current_addr & (page_size - 1);
-        
-        /* Calculate bytes to write in this page */
-        bytes_to_write = len - total_written;
-        if (bytes_to_write > (size_t)(page_size - offset_in_page))
-            bytes_to_write = page_size - offset_in_page;
+        page_kva = phys_to_virt(page_pa);
+        /* Offset within the page */
+        offset_in_page = addr & (page_size - 1);
+        /* Bytes to write in this page */
+        bytes = len - total;
+        if (bytes > (size_t)(page_size - offset_in_page))
+            bytes = page_size - offset_in_page;
 
-        kpm_info("Page PA: 0x%llx, VA: 0x%llx, offset: %llu, bytes: %zu\n",
-                 page_pa, page_va, offset_in_page, bytes_to_write);
+        /* === MAGIC: Temporarily make PTE writable === */
+        new_pte = orig_pte;
+        new_pte &= ~PTE_RDONLY;  /* Clear read-only */
+        new_pte |= PTE_WRITE;    /* Set writable (DBM bit) */
 
-        /* === ULTIMATE MAGIC: Make PTE writable === */
-        writable_pte = original_pte;
-        writable_pte &= ~PTE_RDONLY;     /* Clear read-only bit */
-        writable_pte |= PTE_WRITE;       /* Set write bit (DBM) */
-        
-        /* Write modified PTE */
-        *pte_ptr = writable_pte;
-        dsb(ishst);  /* Data synchronization barrier */
-        
-        /* Flush TLB for this page */
-        flush_tlb_kernel_page(page_va);
-        
-        /* Now do the actual memory copy */
-        memcpy((void *)(page_va + offset_in_page), 
-               (const char *)buf + total_written, 
-               bytes_to_write);
-        
-        /* Memory barrier to ensure write completes */
-        dsb(ishst);
-        
+        *pte_ptr = new_pte;
+        dsb(ishst);              /* Ensure PTE write is visible */
+
+        /* Flush TLB for this user address */
+        flush_tlb_kernel_page(page_kva);
+
+        /* Direct memory write */
+        memcpy((void *)(page_kva + offset_in_page),
+               (const char *)buf + total, bytes);
+        dsb(ishst);              /* Ensure data write is visible */
+
         /* Restore original PTE */
-        *pte_ptr = original_pte;
+        *pte_ptr = orig_pte;
         dsb(ishst);
-        
+
         /* Flush TLB again */
-        flush_tlb_kernel_page(page_va);
-        
-        total_written += bytes_to_write;
-        kpm_info("Wrote %zu bytes at 0x%lx (total: %zu)\n",
-                 bytes_to_write, current_addr, total_written);
+        flush_tlb_kernel_page(page_kva);
+
+        total += bytes;
     }
 
-    kpm_info("<<< hfr_force_write SUCCESS: %zu bytes written\n", total_written);
-    return (int)total_written;
+    kpm_info("<<< force_write SUCCESS: %zu bytes\n", total);
+    return (int)total;
 }
 
 static inline struct task_struct *hfr_get_current(void)
@@ -248,9 +207,7 @@ static inline struct task_struct *hfr_get_current(void)
 
 static inline int is_valid_user_address(uint64_t addr)
 {
-    if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;
-    return 1;
+    return (addr != 0 && addr < (1ULL << 63));
 }
 
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
@@ -259,64 +216,56 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     struct mm_struct *mm = NULL;
     pid_t target_pid;
     int transferred;
-    uint8_t temp_buffer[MAX_INLINE];
+    uint64_t *pgd;
+    uint8_t temp_buf[MAX_INLINE];
 
     kpm_info(">>> process_packet: op=0x%x pid=%u addr=0x%llx size=%u\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size);
 
+    /* Validate opcode */
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
+    /* Validate size */
     if (!pkt->size || pkt->size > MAX_INLINE) {
-        kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
+    /* Validate address */
     if (!is_valid_user_address(pkt->vaddr)) {
-        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
+    /* Check critical symbols */
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid: %d\n", target_pid);
-    
     if (target_pid <= 0) {
-        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
 
+    /* Find target task */
     if (p_rcu_read_lock) p_rcu_read_lock();
-
     task = p_find_task_by_vpid(target_pid);
-    kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
-    
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
 
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
-    kpm_info("get_task_mm = %px\n", mm);
-
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
-        kpm_err("NO_MM\n");
         pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
         return;
@@ -324,15 +273,16 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     if (pkt->op_code == OP_WRITE_VM) {
         /* ============================================
-         * ULTIMATE WRITE PATH - Direct PTE Bypass
+         * WRITE PATH - Direct PTE Bypass
+         * Use pgd_va (KPM extern) as PGD base
          * ============================================ */
-        transferred = hfr_force_write_memory(mm, 
-                                              (unsigned long)pkt->vaddr,
-                                              pkt->inline_data, 
-                                              pkt->size);
-        
+        pgd = (uint64_t *)pgd_va;
+        kpm_info("Using pgd_va: %px\n", pgd);
+
+        transferred = hfr_force_write_mem(pgd, (unsigned long)pkt->vaddr,
+                                           pkt->inline_data, pkt->size);
+
         if (transferred < 0) {
-            kpm_err("hfr_force_write_memory FAILED: %d\n", transferred);
             pkt->status = STATUS_VM_FAULT;
         } else if ((uint32_t)transferred == pkt->size) {
             pkt->status = STATUS_SUCCESS;
@@ -340,30 +290,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
             pkt->size = (uint32_t)transferred;
             pkt->status = STATUS_PARTIAL_IO;
         } else {
-            pkt->status = STATUS_PAGE_NOT_PRESENT;
+            pkt->status = STATUS_WRITE_FAULT;
         }
     } else {
         /* ============================================
          * READ PATH - Standard access_process_vm
          * ============================================ */
-        memset(temp_buffer, 0, MAX_INLINE);
-        
-        transferred = p_access_process_vm(task, 
-                                           (unsigned long)pkt->vaddr, 
-                                           temp_buffer, 
-                                           (int)pkt->size, 
-                                           0);
-        
+        memset(temp_buf, 0, MAX_INLINE);
+        transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr,
+                                           temp_buf, (int)pkt->size, 0);
+
         if (transferred < 0) {
-            kpm_err("VM_FAULT on read: %d\n", transferred);
             pkt->status = STATUS_VM_FAULT;
         } else if (transferred == 0 && pkt->size > 0) {
-            kpm_err("PROTECTION on read\n");
             pkt->status = STATUS_PROTECTION;
         } else {
             if (transferred > 0)
-                memcpy(pkt->inline_data, temp_buffer, transferred);
-            
+                memcpy(pkt->inline_data, temp_buf, transferred);
             if ((uint32_t)transferred != pkt->size) {
                 pkt->size = (uint32_t)transferred;
                 pkt->status = STATUS_PARTIAL_IO;
@@ -389,57 +332,33 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    kpm_info("*** proc_write_handler: count=%zu\n", count);
-
-    if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
+    if (count != sizeof(struct k_packet))
         return -EINVAL;
-    }
 
-    if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL\n");
+    if (!p_copy_from_user)
         return -EFAULT;
-    }
-    
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_from_user failed\n");
+
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0)
         return -EFAULT;
-    }
 
     curr_task = hfr_get_current();
-    if (!curr_task) {
-        kpm_err("get_current failed\n");
+    if (!curr_task || !p_task_pid_nr_ns)
         return -ESRCH;
-    }
-
-    if (!p_task_pid_nr_ns) {
-        kpm_err("task_pid_nr_ns NULL\n");
-        return -EFAULT;
-    }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    kpm_info("caller_pid: %d\n", caller_pid);
-    
-    if (caller_pid <= 0) {
-        kpm_err("Invalid caller_pid: %d\n", caller_pid);
+    if (caller_pid <= 0)
         return -ESRCH;
-    }
 
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (!p_copy_to_user) {
-        kpm_err("copy_to_user NULL\n");
+    if (!p_copy_to_user)
         return -EFAULT;
-    }
-    
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_to_user failed\n");
-        return -EFAULT;
-    }
 
-    kpm_info("*** proc_write_handler SUCCESS\n");
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0)
+        return -EFAULT;
+
     return (ssize_t)count;
 }
 
@@ -460,7 +379,7 @@ static const struct proc_ops p_ops = {
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     kpm_info("=== HFR ULTIMATE INIT ===\n");
-    
+
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -480,11 +399,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px mm=%px\n",
-             p_proc_create_data, p_access_process_vm, 
-             p_find_task_by_vpid, p_get_task_mm);
-
-    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
+    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid ||
         !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
@@ -499,7 +414,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== HFR ULTIMATE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    kpm_info("Write-protection bypass: ACTIVATED (Direct PTE)\n");
+    kpm_info("Direct PTE write bypass: ACTIVATED\n");
     return 0;
 }
 
