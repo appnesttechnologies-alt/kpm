@@ -49,7 +49,7 @@ KPM_DESCRIPTION("KPM Zero-Trace PTE Write Bypass via follow_pte");
 /* ARM64 PTE bits */
 #define ARM64_PTE_VALID       (1UL << 0)
 #define ARM64_PTE_RDONLY      (1UL << 7)
-#define ARM64_PTE_WRITE       (1UL << 51)  /* DBM */
+#define ARM64_PTE_WRITE       (1UL << 51)
 #define ARM64_PAGE_SIZE       4096
 #define ARM64_PAGE_MASK       (~(ARM64_PAGE_SIZE - 1))
 
@@ -63,13 +63,23 @@ struct k_packet {
 } __attribute__((aligned(8), packed));
 
 /* Forward declarations */
-struct inode; struct file; struct kiocb; struct iov_iter;
-struct poll_table_struct; struct vm_area_struct;
-struct mm_struct; struct task_struct; struct pid_namespace;
-struct page; struct spinlock;
+struct inode;
+struct file;
+struct kiocb;
+struct iov_iter;
+struct poll_table_struct;
+struct vm_area_struct;
+struct mm_struct;
+struct task_struct;
+struct pid_namespace;
+struct page;
 typedef unsigned int __poll_t;
+
+/* pte_t - NOT in KPM headers, define it here */
 typedef unsigned long pte_t;
-typedef struct { int dummy; } spinlock_t;
+
+/* spinlock_t already in linux/spinlock.h - just forward declare */
+struct spinlock;
 
 struct proc_ops {
     unsigned int proc_flags;
@@ -107,12 +117,7 @@ typedef void (*mutex_unlock_t)(struct mutex *);
 
 /* follow_pte: int follow_pte(struct mm_struct *, unsigned long, pte_t **, spinlock_t **) */
 typedef int (*follow_pte_t)(struct mm_struct *, unsigned long, pte_t **, spinlock_t **);
-
-/* spin_unlock */
 typedef void (*spin_unlock_t)(spinlock_t *);
-
-/* memstart_addr - physical memory start */
-typedef uint64_t phys_addr_t;
 
 /* Resolved function pointers */
 static proc_create_data_t    p_proc_create_data;
@@ -135,7 +140,7 @@ static mutex_unlock_t        p_mutex_unlock;
 /* PTE bypass symbols */
 static follow_pte_t     p_follow_pte;
 static spin_unlock_t    p_spin_unlock;
-static phys_addr_t     *p_memstart_addr;  /* points to memstart_addr variable */
+static uint64_t        *p_memstart_addr;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -143,13 +148,6 @@ static struct mutex hfr_mutex;
 
 /* ================================================================
  * ULTIMATE WRITE - follow_pte + PTE manipulation
- * 
- * Uses:
- *   follow_pte(mm, addr, &ptep, &ptlp) → PTE + spinlock
- *   memstart_addr → PHYS_OFFSET
- *   PTE bits → physical address
- *   phys_addr | PAGE_OFFSET → kernel VA
- *   memcpy → direct write
  * ================================================================ */
 static int hfr_pte_force_write(struct mm_struct *mm, unsigned long user_addr,
                                 const void *buf, size_t len)
@@ -160,25 +158,11 @@ static int hfr_pte_force_write(struct mm_struct *mm, unsigned long user_addr,
     uint64_t page_start, offset;
     size_t bytes, total = 0;
     int ret;
-    uint64_t page_offset; /* PAGE_OFFSET equivalent */
 
     kpm_info(">>> pte_force_write: mm=%px addr=0x%lx len=%zu\n", mm, user_addr, len);
 
     if (!mm || !buf || len == 0 || !p_follow_pte || !p_memstart_addr)
         return -EINVAL;
-
-    /* ARM64 PAGE_OFFSET calculation: 
-     * From kernel: #define __phys_to_virt(x) ((x - PHYS_OFFSET) | PAGE_OFFSET)
-     * Simplified: kern_va = phys_addr - PHYS_OFFSET + PAGE_OFFSET
-     * For linear mapping: kern_va ≈ phys_addr + (PAGE_OFFSET - PHYS_OFFSET)
-     * Since PAGE_OFFSET = 0xFFFFFF8000000000 (VA_BITS=39) or 0xFFFF000000000000 (VA_BITS=48)
-     * and PHYS_OFFSET is typically 0x80000000,
-     * the offset = PAGE_OFFSET - PHYS_OFFSET ≈ PAGE_OFFSET for high addresses
-     */
-    
-    /* Use memstart_addr as PHYS_OFFSET */
-    uint64_t phys_offset = *p_memstart_addr;
-    kpm_info("PHYS_OFFSET (memstart_addr): 0x%llx\n", phys_offset);
 
     while (total < len) {
         user_addr = (user_addr + total);
@@ -197,7 +181,6 @@ static int hfr_pte_force_write(struct mm_struct *mm, unsigned long user_addr,
 
         pte_val = *ptep;
 
-        /* Check if PTE is valid */
         if (!(pte_val & ARM64_PTE_VALID)) {
             kpm_err("PTE not valid at 0x%lx\n", page_start);
             if (ptlp && p_spin_unlock) p_spin_unlock(ptlp);
@@ -207,50 +190,28 @@ static int hfr_pte_force_write(struct mm_struct *mm, unsigned long user_addr,
         /* Extract physical address (bits 47:12) */
         phys_addr = pte_val & 0x0000FFFFFFFFF000ULL;
 
-        /* Convert to kernel virtual address 
-         * ARM64 linear map: kern_va = phys_addr - PHYS_OFFSET + PAGE_OFFSET
-         * Since PAGE_OFFSET = 0xFFFFFF8000000000 and PHYS_OFFSET is small,
-         * kern_va = phys_addr | PAGE_OFFSET (high bits set)
-         * Using approximation: kern_va = phys_addr + 0xFFFFFF0000000000
-         */
-        
-        /* Calculate PAGE_OFFSET dynamically based on VA_BITS */
-        /* For 39-bit VA: PAGE_OFFSET = 0xFFFFFF8000000000 */
-        /* For 48-bit VA: PAGE_OFFSET = 0xFFFF000000000000 */
-        /* Using fixed 48-bit for safety (most modern ARM64) */
-        page_offset = 0xFFFF000000000000ULL;
-        
-        kern_va = phys_addr | page_offset;
-        
-        kpm_info("PTE: 0x%llx phys: 0x%llx kern_va: 0x%llx\n", 
-                 pte_val, phys_addr, kern_va);
+        /* Convert to kernel VA: ARM64 linear map */
+        kern_va = phys_addr | 0xFFFF000000000000ULL;
 
-        /* Temporarily make PTE writable */
+        /* Make PTE writable */
         pte_val &= ~ARM64_PTE_RDONLY;
         pte_val |= ARM64_PTE_WRITE;
         *ptep = pte_val;
-
-        /* Memory barrier */
         asm volatile("dsb ishst" ::: "memory");
 
-        /* Direct write to kernel virtual address */
+        /* Direct write */
         memcpy((void *)(kern_va + offset), (const char *)buf + total, bytes);
-
-        /* Memory barrier */
         asm volatile("dsb ishst" ::: "memory");
 
-        /* Restore original PTE (read-only) */
+        /* Restore PTE */
         pte_val &= ~ARM64_PTE_WRITE;
         pte_val |= ARM64_PTE_RDONLY;
         *ptep = pte_val;
 
-        /* Release spinlock */
-        if (ptlp && p_spin_unlock) {
+        if (ptlp && p_spin_unlock)
             p_spin_unlock(ptlp);
-        }
 
         total += bytes;
-        kpm_info("Wrote %zu bytes at 0x%lx (total: %zu)\n", bytes, user_addr, total);
     }
 
     kpm_info("<<< pte_force_write SUCCESS: %zu bytes\n", total);
@@ -325,18 +286,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if (pkt->op_code == OP_WRITE_VM) {
-        /* ============================================
-         * WRITE PATH - follow_pte + PTE bypass
-         * ============================================ */
         if (p_follow_pte && p_memstart_addr) {
             transferred = hfr_pte_force_write(mm, (unsigned long)pkt->vaddr,
                                                pkt->inline_data, pkt->size);
         } else {
-            /* Fallback: access_process_vm with FOLL_FORCE */
-            kpm_info("PTE bypass unavailable, using fallback\n");
             transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr,
                                                pkt->inline_data, (int)pkt->size,
-                                               0x11); /* FOLL_WRITE | FOLL_FORCE */
+                                               0x11);
         }
 
         if (transferred < 0)
@@ -349,7 +305,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         } else
             pkt->status = STATUS_PROTECTION;
     } else {
-        /* READ PATH - standard access_process_vm */
         memset(temp_buf, 0, MAX_INLINE);
         transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr,
                                            temp_buf, (int)pkt->size, 0);
@@ -443,11 +398,10 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    /* PTE bypass symbols */
     p_follow_pte = (follow_pte_t)kallsyms_lookup_name("follow_pte");
     p_spin_unlock = (spin_unlock_t)kallsyms_lookup_name("_raw_spin_unlock");
     if (!p_spin_unlock) p_spin_unlock = (spin_unlock_t)kallsyms_lookup_name("spin_unlock");
-    p_memstart_addr = (phys_addr_t *)kallsyms_lookup_name("memstart_addr");
+    p_memstart_addr = (uint64_t *)kallsyms_lookup_name("memstart_addr");
 
     kpm_info("Standard: proc=%px vm=%px task=%px mm=%px\n",
              p_proc_create_data, p_access_process_vm,
@@ -470,10 +424,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== HFR ZERO-TRACE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    if (p_follow_pte && p_memstart_addr)
-        kpm_info("Mode: PTE_DIRECT_WRITE (zero trace)\n");
-    else
-        kpm_info("Mode: ACCESS_PROCESS_VM_FALLBACK\n");
+    kpm_info("Mode: %s\n", (p_follow_pte && p_memstart_addr) ?
+             "PTE_DIRECT_WRITE" : "ACCESS_PROCESS_VM_FALLBACK");
     return 0;
 }
 
