@@ -48,13 +48,7 @@ KPM_DESCRIPTION("KPM Write-Protection Bypass - get_user_pages + kmap_atomic");
 
 /* ARM64 Kernel 5.10 hardcoded constants */
 #define ARM64_PAGE_SIZE       4096
-#define ARM64_PAGE_SHIFT      12
 #define ARM64_PAGE_MASK       (~(ARM64_PAGE_SIZE - 1))
-
-/* PTE bits for ARM64 */
-#define ARM64_PTE_VALID       (1UL << 0)
-#define ARM64_PTE_RDONLY      (1UL << 7)   /* AP[2] */
-#define ARM64_PTE_WRITE       (1UL << 51)  /* DBM */
 
 /* get_user_pages flags */
 #define GUP_FLAGS_WRITE       0x01  /* FOLL_WRITE */
@@ -69,8 +63,17 @@ struct k_packet {
     uint8_t  inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-struct inode; struct file; struct kiocb; struct iov_iter;
-struct poll_table_struct; struct vm_area_struct;
+/* Forward declarations */
+struct inode;
+struct file;
+struct kiocb;
+struct iov_iter;
+struct poll_table_struct;
+struct vm_area_struct;
+struct page;
+struct mm_struct;
+struct task_struct;
+struct pid_namespace;
 typedef unsigned int __poll_t;
 
 struct proc_ops {
@@ -113,9 +116,10 @@ typedef long (*get_user_pages_remote_t)(struct mm_struct *mm,
     unsigned int gup_flags, struct page **pages,
     struct vm_area_struct **vmas, int *locked);
 
-/* kmap_atomic / kunmap_atomic signatures */
+/* kmap_atomic / kunmap_atomic / put_page signatures */
 typedef void *(*kmap_atomic_t)(struct page *page);
 typedef void (*kunmap_atomic_t)(void *addr);
+typedef void (*put_page_t)(struct page *page);
 
 /* flush_tlb_page signature */
 typedef void (*flush_tlb_page_t)(struct vm_area_struct *vma, unsigned long uaddr);
@@ -138,10 +142,11 @@ static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
 
-/* New: get_user_pages_remote, kmap/kunmap, flush_tlb_page */
+/* GUP + kmap symbols */
 static get_user_pages_remote_t p_get_user_pages_remote;
 static kmap_atomic_t           p_kmap_atomic;
 static kunmap_atomic_t         p_kunmap_atomic;
+static put_page_t              p_put_page;
 static flush_tlb_page_t        p_flush_tlb_page;
 
 static const char *proc_filename = "hfr_mem";
@@ -149,13 +154,7 @@ static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
 
 /* ================================================================
- * ULTIMATE WRITE FUNCTION
- * Uses: get_user_pages_remote + kmap_atomic + direct memcpy
- * This bypasses ALL write protection by:
- *   1. Pinning the page with FOLL_WRITE|FOLL_FORCE
- *   2. Getting kernel virtual address via kmap_atomic
- *   3. Direct memcpy to kernel address
- *   4. Flushing TLB for coherency
+ * ULTIMATE WRITE - get_user_pages_remote + kmap_atomic
  * ================================================================ */
 static int hfr_gup_force_write(struct task_struct *task, struct mm_struct *mm,
                                 unsigned long user_addr, const void *buf, size_t len)
@@ -164,17 +163,15 @@ static int hfr_gup_force_write(struct task_struct *task, struct mm_struct *mm,
     void *kaddr;
     unsigned long page_start, offset;
     size_t bytes, total = 0;
-    int ret = 0;
     long gup_ret;
 
-    kpm_info(">>> gup_force_write: task=%px mm=%px addr=0x%lx len=%zu\n",
-             task, mm, user_addr, len);
+    kpm_info(">>> gup_force_write: addr=0x%lx len=%zu\n", user_addr, len);
 
     if (!task || !mm || !buf || len == 0)
         return -EINVAL;
 
-    if (!p_get_user_pages_remote || !p_kmap_atomic) {
-        kpm_err("Required symbols not resolved\n");
+    if (!p_get_user_pages_remote || !p_kmap_atomic || !p_put_page) {
+        kpm_err("Required GUP symbols not resolved\n");
         return -ENOSYS;
     }
 
@@ -186,51 +183,43 @@ static int hfr_gup_force_write(struct task_struct *task, struct mm_struct *mm,
         if (bytes > ARM64_PAGE_SIZE - offset)
             bytes = ARM64_PAGE_SIZE - offset;
 
-        /* Pin the page with write+force flags */
+        /* Pin page with FOLL_WRITE|FOLL_FORCE */
         gup_ret = p_get_user_pages_remote(mm, page_start, 1,
                                            GUP_FLAGS_WRITE | GUP_FLAGS_FORCE,
                                            &page, NULL, NULL);
         if (gup_ret <= 0) {
-            kpm_err("get_user_pages_remote failed: %ld at 0x%lx\n", gup_ret, page_start);
-            ret = (total > 0) ? (int)total : -EFAULT;
-            goto out;
+            kpm_err("get_user_pages_remote failed: %ld\n", gup_ret);
+            return (total > 0) ? (int)total : -EFAULT;
         }
 
-        /* Get kernel virtual address for the page */
+        /* Map page to kernel VA */
         kaddr = p_kmap_atomic(page);
         if (!kaddr) {
-            kpm_err("kmap_atomic failed for page %px\n", page);
-            put_page(page);
-            ret = (total > 0) ? (int)total : -ENOMEM;
-            goto out;
+            kpm_err("kmap_atomic failed\n");
+            p_put_page(page);
+            return (total > 0) ? (int)total : -ENOMEM;
         }
 
-        /* Direct memory write to kernel address */
+        /* Direct write */
         memcpy(kaddr + offset, (const char *)buf + total, bytes);
 
-        /* Unmap the page */
+        /* Unmap */
         if (p_kunmap_atomic)
             p_kunmap_atomic(kaddr);
 
-        /* Release the page */
-        put_page(page);
-        page = NULL;
-
-        /* Flush TLB for this user address if available */
+        /* Flush TLB if available */
         if (p_flush_tlb_page)
             p_flush_tlb_page(NULL, user_addr);
 
+        /* Release page */
+        p_put_page(page);
+        page = NULL;
+
         total += bytes;
-        kpm_info("Wrote %zu bytes at 0x%lx (total: %zu)\n", bytes, user_addr, total);
     }
 
-    ret = (int)total;
-    kpm_info("<<< gup_force_write SUCCESS: %d bytes\n", ret);
-
-out:
-    if (page)
-        put_page(page);
-    return ret;
+    kpm_info("<<< gup_force_write SUCCESS: %zu bytes\n", total);
+    return (int)total;
 }
 
 static inline struct task_struct *hfr_get_current(void)
@@ -256,25 +245,21 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     kpm_info(">>> process_packet: op=0x%x pid=%u addr=0x%llx size=%u\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size);
 
-    /* Validate opcode */
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
-    /* Validate size */
     if (!pkt->size || pkt->size > MAX_INLINE) {
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
-    /* Validate address */
     if (!is_valid_user_address(pkt->vaddr)) {
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
-    /* Check critical symbols */
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
         pkt->status = STATUS_NULL_SYMBOL;
         return;
@@ -286,7 +271,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    /* Find target task */
     if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(target_pid);
     if (!task) {
@@ -306,51 +290,41 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if (pkt->op_code == OP_WRITE_VM) {
-        /* ============================================
-         * WRITE PATH - get_user_pages_remote + kmap_atomic
-         * ============================================ */
-        if (!p_get_user_pages_remote || !p_kmap_atomic) {
-            /* Fallback: try access_process_vm with FOLL_WRITE|FOLL_FORCE */
-            kpm_info("Using access_process_vm fallback for write\n");
+        /* WRITE: try GUP first, fallback to access_process_vm */
+        if (p_get_user_pages_remote && p_kmap_atomic && p_put_page) {
+            transferred = hfr_gup_force_write(task, mm, (unsigned long)pkt->vaddr,
+                                               pkt->inline_data, pkt->size);
+        } else {
             transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr,
                                                pkt->inline_data, (int)pkt->size,
                                                GUP_FLAGS_WRITE | GUP_FLAGS_FORCE);
-        } else {
-            transferred = hfr_gup_force_write(task, mm, (unsigned long)pkt->vaddr,
-                                               pkt->inline_data, pkt->size);
         }
 
-        if (transferred < 0) {
+        if (transferred < 0)
             pkt->status = STATUS_VM_FAULT;
-        } else if ((uint32_t)transferred == pkt->size) {
+        else if ((uint32_t)transferred == pkt->size)
             pkt->status = STATUS_SUCCESS;
-        } else if (transferred > 0) {
+        else if (transferred > 0) {
             pkt->size = (uint32_t)transferred;
             pkt->status = STATUS_PARTIAL_IO;
-        } else {
+        } else
             pkt->status = STATUS_PROTECTION;
-        }
     } else {
-        /* ============================================
-         * READ PATH - Standard access_process_vm
-         * ============================================ */
+        /* READ: standard access_process_vm */
         memset(temp_buf, 0, MAX_INLINE);
         transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr,
                                            temp_buf, (int)pkt->size, 0);
-
-        if (transferred < 0) {
+        if (transferred < 0)
             pkt->status = STATUS_VM_FAULT;
-        } else if (transferred == 0 && pkt->size > 0) {
+        else if (transferred == 0 && pkt->size > 0)
             pkt->status = STATUS_PROTECTION;
-        } else {
+        else {
             if (transferred > 0)
                 memcpy(pkt->inline_data, temp_buf, transferred);
-            if ((uint32_t)transferred != pkt->size) {
+            pkt->status = ((uint32_t)transferred == pkt->size) ? 
+                           STATUS_SUCCESS : STATUS_PARTIAL_IO;
+            if (pkt->status == STATUS_PARTIAL_IO)
                 pkt->size = (uint32_t)transferred;
-                pkt->status = STATUS_PARTIAL_IO;
-            } else {
-                pkt->status = STATUS_SUCCESS;
-            }
         }
     }
 
@@ -401,24 +375,16 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
 }
 
 static const struct proc_ops p_ops = {
-    .proc_flags   = 0,
     .proc_open    = proc_open_handler,
     .proc_read    = proc_read_handler,
-    .proc_read_iter = NULL,
     .proc_write   = proc_write_handler,
-    .proc_lseek   = NULL,
     .proc_release = proc_release_handler,
-    .proc_poll    = NULL,
-    .proc_ioctl   = NULL,
-    .proc_mmap    = NULL,
-    .proc_get_unmapped_area = NULL,
 };
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     kpm_info("=== HFR ULTIMATE INIT ===\n");
 
-    /* Standard symbols */
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -438,22 +404,23 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    /* New symbols for GUP-based write bypass */
+    /* GUP write bypass symbols */
     p_get_user_pages_remote = (get_user_pages_remote_t)kallsyms_lookup_name("get_user_pages_remote");
     p_kmap_atomic = (kmap_atomic_t)kallsyms_lookup_name("kmap_atomic");
     p_kunmap_atomic = (kunmap_atomic_t)kallsyms_lookup_name("kunmap_atomic");
+    p_put_page = (put_page_t)kallsyms_lookup_name("put_page");
     p_flush_tlb_page = (flush_tlb_page_t)kallsyms_lookup_name("flush_tlb_page");
 
-    kpm_info("Standard symbols: proc=%px vm=%px task=%px mm=%px\n",
+    kpm_info("Standard: proc=%px vm=%px task=%px mm=%px\n",
              p_proc_create_data, p_access_process_vm,
              p_find_task_by_vpid, p_get_task_mm);
-    kpm_info("GUP symbols: gup_remote=%px kmap=%px kunmap=%px flush_tlb=%px\n",
+    kpm_info("GUP: gup=%px kmap=%px kunmap=%px put=%px tlb=%px\n",
              p_get_user_pages_remote, p_kmap_atomic,
-             p_kunmap_atomic, p_flush_tlb_page);
+             p_kunmap_atomic, p_put_page, p_flush_tlb_page);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid ||
         !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
-        kpm_err("CRITICAL STANDARD SYMBOL MISSING\n");
+        kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
 
@@ -466,10 +433,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
 
     kpm_info("=== HFR ULTIMATE INIT SUCCESS /proc/%s ===\n", proc_filename);
-    if (p_get_user_pages_remote && p_kmap_atomic)
-        kpm_info("GUP write bypass: ACTIVATED\n");
-    else
-        kpm_info("GUP write bypass: UNAVAILABLE (fallback mode)\n");
+    kpm_info("Mode: %s\n", (p_get_user_pages_remote && p_kmap_atomic && p_put_page) ?
+             "GUP_KERNEL_WRITE" : "ACCESS_PROCESS_VM_FALLBACK");
     return 0;
 }
 
