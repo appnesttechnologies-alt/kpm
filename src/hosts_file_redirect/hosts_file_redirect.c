@@ -14,7 +14,7 @@
 #include <linux/version.h>
 
 KPM_NAME("hosts_file_redirect");
-KPM_VERSION("2.0.1");
+KPM_VERSION("2.0.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
 KPM_DESCRIPTION("Kernel Memory Bridge");
@@ -110,31 +110,31 @@ typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
-typedef struct task_struct *(*next_task_t)(struct task_struct *);
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 typedef int (*filp_close_t)(struct file *, void *);
 typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
+typedef const char *(*get_task_comm_t)(struct task_struct *);
 
-static proc_create_data_t    p_proc_create_data;
-static remove_proc_entry_t   p_remove_proc_entry;
-static copy_from_user_t      p_copy_from_user;
-static copy_to_user_t        p_copy_to_user;
-static access_process_vm_t   p_access_process_vm;
-static find_task_by_vpid_t   p_find_task_by_vpid;
-static get_task_mm_t         p_get_task_mm;
-static mmput_t               p_mmput;
-static get_task_struct_t     p_get_task_struct;
-static put_task_struct_t     p_put_task_struct;
-static task_pid_nr_ns_t      p_task_pid_nr_ns;
-static rcu_read_lock_t       p_rcu_read_lock;
-static rcu_read_unlock_t     p_rcu_read_unlock;
-static mutex_init_t          p_mutex_init;
-static mutex_lock_t          p_mutex_lock;
-static mutex_unlock_t        p_mutex_unlock;
-static next_task_t           p_next_task;
-static filp_open_t           p_filp_open;
-static filp_close_t          p_filp_close;
-static kernel_read_t         p_kernel_read;
+static proc_create_data_t    p_proc_create_data = NULL;
+static remove_proc_entry_t   p_remove_proc_entry = NULL;
+static copy_from_user_t      p_copy_from_user = NULL;
+static copy_to_user_t        p_copy_to_user = NULL;
+static access_process_vm_t   p_access_process_vm = NULL;
+static find_task_by_vpid_t   p_find_task_by_vpid = NULL;
+static get_task_mm_t         p_get_task_mm = NULL;
+static mmput_t               p_mmput = NULL;
+static get_task_struct_t     p_get_task_struct = NULL;
+static put_task_struct_t     p_put_task_struct = NULL;
+static task_pid_nr_ns_t      p_task_pid_nr_ns = NULL;
+static rcu_read_lock_t       p_rcu_read_lock = NULL;
+static rcu_read_unlock_t     p_rcu_read_unlock = NULL;
+static mutex_init_t          p_mutex_init = NULL;
+static mutex_lock_t          p_mutex_lock = NULL;
+static mutex_unlock_t        p_mutex_unlock = NULL;
+static filp_open_t           p_filp_open = NULL;
+static filp_close_t          p_filp_close = NULL;
+static kernel_read_t         p_kernel_read = NULL;
+static get_task_comm_t       p_get_task_comm_fn = NULL;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -152,25 +152,14 @@ static inline int is_valid_user_address(uint64_t addr)
     return (addr >= 0x1000 && addr < (1ULL << 63));
 }
 
-static int kstr_match(const char *a, const char *b)
+static int kstr_nmatch(const char *a, const char *b, int n)
 {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+        if (!a[i]) break;
     }
-    return (*a == *b);
-}
-
-static int kstr_contains(const char *haystack, const char *needle)
-{
-    int i, j;
-    for (i = 0; haystack[i]; i++) {
-        for (j = 0; needle[j]; j++) {
-            if (haystack[i + j] != needle[j]) break;
-        }
-        if (!needle[j]) return 1;
-    }
-    return 0;
+    return 1;
 }
 
 static void build_path(int pid, const char *suffix, char *buf, int buf_size)
@@ -180,60 +169,108 @@ static void build_path(int pid, const char *suffix, char *buf, int buf_size)
     char ps[16];
     int tp = pid;
     while (pre[pos] && pos < buf_size - 1) { buf[pos] = pre[pos]; pos++; }
+    if (tp == 0) { ps[pl++] = '0'; }
     while (tp > 0) { ps[pl++] = '0' + (tp % 10); tp /= 10; }
-    if (pl == 0) ps[pl++] = '0';
     for (i = pl - 1; i >= 0; i--) { if (pos < buf_size - 1) buf[pos++] = ps[i]; }
     for (i = 0; suffix[i] && pos < buf_size - 1; i++) buf[pos++] = suffix[i];
     buf[pos] = '\0';
 }
 
-static int read_process_cmdline(pid_t pid, char *buffer, size_t buf_size)
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  PID SCAN - find_task_by_vpid + __get_task_comm             ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+static int find_process_by_pid_scan(const char *proc_name, pid_t *out_pid)
 {
-    char path[64];
-    struct file *f = NULL;
-    ssize_t rd;
-    loff_t pos = 0;
-    int i;
+    struct task_struct *task;
+    const char *comm;
+    pid_t pid;
+    int name_len, i;
     
-    if (!p_filp_open || !p_filp_close || !p_kernel_read) return -EFAULT;
-    
-    build_path(pid, "/cmdline", path, sizeof(path));
-    
-    f = p_filp_open(path, HFR_O_RDONLY, 0);
-    if (!f || (unsigned long)f >= (unsigned long)(-4095)) return -ENOENT;
-    
-    rd = p_kernel_read(f, buffer, buf_size - 1, &pos);
-    p_filp_close(f, NULL);
-    
-    if (rd < 0) return -EIO;
-    buffer[rd] = '\0';
-    
-    for (i = 0; i < rd; i++) {
-        if (buffer[i] == '\0') buffer[i] = ' ';
+    if (!p_find_task_by_vpid || !p_get_task_comm_fn) {
+        kpm_err("Symbols NULL: find_task=%px get_comm=%px\n",
+                p_find_task_by_vpid, p_get_task_comm_fn);
+        return -EFAULT;
     }
     
-    return 0;
-}
-
-static int find_process_by_cmdline_scan(const char *proc_name, pid_t *out_pid)
-{
-    char cmdline[MAX_CMDLINE];
-    pid_t pid;
-    int ret;
+    name_len = 0;
+    while (proc_name[name_len]) name_len++;
     
-    kpm_info("Scanning cmdline for '%s'\n", proc_name);
+    kpm_info("PID scan for '%s' (len=%d)\n", proc_name, name_len);
     
     for (pid = 1; pid < 32768; pid++) {
-        ret = read_process_cmdline(pid, cmdline, sizeof(cmdline));
-        if (ret == 0) {
-            if (kstr_contains(cmdline, proc_name)) {
+        task = p_find_task_by_vpid(pid);
+        if (!task) continue;
+        
+        comm = p_get_task_comm_fn(task);
+        if (!comm) continue;
+        
+        // comm is max 15 chars, match accordingly
+        int match_len = (name_len < 15) ? name_len : 15;
+        if (kstr_nmatch(comm, proc_name, match_len) && (name_len <= 15 || comm[15] == '\0' || comm[14] == '\0')) {
+            kpm_info("FOUND: PID=%d comm='%s'\n", pid, comm);
+            *out_pid = pid;
+            return 0;
+        }
+    }
+    
+    kpm_err("PID scan complete, not found\n");
+    return -ESRCH;
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  CMDLINE SCAN - filp_open /proc/PID/cmdline                 ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+static int find_process_by_cmdline(const char *proc_name, pid_t *out_pid)
+{
+    char path[64];
+    char buf[MAX_CMDLINE];
+    struct file *f;
+    ssize_t rd;
+    loff_t pos;
+    pid_t pid;
+    int i;
+    
+    if (!p_filp_open || !p_filp_close || !p_kernel_read) {
+        kpm_err("VFS symbols NULL: open=%px close=%px read=%px\n",
+                p_filp_open, p_filp_close, p_kernel_read);
+        return -EFAULT;
+    }
+    
+    kpm_info("Cmdline scan for '%s'\n", proc_name);
+    
+    for (pid = 1; pid < 32768; pid++) {
+        build_path(pid, "/cmdline", path, sizeof(path));
+        
+        f = p_filp_open(path, HFR_O_RDONLY, 0);
+        if (!f || (unsigned long)f >= (unsigned long)(-4095)) continue;
+        
+        pos = 0;
+        rd = p_kernel_read(f, buf, sizeof(buf) - 1, &pos);
+        p_filp_close(f, NULL);
+        
+        if (rd <= 0) continue;
+        
+        buf[rd] = '\0';
+        // Replace null separators with spaces
+        for (i = 0; i < rd; i++) if (buf[i] == '\0') buf[i] = ' ';
+        
+        // Check if proc_name is substring
+        for (i = 0; buf[i]; i++) {
+            int j;
+            for (j = 0; proc_name[j]; j++) {
+                if (buf[i + j] != proc_name[j]) break;
+            }
+            if (!proc_name[j]) {
+                kpm_info("FOUND by cmdline: PID=%d\n", pid);
                 *out_pid = pid;
-                kpm_info("Found '%s' at PID=%d\n", proc_name, pid);
                 return 0;
             }
         }
     }
     
+    kpm_err("Cmdline scan complete, not found\n");
     return -ESRCH;
 }
 
@@ -286,21 +323,30 @@ static void process_find_packet(struct k_packet *pkt)
     memcpy(proc_name, pkt->inline_data, name_len);
     proc_name[name_len] = '\0';
     
-    kpm_info("Finding process: '%s'\n", proc_name);
+    kpm_info("Finding: '%s'\n", proc_name);
     
-    if (find_process_by_cmdline_scan(proc_name, &found_pid) == 0 && found_pid > 0) {
-        pkt->target_pid = (uint32_t)found_pid;
-        pkt->vaddr = (uint64_t)found_pid;
-        pkt->size = (uint32_t)found_pid;
-        pkt->status = STATUS_SUCCESS;
-        return;
-    }
+    // Method 1: find_task_by_vpid + __get_task_comm scan
+    if (find_process_by_pid_scan(proc_name, &found_pid) == 0 && found_pid > 0)
+        goto success;
     
+    // Method 2: /proc/PID/cmdline VFS scan
+    if (find_process_by_cmdline(proc_name, &found_pid) == 0 && found_pid > 0)
+        goto success;
+    
+    // Not found
     pkt->target_pid = 0;
     pkt->vaddr = 0;
     pkt->size = 0;
     pkt->status = STATUS_NOT_FOUND;
     kpm_err("NOT FOUND: '%s'\n", proc_name);
+    return;
+    
+success:
+    pkt->target_pid = (uint32_t)found_pid;
+    pkt->vaddr = (uint64_t)found_pid;
+    pkt->size = (uint32_t)found_pid;
+    pkt->status = STATUS_SUCCESS;
+    kpm_info("SUCCESS: PID=%d\n", found_pid);
 }
 
 static int read_process_maps(pid_t pid, char *buffer, size_t buf_size, loff_t offset, size_t *bytes_read)
@@ -309,7 +355,9 @@ static int read_process_maps(pid_t pid, char *buffer, size_t buf_size, loff_t of
     struct file *f = NULL;
     ssize_t rd;
     loff_t pos = offset;
+    
     if (!p_filp_open || !p_filp_close || !p_kernel_read) return -EFAULT;
+    
     build_path(pid, "/maps", path, sizeof(path));
     f = p_filp_open(path, HFR_O_RDONLY, 0);
     if (!f || (unsigned long)f >= (unsigned long)(-4095)) return -ENOENT;
@@ -337,9 +385,7 @@ static void process_check_packet(struct k_packet *pkt)
 {
     struct task_struct *task;
     if (pkt->target_pid <= 0 || !p_find_task_by_vpid) { pkt->status = STATUS_OUT_OF_RANGE; return; }
-    if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(pkt->target_pid);
-    if (p_rcu_read_unlock) p_rcu_read_unlock();
     pkt->status = task ? STATUS_SUCCESS : STATUS_NO_TASK;
 }
 
@@ -386,7 +432,8 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT START v2.0.1 ===\n");
+    kpm_info("=== INIT v2.0.3 ===\n");
+    
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -400,25 +447,32 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
-    p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
-    p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
-    p_next_task = (next_task_t)kallsyms_lookup_name("next_task");
     p_filp_open = (filp_open_t)kallsyms_lookup_name("filp_open");
     p_filp_close = (filp_close_t)kallsyms_lookup_name("filp_close");
     p_kernel_read = (kernel_read_t)kallsyms_lookup_name("kernel_read");
+    
+    // 🔥 Use __get_task_comm (your kernel has this, not get_task_comm)
+    p_get_task_comm_fn = (get_task_comm_t)kallsyms_lookup_name("__get_task_comm");
+    if (!p_get_task_comm_fn) p_get_task_comm_fn = (get_task_comm_t)kallsyms_lookup_name("get_task_comm");
+    
+    kpm_info("Symbols: proc=%px vm=%px task=%px mm=%px comm=%px open=%px read=%px\n",
+             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid,
+             p_get_task_mm, p_get_task_comm_fn, p_filp_open, p_kernel_read);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
+    
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) { kpm_err("proc_create FAILED\n"); return -EFAULT; }
-    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
+    
+    kpm_info("=== SUCCESS /proc/%s ===\n", proc_filename);
     return 0;
 }
 
