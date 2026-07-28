@@ -153,20 +153,16 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
-// 🔥 SIMPLE SLEEP FUNCTION (No jiffies.h needed)
+// 🔥 SIMPLE DELAY - NO HEADERS NEEDED
 // ============================================================
 
-static void simple_sleep_ms(int ms)
+static void simple_delay(int iterations)
 {
-    unsigned long timeout = (ms * 1000) / 1000; // Convert to microseconds
-    unsigned long start = jiffies;
-    unsigned long delay = msecs_to_jiffies(ms);
-    
-    if (timeout < 1) timeout = 1;
-    
-    // Use a simple loop with schedule_timeout
-    set_current_state(TASK_INTERRUPTIBLE);
-    schedule_timeout(delay);
+    volatile int i;
+    for (i = 0; i < iterations; i++) {
+        // Simple CPU loop - no headers needed
+        asm volatile("" ::: "memory");
+    }
 }
 
 // ============================================================
@@ -324,7 +320,7 @@ static void process_get_game_info(struct k_packet *pkt) {
 
 static void process_wait_for_game(struct k_packet *pkt) {
     int attempts = 0;
-    const int max_attempts = 600; // 30 seconds at 50ms each
+    const int max_attempts = 6000; // 6000 attempts (about 30 seconds with small delay)
     pid_t found_pid = 0;
     uint64_t lib_base = 0;
     
@@ -360,20 +356,9 @@ static void process_wait_for_game(struct k_packet *pkt) {
         }
         
         attempts++;
-        // Sleep 50ms - using simple delay
-        if (attempts < max_attempts) {
-            // Use msleep if available, otherwise simple loop
-            #ifdef CONFIG_X86
-            asm volatile("pause");
-            #else
-            // Simple busy wait for 50ms
-            unsigned long delay = 50000; // 50ms in microseconds
-            unsigned long start = jiffies;
-            while (time_before(jiffies, start + msecs_to_jiffies(50))) {
-                cpu_relax();
-            }
-            #endif
-        }
+        // Simple delay - about 5ms per iteration on modern CPUs
+        // 6000 * 5ms = 30 seconds
+        simple_delay(1000000);
     }
     
     if (g_game_info.is_found) {
@@ -382,8 +367,7 @@ static void process_wait_for_game(struct k_packet *pkt) {
         resp->lib_base = g_game_info.lib_base;
         pkt->size = sizeof(struct game_info_response);
         pkt->status = STATUS_SUCCESS;
-        kpm_info("Game found after %dms: PID=%d, LIB=0x%llx\n", 
-                 attempts * 50, g_game_info.game_pid, g_game_info.lib_base);
+        kpm_info("Game found after %d attempts\n", attempts);
     } else {
         kpm_err("Game not found after %d attempts\n", attempts);
         pkt->status = STATUS_GAME_NOT_FOUND;
