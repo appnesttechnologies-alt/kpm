@@ -12,6 +12,8 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -69,7 +71,6 @@ struct file;
 struct kiocb;
 struct iov_iter;
 struct poll_table_struct;
-struct vm_area_struct;
 typedef unsigned int __poll_t;
 
 struct proc_ops {
@@ -109,6 +110,7 @@ typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
+typedef char *(*d_path_t)(const struct path *, char *, int);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -126,6 +128,7 @@ static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
+static d_path_t              p_d_path;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -160,13 +163,12 @@ static void simple_delay(int iterations)
 {
     volatile int i;
     for (i = 0; i < iterations; i++) {
-        // Simple CPU loop - no headers needed
         asm volatile("" ::: "memory");
     }
 }
 
 // ============================================================
-// 🔥 PROCESS SCANNING - NO NEW KALLSYMS NEEDED
+// 🔥 PROCESS SCANNING - Using d_path from kallsyms
 // ============================================================
 
 // Find process by checking task->comm
@@ -179,12 +181,11 @@ static pid_t find_process_by_comm(void) {
         return 0;
     }
     
-    // Scan PID range (Android app PIDs usually 10000-50000)
+    // Scan PID range
     for (pid_t pid = 1000; pid < 50000; pid += 5) {
         p_rcu_read_lock();
         task = p_find_task_by_vpid(pid);
         if (task && task->comm) {
-            // Manual string compare (no strstr kallsyms needed)
             const char *comm = task->comm;
             int match = 1;
             
@@ -207,48 +208,63 @@ static pid_t find_process_by_comm(void) {
     return found_pid;
 }
 
-// Find libil2cpp.so base by scanning VMA
+// Find libil2cpp.so base using d_path
 static uint64_t find_lib_base_from_mm(pid_t pid) {
     struct task_struct *task;
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     uint64_t lib_base = 0;
-    const char *target = "libil2cpp.so";
+    char *path_buf = NULL;
+    char *path = NULL;
     
-    if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+    if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput || !p_d_path) {
         return 0;
     }
     
+    path_buf = kmalloc(256, GFP_KERNEL);
+    if (!path_buf) return 0;
+    
     task = p_find_task_by_vpid(pid);
-    if (!task) return 0;
+    if (!task) {
+        kfree(path_buf);
+        return 0;
+    }
     
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
     if (p_put_task_struct && task) p_put_task_struct(task);
     
-    if (!mm) return 0;
+    if (!mm) {
+        kfree(path_buf);
+        return 0;
+    }
     
-    // Walk VMA list using mm->mmap
+    // Walk VMA list
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (vma && vma->vm_file && vma->vm_file->f_path.dentry) {
-            const char *name = vma->vm_file->f_path.dentry->d_name.name;
-            int match = 1;
-            
-            for (int i = 0; i < 12 && target[i] && name[i]; i++) {
-                if (target[i] != name[i]) {
-                    match = 0;
+        if (vma && vma->vm_file) {
+            path = p_d_path(&vma->vm_file->f_path, path_buf, 256);
+            if (path && !IS_ERR(path)) {
+                // Check if path contains libil2cpp.so
+                const char *target = "libil2cpp.so";
+                int match = 1;
+                
+                for (int i = 0; i < 12 && target[i] && path[i]; i++) {
+                    if (target[i] != path[i]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                
+                if (match) {
+                    lib_base = vma->vm_start;
                     break;
                 }
-            }
-            
-            if (match) {
-                lib_base = vma->vm_start;
-                break;
             }
         }
     }
     
     p_mmput(mm);
+    kfree(path_buf);
     return lib_base;
 }
 
@@ -264,10 +280,8 @@ static void process_get_game_info(struct k_packet *pkt) {
     
     // Check cache first
     if (g_game_info.is_found) {
-        // Verify PID still exists
         struct task_struct *task = p_find_task_by_vpid(g_game_info.game_pid);
         if (task) {
-            // Cache is valid
             struct game_info_response *resp = (struct game_info_response *)pkt->inline_data;
             resp->pid = g_game_info.game_pid;
             resp->lib_base = g_game_info.lib_base;
@@ -277,9 +291,7 @@ static void process_get_game_info(struct k_packet *pkt) {
                      g_game_info.game_pid, g_game_info.lib_base);
             return;
         } else {
-            // Cache invalid, clear it
             g_game_info.is_found = false;
-            kpm_info("Cache invalid, clearing\n");
         }
     }
     
@@ -320,7 +332,7 @@ static void process_get_game_info(struct k_packet *pkt) {
 
 static void process_wait_for_game(struct k_packet *pkt) {
     int attempts = 0;
-    const int max_attempts = 6000; // 6000 attempts (about 30 seconds with small delay)
+    const int max_attempts = 6000;
     pid_t found_pid = 0;
     uint64_t lib_base = 0;
     
@@ -343,7 +355,6 @@ static void process_wait_for_game(struct k_packet *pkt) {
     }
     
     while (attempts < max_attempts) {
-        // Try to find game
         found_pid = find_process_by_comm();
         if (found_pid) {
             lib_base = find_lib_base_from_mm(found_pid);
@@ -356,8 +367,6 @@ static void process_wait_for_game(struct k_packet *pkt) {
         }
         
         attempts++;
-        // Simple delay - about 5ms per iteration on modern CPUs
-        // 6000 * 5ms = 30 seconds
         simple_delay(1000000);
     }
     
@@ -603,13 +612,14 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
+    p_d_path = (d_path_t)kallsyms_lookup_name("d_path");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px d_path=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user, p_d_path);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
+        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user || !p_d_path) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
