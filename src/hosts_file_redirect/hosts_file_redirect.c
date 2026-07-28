@@ -161,7 +161,6 @@ static int kstr_match(const char *a, const char *b)
     return (*a == *b);
 }
 
-// Check if 'needle' is substring of 'haystack'
 static int kstr_contains(const char *haystack, const char *needle)
 {
     int i, j;
@@ -174,25 +173,19 @@ static int kstr_contains(const char *haystack, const char *needle)
     return 0;
 }
 
-static void build_maps_path(int pid, char *buf, int buf_size)
+static void build_path(int pid, const char *suffix, char *buf, int buf_size)
 {
-    const char *p = "/proc/";
-    const char *s = "/maps";
+    const char *pre = "/proc/";
     int pos = 0, i, pl = 0;
     char ps[16];
     int tp = pid;
-    while (*p && pos < buf_size - 1) { buf[pos++] = *p++; }
+    while (pre[pos] && pos < buf_size - 1) { buf[pos] = pre[pos]; pos++; }
     while (tp > 0) { ps[pl++] = '0' + (tp % 10); tp /= 10; }
     if (pl == 0) ps[pl++] = '0';
     for (i = pl - 1; i >= 0; i--) { if (pos < buf_size - 1) buf[pos++] = ps[i]; }
-    while (*s && pos < buf_size - 1) { buf[pos++] = *s++; }
+    for (i = 0; suffix[i] && pos < buf_size - 1; i++) buf[pos++] = suffix[i];
     buf[pos] = '\0';
 }
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  🔥 FIX: Read /proc/pid/cmdline via kernel VFS              ║
-// ║  get_task_comm only gives 15 chars, cmdline gives full name ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 static int read_process_cmdline(pid_t pid, char *buffer, size_t buf_size)
 {
@@ -200,21 +193,11 @@ static int read_process_cmdline(pid_t pid, char *buffer, size_t buf_size)
     struct file *f = NULL;
     ssize_t rd;
     loff_t pos = 0;
+    int i;
     
     if (!p_filp_open || !p_filp_close || !p_kernel_read) return -EFAULT;
     
-    // Build /proc/PID/cmdline path
-    const char *pre = "/proc/";
-    const char *suf = "/cmdline";
-    int px = 0, i, pl = 0;
-    char ps[16];
-    int tp = pid;
-    while (pre[px] && px < 63) { path[px] = pre[px]; px++; }
-    while (tp > 0) { ps[pl++] = '0' + (tp % 10); tp /= 10; }
-    if (pl == 0) ps[pl++] = '0';
-    for (i = pl - 1; i >= 0; i--) { if (px < 63) path[px++] = ps[i]; }
-    for (i = 0; sufi; i++) { if (px < 63) path[px++] = suf[i]; }
-    path[px] = '\0';
+    build_path(pid, "/cmdline", path, sizeof(path));
     
     f = p_filp_open(path, HFR_O_RDONLY, 0);
     if (!f || (unsigned long)f >= (unsigned long)(-4095)) return -ENOENT;
@@ -225,90 +208,12 @@ static int read_process_cmdline(pid_t pid, char *buffer, size_t buf_size)
     if (rd < 0) return -EIO;
     buffer[rd] = '\0';
     
-    // cmdline has null separators between args, convert to spaces for searching
     for (i = 0; i < rd; i++) {
         if (buffer[i] == '\0') buffer[i] = ' ';
     }
     
     return 0;
 }
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  🔥 FIXED: Check BOTH comm AND cmdline                      ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-static int find_process_by_name(const char *proc_name, pid_t *out_pid)
-{
-    struct task_struct *task;
-    const char *comm;
-    char cmdline[MAX_CMDLINE];
-    int found = 0;
-    
-    if (!p_next_task || !p_rcu_read_lock || !p_rcu_read_unlock || !p_task_pid_nr_ns) {
-        kpm_err("Missing symbols for process scan\n");
-        return -EFAULT;
-    }
-    
-    p_rcu_read_lock();
-    for (task = hfr_get_current(); task; task = p_next_task(task)) {
-        if (!task) break;
-        
-        // Method 1: Check comm (short name, works for names <= 15 chars)
-        comm = get_task_comm(task);
-        if (comm && kstr_match(comm, proc_name)) {
-            found = 1;
-        }
-        
-        // Method 2: Check cmdline (full package name, works for any length)
-        if (!found) {
-            pid_t tpid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
-            if (tpid > 0 && p_get_task_struct) p_get_task_struct(task);
-            
-            // Temporarily release RCU lock for file I/O
-            if (p_rcu_read_unlock) p_rcu_read_unlock();
-            
-            if (read_process_cmdline(tpid, cmdline, sizeof(cmdline)) == 0) {
-                if (kstr_contains(cmdline, proc_name)) {
-                    found = 1;
-                    kpm_info("Found by cmdline: PID=%d cmd='%s'\n", tpid, cmdline);
-                }
-            }
-            
-            if (p_rcu_read_lock) p_rcu_read_lock();
-            if (p_put_task_struct) p_put_task_struct(task);
-            
-            // Need to restart scan because we lost our place in the task list
-            // Actually, we already have the task struct pinned, so just check
-            if (found && p_get_task_struct) {
-                // Re-get the task since we might have lost ref
-                task = p_find_task_by_vpid(tpid);
-                if (task) {
-                    p_get_task_struct(task);
-                    *out_pid = tpid;
-                    p_put_task_struct(task);
-                    if (p_rcu_read_unlock) p_rcu_read_unlock();
-                    return 0;
-                }
-                found = 0;
-            }
-        }
-        
-        if (found) {
-            if (p_get_task_struct) p_get_task_struct(task);
-            *out_pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
-            if (p_put_task_struct) p_put_task_struct(task);
-            p_rcu_read_unlock();
-            return 0;
-        }
-    }
-    p_rcu_read_unlock();
-    return -ESRCH;
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  🔥 SIMPLER VERSION: Just scan cmdline for each PID 1-20000 ║
-// ║  More reliable than task_struct traversal for long names    ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 static int find_process_by_cmdline_scan(const char *proc_name, pid_t *out_pid)
 {
@@ -318,13 +223,12 @@ static int find_process_by_cmdline_scan(const char *proc_name, pid_t *out_pid)
     
     kpm_info("Scanning cmdline for '%s'\n", proc_name);
     
-    // Scan PIDs from 1 to some max (adjust as needed)
     for (pid = 1; pid < 32768; pid++) {
         ret = read_process_cmdline(pid, cmdline, sizeof(cmdline));
         if (ret == 0) {
             if (kstr_contains(cmdline, proc_name)) {
                 *out_pid = pid;
-                kpm_info("Found '%s' at PID=%d cmdline='%s'\n", proc_name, pid, cmdline);
+                kpm_info("Found '%s' at PID=%d\n", proc_name, pid);
                 return 0;
             }
         }
@@ -332,10 +236,6 @@ static int find_process_by_cmdline_scan(const char *proc_name, pid_t *out_pid)
     
     return -ESRCH;
 }
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  ORIGINAL FUNCTIONS (unchanged)                             ║
-// ╚══════════════════════════════════════════════════════════════╝
 
 static void process_rw_packet(struct k_packet *pkt)
 {
@@ -388,23 +288,11 @@ static void process_find_packet(struct k_packet *pkt)
     
     kpm_info("Finding process: '%s'\n", proc_name);
     
-    // 🔥 Try cmdline scan first (handles long names like com.dts.freefiremax)
     if (find_process_by_cmdline_scan(proc_name, &found_pid) == 0 && found_pid > 0) {
         pkt->target_pid = (uint32_t)found_pid;
         pkt->vaddr = (uint64_t)found_pid;
         pkt->size = (uint32_t)found_pid;
         pkt->status = STATUS_SUCCESS;
-        kpm_info("SUCCESS: PID=%d\n", found_pid);
-        return;
-    }
-    
-    // Fallback: try comm match (works for short names)
-    if (find_process_by_name(proc_name, &found_pid) == 0 && found_pid > 0) {
-        pkt->target_pid = (uint32_t)found_pid;
-        pkt->vaddr = (uint64_t)found_pid;
-        pkt->size = (uint32_t)found_pid;
-        pkt->status = STATUS_SUCCESS;
-        kpm_info("SUCCESS (comm): PID=%d\n", found_pid);
         return;
     }
     
@@ -422,7 +310,7 @@ static int read_process_maps(pid_t pid, char *buffer, size_t buf_size, loff_t of
     ssize_t rd;
     loff_t pos = offset;
     if (!p_filp_open || !p_filp_close || !p_kernel_read) return -EFAULT;
-    build_maps_path(pid, path, sizeof(path));
+    build_path(pid, "/maps", path, sizeof(path));
     f = p_filp_open(path, HFR_O_RDONLY, 0);
     if (!f || (unsigned long)f >= (unsigned long)(-4095)) return -ENOENT;
     rd = p_kernel_read(f, buffer, buf_size, &pos);
