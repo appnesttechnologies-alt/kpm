@@ -12,8 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -155,10 +153,27 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // ============================================================
+// 🔥 SIMPLE SLEEP FUNCTION (No jiffies.h needed)
+// ============================================================
+
+static void simple_sleep_ms(int ms)
+{
+    unsigned long timeout = (ms * 1000) / 1000; // Convert to microseconds
+    unsigned long start = jiffies;
+    unsigned long delay = msecs_to_jiffies(ms);
+    
+    if (timeout < 1) timeout = 1;
+    
+    // Use a simple loop with schedule_timeout
+    set_current_state(TASK_INTERRUPTIBLE);
+    schedule_timeout(delay);
+}
+
+// ============================================================
 // 🔥 PROCESS SCANNING - NO NEW KALLSYMS NEEDED
 // ============================================================
 
-// Find process by checking task->comm (NO strstr kallsyms)
+// Find process by checking task->comm
 static pid_t find_process_by_comm(void) {
     pid_t found_pid = 0;
     struct task_struct *task;
@@ -196,7 +211,7 @@ static pid_t find_process_by_comm(void) {
     return found_pid;
 }
 
-// Find libil2cpp.so base by scanning VMA (NO d_path kallsyms)
+// Find libil2cpp.so base by scanning VMA
 static uint64_t find_lib_base_from_mm(pid_t pid) {
     struct task_struct *task;
     struct mm_struct *mm;
@@ -217,11 +232,10 @@ static uint64_t find_lib_base_from_mm(pid_t pid) {
     
     if (!mm) return 0;
     
-    // Walk VMA list
+    // Walk VMA list using mm->mmap
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (vma->vm_file && vma->vm_file->f_path.dentry) {
+        if (vma && vma->vm_file && vma->vm_file->f_path.dentry) {
             const char *name = vma->vm_file->f_path.dentry->d_name.name;
-            // Manual string compare (no strstr kallsyms needed)
             int match = 1;
             
             for (int i = 0; i < 12 && target[i] && name[i]; i++) {
@@ -231,7 +245,6 @@ static uint64_t find_lib_base_from_mm(pid_t pid) {
                 }
             }
             
-            // Also check if it has "libil2cpp" in the path
             if (match) {
                 lib_base = vma->vm_start;
                 break;
@@ -347,9 +360,20 @@ static void process_wait_for_game(struct k_packet *pkt) {
         }
         
         attempts++;
-        // Sleep 50ms
-        set_current_state(TASK_INTERRUPTIBLE);
-        schedule_timeout(msecs_to_jiffies(50));
+        // Sleep 50ms - using simple delay
+        if (attempts < max_attempts) {
+            // Use msleep if available, otherwise simple loop
+            #ifdef CONFIG_X86
+            asm volatile("pause");
+            #else
+            // Simple busy wait for 50ms
+            unsigned long delay = 50000; // 50ms in microseconds
+            unsigned long start = jiffies;
+            while (time_before(jiffies, start + msecs_to_jiffies(50))) {
+                cpu_relax();
+            }
+            #endif
+        }
     }
     
     if (g_game_info.is_found) {
