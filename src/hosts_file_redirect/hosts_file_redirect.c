@@ -18,7 +18,7 @@ KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("ZERO TRACE DMA - NO EXTRA HEADERS");
+KPM_DESCRIPTION("ZERO TRACE - SIMPLE");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -105,31 +105,6 @@ static task_pid_nr_ns_t      p_task_pid_nr_ns = NULL;
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 
-// MANUAL DMA DECLARATIONS - NO HEADERS NEEDED
-typedef unsigned long long dma_addr_t;
-typedef unsigned int gfp_t;
-
-enum dma_data_direction {
-    DMA_BIDIRECTIONAL = 0,
-    DMA_TO_DEVICE = 1,
-    DMA_FROM_DEVICE = 2,
-    DMA_NONE = 3,
-};
-
-struct device {
-    void *driver_data;
-};
-
-// External DMA functions from kernel
-extern void *dma_alloc_coherent(void *dev, size_t size, dma_addr_t *dma_handle, gfp_t gfp);
-extern void dma_free_coherent(void *dev, size_t size, void *cpu_addr, dma_addr_t dma_handle);
-extern void dma_sync_single_for_cpu(void *dev, dma_addr_t addr, size_t size, int dir);
-extern void dma_sync_single_for_device(void *dev, dma_addr_t addr, size_t size, int dir);
-
-// DMA buffer - allocated once
-static void      *dma_buffer = NULL;
-static dma_addr_t dma_handle = 0;
-
 #define VA_BITS          39
 #define PAGE_OFFSET_VAL  (-(1UL << VA_BITS))
 #define PGD_OFFSET       0x48
@@ -193,7 +168,7 @@ static int get_phys_addr(struct mm_struct *mm, unsigned long addr,
     return 0;
 }
 
-static int dma_access(struct mm_struct *mm, unsigned long addr,
+static int mem_access(struct mm_struct *mm, unsigned long addr,
                       void *buffer, int size, int is_write)
 {
     unsigned long phys_addr, kvirt_addr;
@@ -206,7 +181,6 @@ static int dma_access(struct mm_struct *mm, unsigned long addr,
     if (ret < 0)
         return ret;
     
-    // Direct kernel linear map access (NO PTE MOD, NO PAN ISSUE)
     kvirt_addr = phys_to_kvirt(phys_addr);
     
     hfr_log("%s: vaddr=0x%llx phys=0x%llx kvirt=0x%llx size=%d",
@@ -275,7 +249,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (is_write_op)
         memcpy(temp_buffer, pkt->inline_data, pkt->size);
 
-    transferred = dma_access(mm, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
+    transferred = mem_access(mm, pkt->vaddr, temp_buffer, pkt->size, is_write_op);
 
     pkt->status = (transferred > 0) ? STATUS_SUCCESS : STATUS_VM_FAULT;
 
@@ -332,7 +306,7 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    hfr_log("=== ZERO TRACE MODULE - SIMPLE ===");
+    hfr_log("=== ZERO TRACE - SIMPLE ===");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -361,7 +335,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     }
     
     hfr_log("=== /proc/%s CREATED ===", proc_filename);
-    hfr_log("=== USING KERNEL LINEAR MAP ACCESS ===");
     return 0;
 }
 
