@@ -12,12 +12,14 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
 
 KPM_NAME("hosts_file_redirect");
-KPM_VERSION("2.0.3");
+KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("Kernel Memory Bridge");
+KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm");
 
 #define HFR_DEBUG
 #ifdef HFR_DEBUG
@@ -28,18 +30,11 @@ KPM_DESCRIPTION("Kernel Memory Bridge");
 #define kpm_err(fmt, ...)
 #endif
 
-#define MAX_INLINE      256
-#define MAX_CMDLINE     512
-
-#define OP_READ_VM      0x2000
-#define OP_WRITE_VM     0x2001
-#define OP_FIND_PROCESS 0x2002
-#define OP_CHECK_PROCESS 0x2003
-#define OP_READ_MAPS    0x2004
-
-#define HFR_FOLL_WRITE  0x01
-#define FOLL_FORCE      0x10
-#define HFR_O_RDONLY    00
+#define MAX_INLINE     256
+#define OP_READ_VM     0x2000
+#define OP_WRITE_VM    0x3000
+#define OP_GET_GAME_INFO 0x4000
+#define OP_WAIT_GAME     0x4001
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_SIZE   0x1005
@@ -52,9 +47,10 @@ KPM_DESCRIPTION("Kernel Memory Bridge");
 #define STATUS_PROTECTION     0x100C
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
-#define STATUS_NOT_FOUND      0x100F
-#define STATUS_NO_FILE        0x1010
-#define STATUS_EOF            0x1011
+#define STATUS_GAME_NOT_FOUND 0x100F
+
+#define HFR_FOLL_WRITE        0x01
+#define FOLL_FORCE            0x10  
 
 struct k_packet {
     uint32_t op_code;
@@ -64,6 +60,11 @@ struct k_packet {
     uint32_t status;
     uint8_t  inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
+
+struct game_info_response {
+    pid_t pid;
+    uint64_t lib_base;
+} __attribute__((packed));
 
 struct inode;
 struct file;
@@ -110,35 +111,34 @@ typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
-typedef struct file *(*filp_open_t)(const char *, int, umode_t);
-typedef int (*filp_close_t)(struct file *, void *);
-typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
-typedef const char *(*get_task_comm_t)(struct task_struct *);
 
-static proc_create_data_t    p_proc_create_data = NULL;
-static remove_proc_entry_t   p_remove_proc_entry = NULL;
-static copy_from_user_t      p_copy_from_user = NULL;
-static copy_to_user_t        p_copy_to_user = NULL;
-static access_process_vm_t   p_access_process_vm = NULL;
-static find_task_by_vpid_t   p_find_task_by_vpid = NULL;
-static get_task_mm_t         p_get_task_mm = NULL;
-static mmput_t               p_mmput = NULL;
-static get_task_struct_t     p_get_task_struct = NULL;
-static put_task_struct_t     p_put_task_struct = NULL;
-static task_pid_nr_ns_t      p_task_pid_nr_ns = NULL;
-static rcu_read_lock_t       p_rcu_read_lock = NULL;
-static rcu_read_unlock_t     p_rcu_read_unlock = NULL;
-static mutex_init_t          p_mutex_init = NULL;
-static mutex_lock_t          p_mutex_lock = NULL;
-static mutex_unlock_t        p_mutex_unlock = NULL;
-static filp_open_t           p_filp_open = NULL;
-static filp_close_t          p_filp_close = NULL;
-static kernel_read_t         p_kernel_read = NULL;
-static get_task_comm_t       p_get_task_comm_fn = NULL;
+static proc_create_data_t    p_proc_create_data;
+static remove_proc_entry_t   p_remove_proc_entry;
+static copy_from_user_t      p_copy_from_user;
+static copy_to_user_t        p_copy_to_user;
+static access_process_vm_t   p_access_process_vm;
+static find_task_by_vpid_t   p_find_task_by_vpid;
+static get_task_mm_t         p_get_task_mm;
+static mmput_t               p_mmput;
+static get_task_struct_t     p_get_task_struct;
+static put_task_struct_t     p_put_task_struct;
+static task_pid_nr_ns_t      p_task_pid_nr_ns;
+static rcu_read_lock_t       p_rcu_read_lock;
+static rcu_read_unlock_t     p_rcu_read_unlock;
+static mutex_init_t          p_mutex_init;
+static mutex_lock_t          p_mutex_lock;
+static mutex_unlock_t        p_mutex_unlock;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
 static struct mutex hfr_mutex;
+
+// Game info cache
+static struct {
+    pid_t game_pid;
+    uint64_t lib_base;
+    bool is_found;
+} g_game_info = {0, 0, false};
 
 static inline struct task_struct *hfr_get_current(void)
 {
@@ -149,255 +149,350 @@ static inline struct task_struct *hfr_get_current(void)
 
 static inline int is_valid_user_address(uint64_t addr)
 {
-    return (addr >= 0x1000 && addr < (1ULL << 63));
-}
-
-static int kstr_nmatch(const char *a, const char *b, int n)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        if (a[i] != b[i]) return 0;
-        if (!a[i]) break;
-    }
+    if (addr == 0) return 0;
+    if (addr >= (1ULL << 63)) return 0;
     return 1;
 }
 
-static void build_path(int pid, const char *suffix, char *buf, int buf_size)
-{
-    const char *pre = "/proc/";
-    int pos = 0, i, pl = 0;
-    char ps[16];
-    int tp = pid;
-    while (pre[pos] && pos < buf_size - 1) { buf[pos] = pre[pos]; pos++; }
-    if (tp == 0) { ps[pl++] = '0'; }
-    while (tp > 0) { ps[pl++] = '0' + (tp % 10); tp /= 10; }
-    for (i = pl - 1; i >= 0; i--) { if (pos < buf_size - 1) buf[pos++] = ps[i]; }
-    for (i = 0; suffix[i] && pos < buf_size - 1; i++) buf[pos++] = suffix[i];
-    buf[pos] = '\0';
-}
+// ============================================================
+// 🔥 PROCESS SCANNING - NO NEW KALLSYMS NEEDED
+// ============================================================
 
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  PID SCAN - find_task_by_vpid + __get_task_comm             ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-static int find_process_by_pid_scan(const char *proc_name, pid_t *out_pid)
-{
+// Find process by checking task->comm (NO strstr kallsyms)
+static pid_t find_process_by_comm(void) {
+    pid_t found_pid = 0;
     struct task_struct *task;
-    const char *comm;
-    pid_t pid;
-    int name_len, i;
+    const char *target = "com.dts.freefiremax";
     
-    if (!p_find_task_by_vpid || !p_get_task_comm_fn) {
-        kpm_err("Symbols NULL: find_task=%px get_comm=%px\n",
-                p_find_task_by_vpid, p_get_task_comm_fn);
-        return -EFAULT;
+    if (!p_find_task_by_vpid || !p_rcu_read_lock || !p_rcu_read_unlock) {
+        return 0;
     }
     
-    name_len = 0;
-    while (proc_name[name_len]) name_len++;
-    
-    kpm_info("PID scan for '%s' (len=%d)\n", proc_name, name_len);
-    
-    for (pid = 1; pid < 32768; pid++) {
+    // Scan PID range (Android app PIDs usually 10000-50000)
+    for (pid_t pid = 1000; pid < 50000; pid += 5) {
+        p_rcu_read_lock();
         task = p_find_task_by_vpid(pid);
-        if (!task) continue;
-        
-        comm = p_get_task_comm_fn(task);
-        if (!comm) continue;
-        
-        // comm is max 15 chars, match accordingly
-        int match_len = (name_len < 15) ? name_len : 15;
-        if (kstr_nmatch(comm, proc_name, match_len) && (name_len <= 15 || comm[15] == '\0' || comm[14] == '\0')) {
-            kpm_info("FOUND: PID=%d comm='%s'\n", pid, comm);
-            *out_pid = pid;
-            return 0;
-        }
-    }
-    
-    kpm_err("PID scan complete, not found\n");
-    return -ESRCH;
-}
-
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  CMDLINE SCAN - filp_open /proc/PID/cmdline                 ║
-// ╚══════════════════════════════════════════════════════════════╝
-
-static int find_process_by_cmdline(const char *proc_name, pid_t *out_pid)
-{
-    char path[64];
-    char buf[MAX_CMDLINE];
-    struct file *f;
-    ssize_t rd;
-    loff_t pos;
-    pid_t pid;
-    int i;
-    
-    if (!p_filp_open || !p_filp_close || !p_kernel_read) {
-        kpm_err("VFS symbols NULL: open=%px close=%px read=%px\n",
-                p_filp_open, p_filp_close, p_kernel_read);
-        return -EFAULT;
-    }
-    
-    kpm_info("Cmdline scan for '%s'\n", proc_name);
-    
-    for (pid = 1; pid < 32768; pid++) {
-        build_path(pid, "/cmdline", path, sizeof(path));
-        
-        f = p_filp_open(path, HFR_O_RDONLY, 0);
-        if (!f || (unsigned long)f >= (unsigned long)(-4095)) continue;
-        
-        pos = 0;
-        rd = p_kernel_read(f, buf, sizeof(buf) - 1, &pos);
-        p_filp_close(f, NULL);
-        
-        if (rd <= 0) continue;
-        
-        buf[rd] = '\0';
-        // Replace null separators with spaces
-        for (i = 0; i < rd; i++) if (buf[i] == '\0') buf[i] = ' ';
-        
-        // Check if proc_name is substring
-        for (i = 0; buf[i]; i++) {
-            int j;
-            for (j = 0; proc_name[j]; j++) {
-                if (buf[i + j] != proc_name[j]) break;
+        if (task && task->comm) {
+            // Manual string compare (no strstr kallsyms needed)
+            const char *comm = task->comm;
+            int match = 1;
+            
+            for (int i = 0; i < 20 && target[i] && comm[i]; i++) {
+                if (target[i] != comm[i]) {
+                    match = 0;
+                    break;
+                }
             }
-            if (!proc_name[j]) {
-                kpm_info("FOUND by cmdline: PID=%d\n", pid);
-                *out_pid = pid;
-                return 0;
+            
+            if (match) {
+                found_pid = pid;
+                p_rcu_read_unlock();
+                break;
             }
         }
+        p_rcu_read_unlock();
     }
     
-    kpm_err("Cmdline scan complete, not found\n");
-    return -ESRCH;
+    return found_pid;
 }
 
-static void process_rw_packet(struct k_packet *pkt)
-{
-    struct task_struct *task = NULL;
-    struct mm_struct *mm = NULL;
-    int transferred;
-    unsigned int gup_flags;
-    int is_write_op;
-    uint8_t temp_buffer[MAX_INLINE];
-
-    if (!pkt->size || pkt->size > MAX_INLINE) { pkt->status = STATUS_INVALID_SIZE; return; }
-    if (!is_valid_user_address(pkt->vaddr)) { pkt->status = STATUS_INVALID_ADDR; return; }
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) { pkt->status = STATUS_NULL_SYMBOL; return; }
-    if (pkt->target_pid <= 0) { pkt->status = STATUS_OUT_OF_RANGE; return; }
-
-    if (p_rcu_read_lock) p_rcu_read_lock();
-    task = p_find_task_by_vpid(pkt->target_pid);
-    if (!task) { if (p_rcu_read_unlock) p_rcu_read_unlock(); pkt->status = STATUS_NO_TASK; return; }
+// Find libil2cpp.so base by scanning VMA (NO d_path kallsyms)
+static uint64_t find_lib_base_from_mm(pid_t pid) {
+    struct task_struct *task;
+    struct mm_struct *mm;
+    struct vm_area_struct *vma;
+    uint64_t lib_base = 0;
+    const char *target = "libil2cpp.so";
+    
+    if (!p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+        return 0;
+    }
+    
+    task = p_find_task_by_vpid(pid);
+    if (!task) return 0;
+    
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
-    if (p_rcu_read_unlock) p_rcu_read_unlock();
-    if (!mm) { pkt->status = STATUS_NO_MM; if (p_put_task_struct && task) p_put_task_struct(task); return; }
-
-    is_write_op = (pkt->op_code == OP_WRITE_VM);
-    memset(temp_buffer, 0, MAX_INLINE);
-    if (is_write_op) { memcpy(temp_buffer, pkt->inline_data, pkt->size); gup_flags = HFR_FOLL_WRITE | FOLL_FORCE; }
-    else { gup_flags = FOLL_FORCE; }
-
-    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-
-    if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
+    
+    if (!mm) return 0;
+    
+    // Walk VMA list
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+        if (vma->vm_file && vma->vm_file->f_path.dentry) {
+            const char *name = vma->vm_file->f_path.dentry->d_name.name;
+            // Manual string compare (no strstr kallsyms needed)
+            int match = 1;
+            
+            for (int i = 0; i < 12 && target[i] && name[i]; i++) {
+                if (target[i] != name[i]) {
+                    match = 0;
+                    break;
+                }
+            }
+            
+            // Also check if it has "libil2cpp" in the path
+            if (match) {
+                lib_base = vma->vm_start;
+                break;
+            }
+        }
+    }
+    
+    p_mmput(mm);
+    return lib_base;
+}
 
-    if (transferred < 0) { pkt->status = STATUS_VM_FAULT; return; }
-    if (transferred == 0 && pkt->size > 0) { pkt->status = STATUS_PROTECTION; return; }
-    if (!is_write_op && transferred > 0) { memset(pkt->inline_data, 0, MAX_INLINE); memcpy(pkt->inline_data, temp_buffer, transferred); }
-    if ((uint32_t)transferred != pkt->size) { pkt->size = (uint32_t)transferred; pkt->status = STATUS_PARTIAL_IO; return; }
+// ============================================================
+// 🔥 PROCESS PACKET HANDLERS
+// ============================================================
+
+static void process_get_game_info(struct k_packet *pkt) {
+    pid_t found_pid = 0;
+    uint64_t lib_base = 0;
+    
+    kpm_info(">>> process_get_game_info ENTER\n");
+    
+    // Check cache first
+    if (g_game_info.is_found) {
+        // Verify PID still exists
+        struct task_struct *task = p_find_task_by_vpid(g_game_info.game_pid);
+        if (task) {
+            // Cache is valid
+            struct game_info_response *resp = (struct game_info_response *)pkt->inline_data;
+            resp->pid = g_game_info.game_pid;
+            resp->lib_base = g_game_info.lib_base;
+            pkt->size = sizeof(struct game_info_response);
+            pkt->status = STATUS_SUCCESS;
+            kpm_info("Using cached game info: PID=%d, LIB=0x%llx\n", 
+                     g_game_info.game_pid, g_game_info.lib_base);
+            return;
+        } else {
+            // Cache invalid, clear it
+            g_game_info.is_found = false;
+            kpm_info("Cache invalid, clearing\n");
+        }
+    }
+    
+    // Find game process
+    found_pid = find_process_by_comm();
+    if (!found_pid) {
+        kpm_err("Game process not found\n");
+        pkt->status = STATUS_GAME_NOT_FOUND;
+        return;
+    }
+    
+    kpm_info("Found game PID: %d\n", found_pid);
+    
+    // Find lib base
+    lib_base = find_lib_base_from_mm(found_pid);
+    if (!lib_base) {
+        kpm_err("libil2cpp.so not found\n");
+        pkt->status = STATUS_GAME_NOT_FOUND;
+        return;
+    }
+    
+    kpm_info("Found lib base: 0x%llx\n", lib_base);
+    
+    // Cache results
+    g_game_info.game_pid = found_pid;
+    g_game_info.lib_base = lib_base;
+    g_game_info.is_found = true;
+    
+    // Send response
+    struct game_info_response *resp = (struct game_info_response *)pkt->inline_data;
+    resp->pid = found_pid;
+    resp->lib_base = lib_base;
+    pkt->size = sizeof(struct game_info_response);
     pkt->status = STATUS_SUCCESS;
+    
+    kpm_info("<<< process_get_game_info SUCCESS\n");
 }
 
-static void process_find_packet(struct k_packet *pkt)
-{
-    pid_t found_pid = -1;
-    char proc_name[256];
-    int name_len = (int)pkt->size;
+static void process_wait_for_game(struct k_packet *pkt) {
+    int attempts = 0;
+    const int max_attempts = 600; // 30 seconds at 50ms each
+    pid_t found_pid = 0;
+    uint64_t lib_base = 0;
     
-    if (name_len > 255) name_len = 255;
-    memcpy(proc_name, pkt->inline_data, name_len);
-    proc_name[name_len] = '\0';
+    kpm_info(">>> process_wait_for_game ENTER\n");
     
-    kpm_info("Finding: '%s'\n", proc_name);
+    // Check cache first
+    if (g_game_info.is_found) {
+        struct task_struct *task = p_find_task_by_vpid(g_game_info.game_pid);
+        if (task) {
+            struct game_info_response *resp = (struct game_info_response *)pkt->inline_data;
+            resp->pid = g_game_info.game_pid;
+            resp->lib_base = g_game_info.lib_base;
+            pkt->size = sizeof(struct game_info_response);
+            pkt->status = STATUS_SUCCESS;
+            kpm_info("Using cached game info\n");
+            return;
+        } else {
+            g_game_info.is_found = false;
+        }
+    }
     
-    // Method 1: find_task_by_vpid + __get_task_comm scan
-    if (find_process_by_pid_scan(proc_name, &found_pid) == 0 && found_pid > 0)
-        goto success;
+    while (attempts < max_attempts) {
+        // Try to find game
+        found_pid = find_process_by_comm();
+        if (found_pid) {
+            lib_base = find_lib_base_from_mm(found_pid);
+            if (lib_base) {
+                g_game_info.game_pid = found_pid;
+                g_game_info.lib_base = lib_base;
+                g_game_info.is_found = true;
+                break;
+            }
+        }
+        
+        attempts++;
+        // Sleep 50ms
+        set_current_state(TASK_INTERRUPTIBLE);
+        schedule_timeout(msecs_to_jiffies(50));
+    }
     
-    // Method 2: /proc/PID/cmdline VFS scan
-    if (find_process_by_cmdline(proc_name, &found_pid) == 0 && found_pid > 0)
-        goto success;
+    if (g_game_info.is_found) {
+        struct game_info_response *resp = (struct game_info_response *)pkt->inline_data;
+        resp->pid = g_game_info.game_pid;
+        resp->lib_base = g_game_info.lib_base;
+        pkt->size = sizeof(struct game_info_response);
+        pkt->status = STATUS_SUCCESS;
+        kpm_info("Game found after %dms: PID=%d, LIB=0x%llx\n", 
+                 attempts * 50, g_game_info.game_pid, g_game_info.lib_base);
+    } else {
+        kpm_err("Game not found after %d attempts\n", attempts);
+        pkt->status = STATUS_GAME_NOT_FOUND;
+    }
     
-    // Not found
-    pkt->target_pid = 0;
-    pkt->vaddr = 0;
-    pkt->size = 0;
-    pkt->status = STATUS_NOT_FOUND;
-    kpm_err("NOT FOUND: '%s'\n", proc_name);
-    return;
-    
-success:
-    pkt->target_pid = (uint32_t)found_pid;
-    pkt->vaddr = (uint64_t)found_pid;
-    pkt->size = (uint32_t)found_pid;
-    pkt->status = STATUS_SUCCESS;
-    kpm_info("SUCCESS: PID=%d\n", found_pid);
-}
-
-static int read_process_maps(pid_t pid, char *buffer, size_t buf_size, loff_t offset, size_t *bytes_read)
-{
-    char path[64];
-    struct file *f = NULL;
-    ssize_t rd;
-    loff_t pos = offset;
-    
-    if (!p_filp_open || !p_filp_close || !p_kernel_read) return -EFAULT;
-    
-    build_path(pid, "/maps", path, sizeof(path));
-    f = p_filp_open(path, HFR_O_RDONLY, 0);
-    if (!f || (unsigned long)f >= (unsigned long)(-4095)) return -ENOENT;
-    rd = p_kernel_read(f, buffer, buf_size, &pos);
-    p_filp_close(f, NULL);
-    if (rd < 0) return -EIO;
-    *bytes_read = (size_t)rd;
-    return 0;
-}
-
-static void process_maps_packet(struct k_packet *pkt)
-{
-    size_t bytes_read = 0;
-    int ret;
-    if (pkt->target_pid <= 0) { pkt->status = STATUS_OUT_OF_RANGE; return; }
-    ret = read_process_maps(pkt->target_pid, (char *)pkt->inline_data, MAX_INLINE, (loff_t)pkt->vaddr, &bytes_read);
-    if (ret == 0) {
-        pkt->size = (uint32_t)bytes_read;
-        pkt->vaddr = (loff_t)pkt->vaddr + bytes_read;
-        pkt->status = (bytes_read == 0) ? STATUS_EOF : STATUS_SUCCESS;
-    } else { pkt->size = 0; pkt->status = STATUS_NO_FILE; }
-}
-
-static void process_check_packet(struct k_packet *pkt)
-{
-    struct task_struct *task;
-    if (pkt->target_pid <= 0 || !p_find_task_by_vpid) { pkt->status = STATUS_OUT_OF_RANGE; return; }
-    task = p_find_task_by_vpid(pkt->target_pid);
-    pkt->status = task ? STATUS_SUCCESS : STATUS_NO_TASK;
+    kpm_info("<<< process_wait_for_game EXIT\n");
 }
 
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
-    switch (pkt->op_code) {
-        case OP_READ_VM: case OP_WRITE_VM: process_rw_packet(pkt); break;
-        case OP_FIND_PROCESS: process_find_packet(pkt); break;
-        case OP_READ_MAPS: process_maps_packet(pkt); break;
-        case OP_CHECK_PROCESS: process_check_packet(pkt); break;
-        default: pkt->status = STATUS_BAD_OPCODE; break;
+    struct task_struct *task = NULL;
+    struct mm_struct *mm = NULL;
+    pid_t target_pid;
+    int transferred;
+    unsigned int gup_flags;
+    int is_write_op = 0;
+    uint8_t temp_buffer[MAX_INLINE];
+
+    // Handle new opcodes first
+    if (pkt->op_code == OP_GET_GAME_INFO) {
+        process_get_game_info(pkt);
+        return;
     }
+    
+    if (pkt->op_code == OP_WAIT_GAME) {
+        process_wait_for_game(pkt);
+        return;
+    }
+
+    // Original read/write handling
+    if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
+        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
+        pkt->status = STATUS_BAD_OPCODE;
+        return;
+    }
+
+    if (!pkt->size || pkt->size > MAX_INLINE) {
+        kpm_err("INVALID_SIZE: %u\n", pkt->size);
+        pkt->status = STATUS_INVALID_SIZE;
+        return;
+    }
+
+    if (!is_valid_user_address(pkt->vaddr)) {
+        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
+        pkt->status = STATUS_INVALID_ADDR;
+        return;
+    }
+
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+        kpm_err("NULL_SYMBOL\n");
+        pkt->status = STATUS_NULL_SYMBOL;
+        return;
+    }
+
+    target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
+    kpm_info("target_pid resolved: %d\n", target_pid);
+    
+    if (target_pid <= 0) {
+        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
+        pkt->status = STATUS_OUT_OF_RANGE;
+        return;
+    }
+
+    if (p_rcu_read_lock) p_rcu_read_lock();
+
+    task = p_find_task_by_vpid(target_pid);
+    kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
+    
+    if (!task) {
+        if (p_rcu_read_unlock) p_rcu_read_unlock();
+        kpm_err("NO_TASK for pid=%d\n", target_pid);
+        pkt->status = STATUS_NO_TASK;
+        return;
+    }
+
+    if (p_get_task_struct) p_get_task_struct(task);
+    mm = p_get_task_mm(task);
+    kpm_info("get_task_mm = %px\n", mm);
+
+    if (p_rcu_read_unlock) p_rcu_read_unlock();
+
+    if (!mm) {
+        kpm_err("NO_MM\n");
+        pkt->status = STATUS_NO_MM;
+        if (p_put_task_struct && task) p_put_task_struct(task);
+        return;
+    }
+
+    is_write_op = (pkt->op_code == OP_WRITE_VM);
+    memset(temp_buffer, 0, MAX_INLINE);
+    
+    if (is_write_op) {
+        memcpy(temp_buffer, pkt->inline_data, pkt->size);
+        gup_flags = HFR_FOLL_WRITE | FOLL_FORCE;
+    } else {
+        gup_flags = FOLL_FORCE;
+    }
+
+    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
+             task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
+    
+    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
+    kpm_info("access_process_vm returned: %d\n", transferred);
+
+    if (mm) p_mmput(mm);
+    if (p_put_task_struct && task) p_put_task_struct(task);
+
+    if (transferred < 0) {
+        kpm_err("VM_FAULT: %d\n", transferred);
+        pkt->status = STATUS_VM_FAULT;
+        return;
+    }
+
+    if (transferred == 0 && pkt->size > 0) {
+        kpm_err("PROTECTION\n");
+        pkt->status = STATUS_PROTECTION;
+        return;
+    }
+
+    if (!is_write_op && transferred > 0) {
+        memset(pkt->inline_data, 0, MAX_INLINE);
+        memcpy(pkt->inline_data, temp_buffer, transferred);
+    }
+
+    if ((uint32_t)transferred != pkt->size) {
+        kpm_info("PARTIAL_IO: wanted %u got %d\n", pkt->size, transferred);
+        pkt->size = (uint32_t)transferred;
+        pkt->status = STATUS_PARTIAL_IO;
+        return;
+    }
+
+    kpm_info("<<< process_packet SUCCESS\n");
+    pkt->status = STATUS_SUCCESS;
 }
 
 static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
@@ -410,29 +505,77 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    if (count != sizeof(struct k_packet)) return -EINVAL;
-    if (!p_copy_from_user || p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) return -EFAULT;
+    kpm_info("*** proc_write_handler: count=%zu expected=%zu\n", count, sizeof(struct k_packet));
+
+    if (count != sizeof(struct k_packet)) {
+        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
+        return -EINVAL;
+    }
+
+    if (!p_copy_from_user) {
+        kpm_err("copy_from_user NULL\n");
+        return -EFAULT;
+    }
+    
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_from_user failed\n");
+        return -EFAULT;
+    }
+
     curr_task = hfr_get_current();
-    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
+    if (!curr_task) {
+        kpm_err("get_current failed\n");
+        return -ESRCH;
+    }
+
+    if (!p_task_pid_nr_ns) {
+        kpm_err("task_pid_nr_ns NULL\n");
+        return -EFAULT;
+    }
+
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) return -ESRCH;
+    kpm_info("caller_pid from current task: %d\n", caller_pid);
+    
+    if (caller_pid <= 0) {
+        kpm_err("Invalid caller_pid: %d\n", caller_pid);
+        return -ESRCH;
+    }
+
     if (p_mutex_lock) p_mutex_lock(&hfr_mutex);
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) return -EFAULT;
+
+    if (!p_copy_to_user) {
+        kpm_err("copy_to_user NULL\n");
+        return -EFAULT;
+    }
+    
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+        kpm_err("copy_to_user failed\n");
+        return -EFAULT;
+    }
+
+    kpm_info("*** proc_write_handler SUCCESS\n");
     return (ssize_t)count;
 }
 
 static const struct proc_ops p_ops = {
-    .proc_open = proc_open_handler,
-    .proc_read = proc_read_handler,
-    .proc_write = proc_write_handler,
+    .proc_flags   = 0,
+    .proc_open    = proc_open_handler,
+    .proc_read    = proc_read_handler,
+    .proc_read_iter = NULL,
+    .proc_write   = proc_write_handler,
+    .proc_lseek   = NULL,
     .proc_release = proc_release_handler,
+    .proc_poll    = NULL,
+    .proc_ioctl   = NULL,
+    .proc_mmap    = NULL,
+    .proc_get_unmapped_area = NULL,
 };
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT v2.0.3 ===\n");
+    kpm_info("=== INIT START ===\n");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -447,37 +590,40 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
+    p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
+    p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
-    p_filp_open = (filp_open_t)kallsyms_lookup_name("filp_open");
-    p_filp_close = (filp_close_t)kallsyms_lookup_name("filp_close");
-    p_kernel_read = (kernel_read_t)kallsyms_lookup_name("kernel_read");
-    
-    // 🔥 Use __get_task_comm (your kernel has this, not get_task_comm)
-    p_get_task_comm_fn = (get_task_comm_t)kallsyms_lookup_name("__get_task_comm");
-    if (!p_get_task_comm_fn) p_get_task_comm_fn = (get_task_comm_t)kallsyms_lookup_name("get_task_comm");
-    
-    kpm_info("Symbols: proc=%px vm=%px task=%px mm=%px comm=%px open=%px read=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid,
-             p_get_task_mm, p_get_task_comm_fn, p_filp_open, p_kernel_read);
+
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
-    
+
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
+
     proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
-    if (!proc_entry) { kpm_err("proc_create FAILED\n"); return -EFAULT; }
-    
-    kpm_info("=== SUCCESS /proc/%s ===\n", proc_filename);
+    if (!proc_entry) {
+        kpm_err("proc_create FAILED\n");
+        return -EFAULT;
+    }
+
+    // Clear game info cache
+    memset(&g_game_info, 0, sizeof(g_game_info));
+
+    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
+    kpm_info("=== EXIT ===\n");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
