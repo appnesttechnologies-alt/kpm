@@ -13,8 +13,9 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/uaccess.h>
-#include <linux/vmalloc.h>
-#include <linux/pagemap.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION("2.0.0");
@@ -37,8 +38,8 @@ KPM_DESCRIPTION("Complete Kernel Memory Bridge - No Root Syscalls");
 
 #define MAX_INLINE           256
 #define MAX_PATH_LEN         512
-#define TARGET_PROC_NAME     "com.dts.freefiremax"
-#define TARGET_LIB_NAME      "libil2cpp.so"
+#define HFR_FOLL_WRITE       0x01
+#define FOLL_FORCE           0x10
 
 // Opcodes
 #define OP_READ_VM           0x2000
@@ -46,7 +47,6 @@ KPM_DESCRIPTION("Complete Kernel Memory Bridge - No Root Syscalls");
 #define OP_FIND_PROCESS      0x2002
 #define OP_GET_MODULE_BASE   0x2003
 #define OP_CHECK_PROCESS     0x2004
-#define OP_INIT_MODULE       0x2005
 
 // Status codes
 #define STATUS_SUCCESS        0x0000
@@ -63,11 +63,8 @@ KPM_DESCRIPTION("Complete Kernel Memory Bridge - No Root Syscalls");
 #define STATUS_NOT_FOUND      0x100F
 #define STATUS_NO_MODULE      0x1010
 
-#define HFR_FOLL_WRITE        0x01
-#define FOLL_FORCE            0x10
-
 // ╔══════════════════════════════════════════════════════════════╗
-// ║                PACKET STRUCTURES                             ║
+// ║                PACKET STRUCTURE                              ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 struct k_packet {
@@ -79,16 +76,9 @@ struct k_packet {
     uint8_t  inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-// Extended packet for module base query
-struct k_packet_ext {
-    uint32_t op_code;
-    uint32_t target_pid;
-    uint64_t vaddr;          // On return: module base address
-    uint32_t size;           // On return: module size
-    uint32_t status;
-    char     module_name[128];
-    uint8_t  reserved[128 - sizeof(uint32_t)*5 - 128];
-} __attribute__((aligned(8), packed));
+// ╔══════════════════════════════════════════════════════════════╗
+// ║             PROCFS STRUCTURES (Android KPM)                  ║
+// ╚══════════════════════════════════════════════════════════════╝
 
 struct inode;
 struct file;
@@ -120,7 +110,7 @@ struct mutex {
 };
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               FUNCTION POINTERS                              ║
+// ║               FUNCTION POINTER TYPEDEFS                      ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
@@ -140,9 +130,10 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 typedef struct task_struct *(*next_task_t)(struct task_struct *);
-typedef struct file *(*fget_t)(unsigned int);
-typedef void (*fput_t)(struct file *);
-typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║               GLOBAL FUNCTION POINTERS                       ║
+// ╚══════════════════════════════════════════════════════════════╝
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -179,12 +170,10 @@ static inline struct task_struct *hfr_get_current(void)
 
 static inline int is_valid_user_address(uint64_t addr)
 {
-    if (addr == 0) return 0;
-    if (addr >= (1ULL << 63)) return 0;
-    return 1;
+    return (addr >= 0x1000 && addr < (1ULL << 63));
 }
 
-// Kernel-side strcmp (no userspace dependency)
+// Simple kernel-side string comparison
 static int kstr_match(const char *a, const char *b)
 {
     while (*a && *b) {
@@ -194,34 +183,31 @@ static int kstr_match(const char *a, const char *b)
     return (*a == *b);
 }
 
-static int kstr_contains(const char *haystack, const char *needle)
+// Check if needle is at the end of haystack
+static int kstr_ends_with(const char *haystack, const char *needle)
 {
-    int needle_len = 0;
-    while (needle[needle_len]) needle_len++;
-    if (!needle_len) return 0;
+    int hlen = 0, nlen = 0;
+    while (haystack[hlen]) hlen++;
+    while (needle[nlen]) nlen++;
     
-    while (*haystack) {
-        int match = 1;
-        for (int i = 0; i < needle_len; i++) {
-            if (haystack[i] != needle[i]) { match = 0; break; }
-        }
-        if (match) return 1;
-        haystack++;
+    if (nlen > hlen) return 0;
+    
+    for (int i = 0; i < nlen; i++) {
+        if (haystack[hlen - nlen + i] != needle[i]) return 0;
     }
-    return 0;
+    return 1;
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║           OP_FIND_PROCESS - Find PID by cmdline              ║
+// ║           OP_FIND_PROCESS - Find PID by task_struct scan     ║
 // ╚══════════════════════════════════════════════════════════════╝
 
-static int find_process_by_name(const char *proc_name, pid_t *out_pid)
+static int find_process_by_comm(const char *proc_name, pid_t *out_pid)
 {
     struct task_struct *task;
-    pid_t found_pid = -1;
     char comm[TASK_COMM_LEN];
     
-    if (!p_next_task || !p_rcu_read_lock || !p_rcu_read_unlock) {
+    if (!p_next_task || !p_rcu_read_lock || !p_rcu_read_unlock || !p_task_pid_nr_ns) {
         kpm_err("Missing symbols for process scan\n");
         return -EFAULT;
     }
@@ -231,32 +217,30 @@ static int find_process_by_name(const char *proc_name, pid_t *out_pid)
     for (task = hfr_get_current(); task; task = p_next_task(task)) {
         if (!task) break;
         
+        // get_task_comm is a kernel macro, not a symbol lookup
         get_task_comm(comm, task);
         
         if (kstr_match(comm, proc_name)) {
             if (p_get_task_struct) p_get_task_struct(task);
-            found_pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
+            *out_pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
             if (p_put_task_struct) p_put_task_struct(task);
-            break;
+            p_rcu_read_unlock();
+            kpm_info("Found process '%s': PID=%d\n", proc_name, *out_pid);
+            return 0;
         }
     }
     
     p_rcu_read_unlock();
-    
-    if (found_pid > 0) {
-        *out_pid = found_pid;
-        return 0;
-    }
-    
-    kpm_err("Process '%s' not found\n", proc_name);
+    kpm_err("Process '%s' not found in task list\n", proc_name);
     return -ESRCH;
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║     OP_GET_MODULE_BASE - Find library base from maps         ║
+// ║     OP_GET_MODULE_BASE - Find library base from VMA tree     ║
 // ╚══════════════════════════════════════════════════════════════╝
 
-static int get_module_base(pid_t pid, const char *lib_name, uint64_t *out_base, uint32_t *out_size)
+static int get_module_base_from_vma(pid_t pid, const char *lib_name, 
+                                     uint64_t *out_base, uint32_t *out_size)
 {
     struct task_struct *task;
     struct mm_struct *mm;
@@ -273,6 +257,7 @@ static int get_module_base(pid_t pid, const char *lib_name, uint64_t *out_base, 
     task = p_find_task_by_vpid(pid);
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
+        kpm_err("Task not found for PID %d\n", pid);
         return -ESRCH;
     }
     
@@ -281,11 +266,12 @@ static int get_module_base(pid_t pid, const char *lib_name, uint64_t *out_base, 
     if (p_rcu_read_unlock) p_rcu_read_unlock();
     
     if (!mm) {
+        kpm_err("No mm_struct for PID %d\n", pid);
         if (p_put_task_struct && task) p_put_task_struct(task);
         return -ESRCH;
     }
     
-    // Traverse VMAs to find the library
+    // Lock mmap_sem
     #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
     mmap_read_lock(mm);
     #else
@@ -297,23 +283,27 @@ static int get_module_base(pid_t pid, const char *lib_name, uint64_t *out_base, 
             char *path_buf = NULL;
             char *path;
             
-            path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
-            if (path_buf) {
-                path = d_path(&vma->vm_file->f_path, path_buf, PATH_MAX);
-                if (!IS_ERR(path)) {
-                    if (kstr_contains(path, lib_name)) {
-                        uint64_t vma_size = vma->vm_end - vma->vm_start;
-                        // First readable mapping of this library
-                        if (found_base == 0 && (vma->vm_flags & VM_READ)) {
-                            found_base = vma->vm_start;
-                            found_size = (uint32_t)vma_size;
-                        }
-                        kpm_info("Found %s: 0x%llx-0x%llx size=0x%llx flags=0x%lx\n",
-                                 lib_name, vma->vm_start, vma->vm_end, vma_size, vma->vm_flags);
+            path_buf = (char *)kmalloc(PATH_MAX, GFP_KERNEL);
+            if (!path_buf) continue;
+            
+            path = d_path(&vma->vm_file->f_path, path_buf, PATH_MAX);
+            if (!IS_ERR(path)) {
+                // Check if path ends with our library name
+                if (kstr_ends_with(path, lib_name)) {
+                    uint64_t vma_size = vma->vm_end - vma->vm_start;
+                    
+                    // Take the first readable+executable mapping as base
+                    if (found_base == 0 && (vma->vm_flags & VM_READ)) {
+                        found_base = vma->vm_start;
+                        // Calculate total size by looking at contiguous mappings
+                        // of the same file
+                        found_size = (uint32_t)vma_size;
+                        kpm_info("Library '%s' found: base=0x%llx size=0x%llx flags=0x%lx path=%s\n",
+                                 lib_name, vma->vm_start, vma_size, vma->vm_flags, path);
                     }
                 }
-                kfree(path_buf);
             }
+            kfree(path_buf);
         }
     }
     
@@ -332,11 +322,12 @@ static int get_module_base(pid_t pid, const char *lib_name, uint64_t *out_base, 
         return 0;
     }
     
+    kpm_err("Library '%s' not found in process %d\n", lib_name, pid);
     return -ENOENT;
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║              OP_READ_VM / OP_WRITE_VM                       ║
+// ║              OP_READ_VM / OP_WRITE_VM                        ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 static void process_rw_packet(struct k_packet *pkt)
@@ -346,7 +337,7 @@ static void process_rw_packet(struct k_packet *pkt)
     pid_t target_pid;
     int transferred;
     unsigned int gup_flags;
-    int is_write_op = 0;
+    int is_write_op;
     uint8_t temp_buffer[MAX_INLINE];
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
@@ -398,7 +389,8 @@ static void process_rw_packet(struct k_packet *pkt)
         gup_flags = FOLL_FORCE;
     }
 
-    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
+    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, 
+                                       temp_buffer, (int)pkt->size, gup_flags);
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
@@ -428,33 +420,29 @@ static void process_rw_packet(struct k_packet *pkt)
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               PROCESS FIND PACKET                           ║
+// ║               OP_FIND_PROCESS HANDLER                        ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 static void process_find_packet(struct k_packet *pkt)
 {
     pid_t found_pid = -1;
+    char proc_name[256];
+    int name_len;
     int ret;
     
-    // inline_data contains the process name (null-terminated)
-    char proc_name[256];
-    int name_len = (int)pkt->size;
+    name_len = (int)pkt->size;
     if (name_len > 255) name_len = 255;
     memcpy(proc_name, pkt->inline_data, name_len);
     proc_name[name_len] = '\0';
     
     kpm_info("Finding process: '%s'\n", proc_name);
     
-    ret = find_process_by_name(proc_name, &found_pid);
+    ret = find_process_by_comm(proc_name, &found_pid);
     
     if (ret == 0 && found_pid > 0) {
-        // Return PID in the packet
-        // Using vaddr field temporarily for PID (kludge, fix with extended packet)
-        pkt->vaddr = (uint64_t)found_pid;
         pkt->target_pid = (uint32_t)found_pid;
-        pkt->size = (uint32_t)found_pid;  // Duplicate for safety
+        pkt->vaddr = (uint64_t)found_pid;  // Extra copy for safety
         pkt->status = STATUS_SUCCESS;
-        kpm_info("Found PID: %d\n", found_pid);
     } else {
         pkt->target_pid = 0;
         pkt->vaddr = 0;
@@ -462,28 +450,31 @@ static void process_find_packet(struct k_packet *pkt)
     }
 }
 
+// ╔══════════════════════════════════════════════════════════════╗
+// ║               OP_GET_MODULE_BASE HANDLER                     ║
+// ╚══════════════════════════════════════════════════════════════╝
+
 static void process_module_packet(struct k_packet *pkt)
 {
     uint64_t module_base = 0;
     uint32_t module_size = 0;
+    char lib_name[256];
+    int name_len;
     int ret;
     
-    // inline_data contains the library name
-    char lib_name[256];
-    int name_len = (int)pkt->size;
+    name_len = (int)pkt->size;
     if (name_len > 255) name_len = 255;
     memcpy(lib_name, pkt->inline_data, name_len);
     lib_name[name_len] = '\0';
     
     kpm_info("Finding module '%s' for PID %d\n", lib_name, pkt->target_pid);
     
-    ret = get_module_base(pkt->target_pid, lib_name, &module_base, &module_size);
+    ret = get_module_base_from_vma(pkt->target_pid, lib_name, &module_base, &module_size);
     
     if (ret == 0 && module_base > 0) {
         pkt->vaddr = module_base;
         pkt->size = module_size;
         pkt->status = STATUS_SUCCESS;
-        kpm_info("Module base: 0x%llx size: 0x%x\n", module_base, module_size);
     } else {
         pkt->vaddr = 0;
         pkt->size = 0;
@@ -492,13 +483,38 @@ static void process_module_packet(struct k_packet *pkt)
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               MAIN PACKET PROCESSOR                         ║
+// ║               OP_CHECK_PROCESS HANDLER                       ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+static void process_check_packet(struct k_packet *pkt)
+{
+    struct task_struct *task;
+    
+    if (pkt->target_pid <= 0) {
+        pkt->status = STATUS_OUT_OF_RANGE;
+        return;
+    }
+    
+    if (!p_find_task_by_vpid) {
+        pkt->status = STATUS_NULL_SYMBOL;
+        return;
+    }
+    
+    if (p_rcu_read_lock) p_rcu_read_lock();
+    task = p_find_task_by_vpid((pid_t)pkt->target_pid);
+    if (p_rcu_read_unlock) p_rcu_read_unlock();
+    
+    pkt->status = task ? STATUS_SUCCESS : STATUS_NO_TASK;
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║               MAIN PACKET DISPATCHER                         ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
-    kpm_info("Packet: op=0x%x pid=%u addr=0x%llx size=%u\n",
-             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size);
+    kpm_info("Packet: op=0x%x pid=%u addr=0x%llx size=%u caller=%d\n",
+             pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
     switch (pkt->op_code) {
         case OP_READ_VM:
@@ -515,16 +531,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
             break;
             
         case OP_CHECK_PROCESS:
-            // Quick check if a PID is still valid
-            if (pkt->target_pid > 0 && p_find_task_by_vpid) {
-                struct task_struct *t;
-                if (p_rcu_read_lock) p_rcu_read_lock();
-                t = p_find_task_by_vpid((pid_t)pkt->target_pid);
-                if (p_rcu_read_unlock) p_rcu_read_unlock();
-                pkt->status = t ? STATUS_SUCCESS : STATUS_NO_TASK;
-            } else {
-                pkt->status = STATUS_BAD_OPCODE;
-            }
+            process_check_packet(pkt);
             break;
             
         default:
@@ -535,14 +542,27 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 }
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               PROC FILE HANDLERS                            ║
+// ║               PROCFS FILE HANDLERS                           ║
 // ╚══════════════════════════════════════════════════════════════╝
 
-static int proc_open_handler(struct inode *inode, struct file *file) { return 0; }
-static int proc_release_handler(struct inode *inode, struct file *file) { return 0; }
-static ssize_t proc_read_handler(struct file *file, char __user *buffer, size_t count, loff_t *pos) { return 0; }
+static int proc_open_handler(struct inode *inode, struct file *file) 
+{ 
+    return 0; 
+}
 
-static ssize_t proc_write_handler(struct file *file, const char __user *buffer, size_t count, loff_t *pos)
+static int proc_release_handler(struct inode *inode, struct file *file) 
+{ 
+    return 0; 
+}
+
+static ssize_t proc_read_handler(struct file *file, char __user *buffer, 
+                                  size_t count, loff_t *pos) 
+{ 
+    return 0; 
+}
+
+static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
+                                   size_t count, loff_t *pos)
 {
     struct k_packet local_pkt;
     pid_t caller_pid;
@@ -613,13 +633,14 @@ static const struct proc_ops p_ops = {
 };
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║               INIT / EXIT                                   ║
+// ║               INIT / EXIT                                    ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
     kpm_info("=== INIT START ===\n");
     
+    // Resolve all kernel symbols
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
     p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
@@ -640,21 +661,24 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
     p_next_task = (next_task_t)kallsyms_lookup_name("next_task");
 
-    kpm_info("Symbols resolved: proc=%px vm=%px task=%px pid=%px mm=%px\n",
+    kpm_info("Symbols: proc_create=%px access_vm=%px find_task=%px get_mm=%px next_task=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, 
-             p_task_pid_nr_ns, p_get_task_mm);
-    kpm_info("next_task=%px\n", p_next_task);
+             p_get_task_mm, p_next_task);
 
+    // Critical symbols check
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || 
         !p_copy_to_user) {
         kpm_err("CRITICAL SYMBOL MISSING\n");
+        kpm_err("proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px cfu=%px ctu=%px\n",
+                p_proc_create_data, p_access_process_vm, p_find_task_by_vpid,
+                p_task_pid_nr_ns, p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
         return -EFAULT;
     }
     
     if (!p_next_task) {
-        kpm_err("WARNING: next_task not found - process scanning disabled\n");
-        // Don't fail - process scanning won't work but R/W will
+        kpm_err("WARNING: next_task not found - process scanning will fail\n");
+        // Don't hard fail - R/W will still work
     }
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
@@ -672,7 +696,9 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 static long hfr_memory_exit(void __user *reserved)
 {
     kpm_info("=== EXIT ===\n");
-    if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
+    if (proc_entry && p_remove_proc_entry) {
+        p_remove_proc_entry(proc_filename, NULL);
+    }
     return 0;
 }
 
