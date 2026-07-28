@@ -30,6 +30,14 @@ KPM_DESCRIPTION("Kernel Memory Bridge with Process Discovery");
 #endif
 
 // ╔══════════════════════════════════════════════════════════════╗
+// ║               BUILTIN WRAPPERS (no symbol lookup needed)     ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+#define hfr_memcpy(d, s, n)  __builtin_memcpy((d), (s), (n))
+#define hfr_memset(d, c, n)  __builtin_memset((d), (c), (n))
+#define hfr_memcmp(a, b, n)  __builtin_memcmp((a), (b), (n))
+
+// ╔══════════════════════════════════════════════════════════════╗
 // ║                     CONSTANTS                                ║
 // ╚══════════════════════════════════════════════════════════════╝
 
@@ -46,7 +54,7 @@ KPM_DESCRIPTION("Kernel Memory Bridge with Process Discovery");
 #define HFR_FOLL_WRITE       0x01
 #define FOLL_FORCE           0x10
 
-// File open flags (not in KPM headers)
+// File open flags
 #define HFR_O_RDONLY         00
 
 // Status codes
@@ -79,7 +87,7 @@ struct k_packet {
 } __attribute__((aligned(8), packed));
 
 // ╔══════════════════════════════════════════════════════════════╗
-// ║             PROCFS STRUCTURES (KPM compatible)               ║
+// ║             PROCFS STRUCTURES                                ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 struct inode;
@@ -133,7 +141,7 @@ typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 typedef struct task_struct *(*next_task_t)(struct task_struct *);
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
-typedef int (*filp_close_t)(struct file *, void *);  // ✅ FIXED: void* instead of fl_owner_t
+typedef int (*filp_close_t)(struct file *, void *);
 typedef ssize_t (*kernel_read_t)(struct file *, void *, size_t, loff_t *);
 
 // ╔══════════════════════════════════════════════════════════════╗
@@ -225,21 +233,15 @@ static void build_maps_path(int pid, char *buf, int buf_size)
     int pid_len;
     int i;
     
-    // Copy "/proc/"
-    for (i = 0; prefix[i] && pos < buf_size - 1; i++) {
+    for (i = 0; prefix[i] && pos < buf_size - 1; i++)
         buf[pos++] = prefix[i];
-    }
     
-    // Copy PID
     pid_len = int_to_str(pid, pid_str);
-    for (i = 0; i < pid_len && pos < buf_size - 1; i++) {
+    for (i = 0; i < pid_len && pos < buf_size - 1; i++)
         buf[pos++] = pid_str[i];
-    }
     
-    // Copy "/maps"
-    for (i = 0; suffix[i] && pos < buf_size - 1; i++) {
+    for (i = 0; suffix[i] && pos < buf_size - 1; i++)
         buf[pos++] = suffix[i];
-    }
     
     buf[pos] = '\0';
 }
@@ -263,7 +265,6 @@ static int find_process_by_comm(const char *proc_name, pid_t *out_pid)
     for (task = hfr_get_current(); task; task = p_next_task(task)) {
         if (!task) break;
         
-        // ✅ FIXED: get_task_comm returns const char* in KPM, not 2-arg version
         comm = get_task_comm(task);
         
         if (comm && kstr_match(comm, proc_name)) {
@@ -271,7 +272,6 @@ static int find_process_by_comm(const char *proc_name, pid_t *out_pid)
             *out_pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
             if (p_put_task_struct) p_put_task_struct(task);
             p_rcu_read_unlock();
-            kpm_info("Found process '%s': PID=%d\n", proc_name, *out_pid);
             return 0;
         }
     }
@@ -297,26 +297,18 @@ static int read_process_maps(pid_t pid, char *buffer, size_t buf_size,
         return -EFAULT;
     }
     
-    // ✅ FIXED: Build path manually instead of snprintf
     build_maps_path(pid, path, sizeof(path));
     
-    // ✅ FIXED: Use HFR_O_RDONLY instead of O_RDONLY
     f = p_filp_open(path, HFR_O_RDONLY, 0);
     
-    // ✅ FIXED: Simple NULL check instead of IS_ERR
     if (!f || (unsigned long)f >= (unsigned long)(-4095)) {
-        kpm_err("Cannot open %s (err=%ld)\n", path, (long)f);
         return -ENOENT;
     }
     
     rd = p_kernel_read(f, buffer, buf_size, &pos);
-    
     p_filp_close(f, NULL);
     
-    if (rd < 0) {
-        kpm_err("kernel_read failed: %zd\n", rd);
-        return -EIO;
-    }
+    if (rd < 0) return -EIO;
     
     *bytes_read = (size_t)rd;
     return 0;
@@ -376,10 +368,10 @@ static void process_rw_packet(struct k_packet *pkt)
     }
 
     is_write_op = (pkt->op_code == OP_WRITE_VM);
-    memset(temp_buffer, 0, MAX_INLINE);
+    hfr_memset(temp_buffer, 0, MAX_INLINE);
     
     if (is_write_op) {
-        memcpy(temp_buffer, pkt->inline_data, pkt->size);
+        hfr_memcpy(temp_buffer, pkt->inline_data, pkt->size);
         gup_flags = HFR_FOLL_WRITE | FOLL_FORCE;
     } else {
         gup_flags = FOLL_FORCE;
@@ -402,8 +394,8 @@ static void process_rw_packet(struct k_packet *pkt)
     }
 
     if (!is_write_op && transferred > 0) {
-        memset(pkt->inline_data, 0, MAX_INLINE);
-        memcpy(pkt->inline_data, temp_buffer, transferred);
+        hfr_memset(pkt->inline_data, 0, MAX_INLINE);
+        hfr_memcpy(pkt->inline_data, temp_buffer, transferred);
     }
 
     if ((uint32_t)transferred != pkt->size) {
@@ -427,7 +419,7 @@ static void process_find_packet(struct k_packet *pkt)
     
     name_len = (int)pkt->size;
     if (name_len > 255) name_len = 255;
-    memcpy(proc_name, pkt->inline_data, name_len);
+    hfr_memcpy(proc_name, pkt->inline_data, name_len);
     proc_name[name_len] = '\0';
     
     if (find_process_by_comm(proc_name, &found_pid) == 0 && found_pid > 0) {
@@ -463,11 +455,7 @@ static void process_maps_packet(struct k_packet *pkt)
     if (ret == 0) {
         pkt->size = (uint32_t)bytes_read;
         pkt->vaddr = offset + bytes_read;
-        if (bytes_read == 0) {
-            pkt->status = STATUS_EOF;
-        } else {
-            pkt->status = STATUS_SUCCESS;
-        }
+        pkt->status = (bytes_read == 0) ? STATUS_EOF : STATUS_SUCCESS;
     } else {
         pkt->size = 0;
         pkt->status = STATUS_NO_FILE;
@@ -534,24 +522,16 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer,
     struct task_struct *curr_task;
 
     if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH\n");
         return -EINVAL;
     }
 
-    if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL\n");
-        return -EFAULT;
-    }
+    if (!p_copy_from_user) return -EFAULT;
     
-    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_from_user failed\n");
+    if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0)
         return -EFAULT;
-    }
 
     curr_task = hfr_get_current();
-    if (!curr_task || !p_task_pid_nr_ns) {
-        return -ESRCH;
-    }
+    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
     if (caller_pid <= 0) return -ESRCH;
@@ -560,25 +540,17 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer,
     process_packet(&local_pkt, caller_pid);
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
-    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
+    if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0)
         return -EFAULT;
-    }
 
     return (ssize_t)count;
 }
 
 static const struct proc_ops p_ops = {
-    .proc_flags   = 0,
     .proc_open    = proc_open_handler,
     .proc_read    = proc_read_handler,
-    .proc_read_iter = NULL,
     .proc_write   = proc_write_handler,
-    .proc_lseek   = NULL,
     .proc_release = proc_release_handler,
-    .proc_poll    = NULL,
-    .proc_ioctl   = NULL,
-    .proc_mmap    = NULL,
-    .proc_get_unmapped_area = NULL,
 };
 
 // ╔══════════════════════════════════════════════════════════════╗
@@ -612,12 +584,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_filp_close = (filp_close_t)kallsyms_lookup_name("filp_close");
     p_kernel_read = (kernel_read_t)kallsyms_lookup_name("kernel_read");
 
-    kpm_info("Core: proc=%px vm=%px task=%px mm=%px next=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, 
-             p_get_task_mm, p_next_task);
-    kpm_info("VFS: filp_open=%px filp_close=%px kernel_read=%px\n",
-             p_filp_open, p_filp_close, p_kernel_read);
-
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || 
         !p_copy_to_user) {
@@ -639,10 +605,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===\n");
-    if (proc_entry && p_remove_proc_entry) {
+    if (proc_entry && p_remove_proc_entry)
         p_remove_proc_entry(proc_filename, NULL);
-    }
     return 0;
 }
 
