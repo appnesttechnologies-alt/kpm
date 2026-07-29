@@ -12,8 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/sched.h>
-#include <linux/sched/task.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -33,8 +31,6 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 #define MAX_INLINE     256
 #define OP_READ_VM     0x2000
 #define OP_WRITE_VM    0x3000
-#define OP_FIND_PID_BY_NAME  0x4000
-#define OP_FIND_LIB_BASE     0x5000
 
 #define STATUS_SUCCESS        0x0000
 #define STATUS_INVALID_SIZE   0x1005
@@ -47,11 +43,10 @@ KPM_DESCRIPTION("KPM Dynamic Symbol Resolved Memory Bridge via access_process_vm
 #define STATUS_PROTECTION     0x100C
 #define STATUS_INVALID_ADDR   0x100D
 #define STATUS_NULL_SYMBOL    0x100E
-#define STATUS_LIB_NOT_FOUND  0x100F
+
 
 #define HFR_FOLL_WRITE        0x01
-#define FOLL_FORCE            0x10
-
+#define FOLL_FORCE            0x10  
 struct k_packet {
     uint32_t op_code;
     uint32_t target_pid;
@@ -90,7 +85,6 @@ struct mutex {
     void *wait_list;
 };
 
-// Function pointer typedefs
 typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
@@ -102,21 +96,11 @@ typedef void (*mmput_t)(struct mm_struct *);
 typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
 typedef void (*put_task_struct_t)(struct task_struct *);
 typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
+typedef void (*rcu_read_lock_t)(void);
+typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
-typedef void *(*kmalloc_t)(unsigned long, int);
-typedef void (*kfree_t)(const void *);
-typedef int (*strcmp_t)(const char *, const char *);
-typedef char *(*strstr_t)(const char *, const char *);
-typedef void *(*memset_t)(void *, int, unsigned long);
-typedef void *(*memcpy_t)(void *, const void *, unsigned long);
-typedef char *(*dentry_path_raw_t)(void *, char *, int);
-typedef void (*down_read_t)(void *);
-typedef void (*up_read_t)(void *);
-typedef struct task_struct *(*next_task_t)(struct task_struct *);
-typedef pid_t (*task_tgid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
-typedef char *(*get_task_comm_t)(char *, struct task_struct *);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -129,21 +113,11 @@ static mmput_t               p_mmput;
 static get_task_struct_t     p_get_task_struct;
 static put_task_struct_t     p_put_task_struct;
 static task_pid_nr_ns_t      p_task_pid_nr_ns;
+static rcu_read_lock_t       p_rcu_read_lock;
+static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
-static kmalloc_t             p_kmalloc;
-static kfree_t               p_kfree;
-static strcmp_t              p_strcmp;
-static strstr_t              p_strstr;
-static memset_t              p_memset;
-static memcpy_t              p_memcpy;
-static dentry_path_raw_t     p_dentry_path_raw;
-static down_read_t           p_down_read;
-static up_read_t             p_up_read;
-static next_task_t           p_next_task;
-static task_tgid_nr_ns_t     p_task_tgid_nr_ns;
-static get_task_comm_t       p_get_task_comm;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -162,126 +136,6 @@ static inline int is_valid_user_address(uint64_t addr)
     if (addr >= (1ULL << 63)) return 0;
     return 1;
 }
-//FF PID FINDING
-
-static pid_t find_pid_by_name(const char *name)
-{
-    struct task_struct *task;
-    struct task_struct *init_task_ptr;
-    pid_t found_pid = 0;
-    char comm[TASK_COMM_LEN];
-    int count = 0;
-
-    if (!name || !name[0])
-        return 0;
-
-    if (!p_next_task || !p_get_task_comm || !p_task_tgid_nr_ns || !p_strcmp || !p_task_pid_nr_ns)
-        return 0;
-
-    init_task_ptr = (struct task_struct *)kallsyms_lookup_name("init_task");
-    if (!init_task_ptr)
-        return 0;
-
-    kpm_info("========== SEARCHING & DUMPING ALL PROCS ==========\n");
-    kpm_info("Looking for: '%s'\n", name);
-
-    task = init_task_ptr;
-
-    do {
-        task = p_next_task(task);
-        if (!task)
-            break;
-
-        // Only thread group leaders - use TGID == PID check instead
-        pid_t pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
-        pid_t tgid = p_task_tgid_nr_ns(task, PIDTYPE_TGID, NULL);
-        
-        if (pid != tgid)
-            continue;
-
-        p_memset(comm, 0, sizeof(comm));
-        p_get_task_comm(comm, task);
-
-        // PRINT EVERY PROCESS
-        kpm_info("  PID=%d COMM='%s'\n", pid, comm);
-
-        // Check match
-        if (p_strcmp(comm, name) == 0) {
-            found_pid = pid;
-            kpm_info("  >>> MATCH FOUND! PID=%d <<<\n", found_pid);
-        }
-
-        count++;
-        if (count >= 500) {
-            kpm_info("... stopped at 500\n");
-            break;
-        }
-
-    } while (task != init_task_ptr);
-
-    kpm_info("========== TOTAL SCANNED: %d | FOUND PID: %d ==========\n", count, found_pid);
-    return found_pid;
-}
-
-// Find library base address using dynamic functions
-static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
-{
-    struct mm_struct *mm;
-    unsigned long base = 0;
-    void *path_buffer = NULL;
-    unsigned long vma_addr;
-
-    if (!task || !lib_name || !lib_name[0] || !p_dentry_path_raw || !p_down_read || !p_up_read || !p_kmalloc || !p_kfree || !p_strstr)
-        return 0;
-
-    mm = p_get_task_mm(task);
-    if (!mm) {
-        kpm_err("find_lib_base: no mm for task\n");
-        return 0;
-    }
-
-    path_buffer = p_kmalloc(512, 0xCC0); // GFP_KERNEL = 0xCC0
-    if (!path_buffer) {
-        p_mmput(mm);
-        return 0;
-    }
-
-    // Lock mmap_sem
-    p_down_read((void *)((unsigned long)mm + 104)); // offset of mmap_sem in mm_struct
-
-    // Get mmap pointer from mm_struct (offset 0 in mm_struct for aarch64)
-    vma_addr = *(unsigned long *)mm;
-
-    while (vma_addr) {
-        unsigned long vm_start = *(unsigned long *)(vma_addr + 0);
-        unsigned long vm_next = *(unsigned long *)(vma_addr + 16);
-        void *vm_file = *(void **)(vma_addr + 96);
-
-        if (vm_file) {
-            // f_path.dentry is at offset 24 in struct file
-            void *dentry = *(void **)((unsigned long)vm_file + 24);
-            
-            if (dentry) {
-                char *path = p_dentry_path_raw(dentry, (char *)path_buffer, 512);
-                if (path && (unsigned long)path > 0x1000 && (unsigned long)path < 0xffff000000000000ULL) {
-                    if (p_strstr(path, lib_name)) {
-                        base = vm_start;
-                        kpm_info("Found lib '%s' at 0x%lx\n", lib_name, base);
-                        break;
-                    }
-                }
-            }
-        }
-        
-        vma_addr = vm_next;
-    }
-
-    p_up_read((void *)((unsigned long)mm + 104));
-    p_kfree(path_buffer);
-    p_mmput(mm);
-    
-    return base;
-}
 
 static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 {
@@ -296,63 +150,6 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
-        // Handle OP_FIND_PID_BY_NAME
-    if (pkt->op_code == OP_FIND_PID_BY_NAME) {
-        char name[TASK_COMM_LEN];
-        if (p_memset) p_memset(name, 0, sizeof(name));
-        else memset(name, 0, sizeof(name));
-        
-        strncpy(name, (const char *)pkt->inline_data, sizeof(name) - 1);
-        name[sizeof(name) - 1] = '\0';
-
-        pid_t pid = find_pid_by_name(name);
-        if (pid <= 0) {
-            kpm_err("Process not found for name: '%s'\n", name);
-            pkt->status = STATUS_NO_TASK;
-        } else {
-            pkt->target_pid = (uint32_t)pid;
-            pkt->status = STATUS_SUCCESS;
-            kpm_info("OP_FIND_PID_BY_NAME SUCCESS: pid=%d\n", pid);
-        }
-        return;
-    }
-
-    // Handle OP_FIND_LIB_BASE
-    if (pkt->op_code == OP_FIND_LIB_BASE) {
-        char lib_name[64];
-        if (p_memset) p_memset(lib_name, 0, sizeof(lib_name));
-        else memset(lib_name, 0, sizeof(lib_name));
-        
-        strncpy(lib_name, (const char *)pkt->inline_data, sizeof(lib_name) - 1);
-        lib_name[sizeof(lib_name) - 1] = '\0';
-
-        target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-        if (target_pid <= 0) {
-            pkt->status = STATUS_OUT_OF_RANGE;
-            return;
-        }
-
-        task = p_find_task_by_vpid(target_pid);
-        if (!task) {
-            pkt->status = STATUS_NO_TASK;
-            return;
-        }
-
-        unsigned long base = find_lib_base_by_name(task, lib_name);
-        if (base == 0) {
-            pkt->status = STATUS_LIB_NOT_FOUND;
-        } else {
-            pkt->vaddr = (uint64_t)base;
-            pkt->status = STATUS_SUCCESS;
-            kpm_info("OP_FIND_LIB_BASE SUCCESS: lib=%s base=0x%lx\n", lib_name, base);
-        }
-        return;
-    }
-
-
-        
-
-    // Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
@@ -386,10 +183,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
+    if (p_rcu_read_lock) p_rcu_read_lock();
+
     task = p_find_task_by_vpid(target_pid);
     kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
     
     if (!task) {
+        if (p_rcu_read_unlock) p_rcu_read_unlock();
         kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
@@ -399,6 +199,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     mm = p_get_task_mm(task);
     kpm_info("get_task_mm = %px\n", mm);
 
+    if (p_rcu_read_unlock) p_rcu_read_unlock();
+
     if (!mm) {
         kpm_err("NO_MM\n");
         pkt->status = STATUS_NO_MM;
@@ -407,16 +209,14 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     is_write_op = (pkt->op_code == OP_WRITE_VM);
-    if (p_memset) p_memset(temp_buffer, 0, MAX_INLINE);
-    else memset(temp_buffer, 0, MAX_INLINE);
+    memset(temp_buffer, 0, MAX_INLINE);
     
     if (is_write_op) {
-        if (p_memcpy) p_memcpy(temp_buffer, pkt->inline_data, pkt->size);
-        else memcpy(temp_buffer, pkt->inline_data, pkt->size);
-        gup_flags = HFR_FOLL_WRITE | FOLL_FORCE; 
-    } else {
-        gup_flags = FOLL_FORCE;                  
-    }
+    memcpy(temp_buffer, pkt->inline_data, pkt->size);
+    gup_flags = HFR_FOLL_WRITE | FOLL_FORCE; 
+} else {
+    gup_flags = FOLL_FORCE;                  
+}
 
     kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
              task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
@@ -440,11 +240,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if (!is_write_op && transferred > 0) {
-        if (p_memset) p_memset(pkt->inline_data, 0, MAX_INLINE);
-        else memset(pkt->inline_data, 0, MAX_INLINE);
-        
-        if (p_memcpy) p_memcpy(pkt->inline_data, temp_buffer, transferred);
-        else memcpy(pkt->inline_data, temp_buffer, transferred);
+        memset(pkt->inline_data, 0, MAX_INLINE);
+        memcpy(pkt->inline_data, temp_buffer, transferred);
     }
 
     if ((uint32_t)transferred != pkt->size) {
@@ -553,28 +350,15 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
     p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
     p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
+    p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
+    p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
-    
-    // Additional dynamic functions
-    p_kmalloc = (kmalloc_t)kallsyms_lookup_name("__kmalloc");
-    if (!p_kmalloc) p_kmalloc = (kmalloc_t)kallsyms_lookup_name("kmalloc");
-    p_kfree = (kfree_t)kallsyms_lookup_name("kfree");
-    p_strcmp = (strcmp_t)kallsyms_lookup_name("strcmp");
-    p_strstr = (strstr_t)kallsyms_lookup_name("strstr");
-    p_memset = (memset_t)kallsyms_lookup_name("memset");
-    p_memcpy = (memcpy_t)kallsyms_lookup_name("memcpy");
-    p_dentry_path_raw = (dentry_path_raw_t)kallsyms_lookup_name("dentry_path_raw");
-    p_down_read = (down_read_t)kallsyms_lookup_name("down_read");
-    p_up_read = (up_read_t)kallsyms_lookup_name("up_read");
-    p_next_task = (next_task_t)kallsyms_lookup_name("next_task");
-    p_task_tgid_nr_ns = (task_tgid_nr_ns_t)kallsyms_lookup_name("task_tgid_nr_ns");
-    if (!p_task_tgid_nr_ns) p_task_tgid_nr_ns = (task_tgid_nr_ns_t)kallsyms_lookup_name("__task_tgid_nr_ns");
-    p_get_task_comm = (get_task_comm_t)kallsyms_lookup_name("get_task_comm");
 
-    kpm_info("Symbols resolved: proc=%px vm=%px task=%px\n",
-             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid);
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+             p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
@@ -584,7 +368,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
 
-    proc_entry = p_proc_create_data(proc_filename, 0600, NULL, &p_ops, NULL);
+    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
     if (!proc_entry) {
         kpm_err("proc_create FAILED\n");
         return -EFAULT;
