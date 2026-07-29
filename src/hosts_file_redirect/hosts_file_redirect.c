@@ -12,7 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/sched/signal.h>   // for_each_process
 #include <linux/sched/task.h>     // get_task_mm, mmput
 #include <linux/dcache.h>         // d_path
 #include <linux/fs.h>             // struct file
