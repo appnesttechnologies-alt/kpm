@@ -8,6 +8,7 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
+#include <linux/mm_types.h>
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
