@@ -10,6 +10,7 @@
 #include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/slab.h>
+#include <linux/mm_types.h>
 #include <linux/version.h>
 
 KPM_NAME("hosts_file_redirect_shm");
@@ -53,7 +54,6 @@ KPM_DESCRIPTION("KPM shared-memory memory bridge via char device + mmap ring buf
 #define HFR_IOCTL_SUBMIT 0x48465200u
 struct inode;
 struct file;
-struct vm_area_struct;
 struct poll_table_struct;
 typedef unsigned int __poll_t;
 
@@ -341,7 +341,7 @@ static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
 
     return p_remap_pfn_range(vma,
                              vma->vm_start,
-                             phys >> PAGE_SHIFT,
+                             phys >> 12,
                              size,
                              vma->vm_page_prot);
 }
