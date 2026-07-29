@@ -43,8 +43,7 @@ struct file;
 
 /*
  * p_state / p_flags remain 0 - not available without the offset-scanning
- * technique cgroupv2_freeze uses. See earlier note - say the word if you
- * want that added.
+ * technique cgroupv2_freeze uses. Say the word if you want that added.
  */
 struct k_packet {
     uint32_t op_code;
@@ -62,42 +61,59 @@ typedef void (*remove_proc_entry_t)(const char *, void *);
 typedef unsigned long (*copy_from_user_t)(void *to, const void __user *from, unsigned long n);
 typedef unsigned long (*copy_to_user_t)(void __user *to, const void *from, unsigned long n);
 
+/*
+ * These 4 are resolved directly via kallsyms_lookup_name, NOT via the
+ * pid.h header's find_vpid()/pid_task()/get_task_pid()/pid_vnr()
+ * wrappers - those wrappers internally use KernelPatch's separate kf_
+ * symbol table, which your dmesg log confirms does NOT know these
+ * symbols on this device, even though /proc/kallsyms confirms all 4
+ * ARE real, exported (EXPORT_SYMBOL) kernel functions. So we bypass
+ * the header's kfunc_direct_call machinery entirely and call the
+ * kallsyms-resolved function pointers ourselves - the same mechanism
+ * that already works for proc_create_data etc. below.
+ */
+typedef struct pid *(*find_vpid_t)(int nr);
+typedef struct task_struct *(*pid_task_t)(struct pid *pid, enum pid_type type);
+typedef struct pid *(*get_task_pid_t)(struct task_struct *task, enum pid_type type);
+typedef pid_t (*pid_vnr_t)(struct pid *pid);
+
 static proc_create_data_t   p_proc_create_data;
 static remove_proc_entry_t  p_remove_proc_entry;
 static copy_from_user_t     p_copy_from_user;
 static copy_to_user_t       p_copy_to_user;
 
+static find_vpid_t     p_find_vpid;
+static pid_task_t       p_pid_task;
+static get_task_pid_t   p_get_task_pid;
+static pid_vnr_t        p_pid_vnr;
+
 static const char *proc_filename = "core_helper_kpm";
 static void *proc_entry = NULL;
 
 /*
- * NOTE ON LOCKING: rcu_read_lock/unlock's underlying symbols
- * (__rcu_read_lock / __rcu_read_unlock) are NOT in this device's
- * KernelPatch symbol table (confirmed by your dmesg log), so they
- * can't be used here. No other module in this repo (cgroupv2_freeze,
- * re_kernel, hosts_file_redirect) calls rcu_read_lock either - they
- * all do direct pointer lookups without it. Following that same
- * established pattern here: there's a theoretical, very small race
- * window where the target task could be freed between find_vpid()
- * and reading its fields, but this matches this codebase's existing
- * convention rather than introducing a locking primitive that isn't
- * actually resolvable on your device.
+ * No rcu_read_lock here - its underlying symbols aren't in this
+ * device's kf_ table either, and no other module in this repo uses it.
+ * Small theoretical race window between find_vpid and reading fields,
+ * consistent with this codebase's existing convention.
  */
 static int fetch_process_data(struct k_packet *pkt)
 {
     struct pid *pid_struct;
+    struct pid *tgid_pid_struct;
     struct task_struct *task;
 
-    pid_struct = find_vpid(pkt->target_pid);
+    pid_struct = p_find_vpid(pkt->target_pid);
     if (!pid_struct)
         return -ESRCH;
 
-    task = pid_task(pid_struct, PIDTYPE_PID);
+    task = p_pid_task(pid_struct, PIDTYPE_PID);
     if (!task)
         return -ESRCH;
 
-    pkt->p_pid = pid_vnr(get_task_pid(task, PIDTYPE_PID));
-    pkt->p_tgid = pid_vnr(get_task_pid(task, PIDTYPE_TGID));
+    pkt->p_pid = p_pid_vnr(pid_struct);
+
+    tgid_pid_struct = p_get_task_pid(task, PIDTYPE_TGID);
+    pkt->p_tgid = tgid_pid_struct ? p_pid_vnr(tgid_pid_struct) : 0;
 
     const char *comm = get_task_comm(task);
     memset(pkt->comm, 0, sizeof(pkt->comm));
@@ -166,26 +182,21 @@ static long core_init(const char *args, const char *event, void __user *reserved
     p_copy_from_user    = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
     p_copy_to_user      = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
 
+    p_find_vpid    = (find_vpid_t)kallsyms_lookup_name("find_vpid");
+    p_pid_task     = (pid_task_t)kallsyms_lookup_name("pid_task");
+    p_get_task_pid = (get_task_pid_t)kallsyms_lookup_name("get_task_pid");
+    p_pid_vnr      = (pid_vnr_t)kallsyms_lookup_name("pid_vnr");
+
     if (!p_proc_create_data || !p_remove_proc_entry || !p_copy_from_user || !p_copy_to_user) {
-        kpm_err("Failed to resolve symbols\n");
+        kpm_err("Failed to resolve core symbols\n");
         return -EFAULT;
     }
 
-    /*
-     * find_vpid / pid_task / get_task_pid / pid_vnr all go through this
-     * framework's kf_ symbol table (same mechanism that failed for
-     * find_task_by_vpid etc). These are more fundamental, widely-used
-     * functions so more likely to be registered - but this is NOT
-     * fully confirmed for get_task_pid/pid_vnr specifically on your
-     * device. If loading logs "unknown symbol: kf_get_task_pid" or
-     * "kf_pid_vnr", paste that dmesg output and I'll swap to a
-     * different path (e.g. reading tgid straight off the struct pid
-     * returned by find_vpid, if the framework exposes that).
-     */
-    kfunc_lookup_name(find_vpid);
-    kfunc_lookup_name(pid_task);
-    kfunc_lookup_name(get_task_pid);
-    kfunc_lookup_name(pid_vnr);
+    if (!p_find_vpid || !p_pid_task || !p_get_task_pid || !p_pid_vnr) {
+        kpm_err("Failed to resolve pid symbols: find_vpid=%px pid_task=%px get_task_pid=%px pid_vnr=%px\n",
+                p_find_vpid, p_pid_task, p_get_task_pid, p_pid_vnr);
+        return -EFAULT;
+    }
 
     proc_entry = p_proc_create_data(proc_filename, 0660, NULL, &p_ops, NULL);
     if (!proc_entry) {
