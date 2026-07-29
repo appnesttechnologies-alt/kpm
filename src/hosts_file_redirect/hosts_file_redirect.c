@@ -409,16 +409,13 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p___get_free_pages = (__get_free_pages_t)kallsyms_lookup_name("__get_free_pages");
     p_free_pages = (free_pages_t)kallsyms_lookup_name("free_pages");
 
-    kpm_info("=== SHM INIT START ===
-");
-    kpm_info("register_chrdev=%px __register_chrdev=%px
-", p_register_chrdev, p___register_chrdev);
+    kpm_info("=== SHM INIT START ===");
+    kpm_info("register_chrdev=%px __register_chrdev=%px", p_register_chrdev, p___register_chrdev);
 
     if (!p_copy_from_user || !p_copy_to_user || !p_access_process_vm || !p_find_task_by_vpid ||
         !p_get_task_mm || !p_mmput || !p_task_pid_nr_ns || !p___get_free_pages ||
         !p_free_pages || !p_remap_pfn_range || !p_virt_to_phys) {
-        kpm_err("critical symbol missing
-");
+        kpm_err("critical symbol missing");
         return -EFAULT;
     }
 
@@ -426,8 +423,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     g_ctx.ring_pages = p___get_free_pages(0, HFR_RING_ORDER);
     if (!g_ctx.ring_pages) {
-        kpm_err("ring alloc failed
-");
+        kpm_err("ring alloc failed");
         return -ENOMEM;
     }
 
@@ -442,8 +438,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
         g_ctx.ring_pages = 0;
         g_ctx.ring = 0;
-        kpm_err("no chrdev registration symbol
-");
+        kpm_err("no chrdev registration symbol");
         return -EFAULT;
     }
 
@@ -451,22 +446,18 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
         g_ctx.ring_pages = 0;
         g_ctx.ring = 0;
-        kpm_err("register_chrdev failed: %d
-", g_ctx.major);
+        kpm_err("register_chrdev failed: %d", g_ctx.major);
         return g_ctx.major;
     }
 
-    kpm_info("chrdev major=%d
-", g_ctx.major);
-    kpm_info("initialized ring=%px size=%lu
-", g_ctx.ring, (unsigned long)HFR_RING_BYTES);
+    kpm_info("chrdev major=%d", g_ctx.major);
+    kpm_info("initialized ring=%px size=%lu", g_ctx.ring, (unsigned long)HFR_RING_BYTES);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== SHM EXIT ===
-");
+    kpm_info("=== SHM EXIT ===");
 
     if (g_ctx.major > 0) {
         if (p_unregister_chrdev)
