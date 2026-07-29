@@ -12,9 +12,11 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/sched/task.h>     // get_task_mm, mmput
-#include <linux/dcache.h>         // d_path
-#include <linux/fs.h>             // struct file
+#include <linux/sched/task.h>
+#include <linux/dcache.h>
+#include <linux/fs.h>
+#include <linux/sched/signal.h>      // TASK_COMM_LEN
+#include <linux/rcupdate.h>          // rcu_read_lock/unlock
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -143,36 +145,40 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 
-// NEW: Find PID by process name (task->comm)
+// ✅ FIXED: Find PID by process name
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     pid_t found_pid = 0;
+    char target_name[TASK_COMM_LEN];
 
     if (!name || !name[0])
         return 0;
 
-    p_rcu_read_lock();
+    strncpy(target_name, name, TASK_COMM_LEN - 1);
+    target_name[TASK_COMM_LEN - 1] = '';
+
+    rcu_read_lock();
     for_each_process(task) {
-        if (strcmp(task->comm, name) == 0) {
-            found_pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
+        if (strcmp(task->comm, target_name) == 0) {
+            found_pid = task_pid_nr(task);
             break;
         }
     }
-    p_rcu_read_unlock();
+    rcu_read_unlock();
 
     kpm_info("find_pid_by_name('%s') = %d
 ", name, found_pid);
     return found_pid;
 }
 
-// NEW: Find library base address by name
+// ✅ FIXED: Find library base address by name
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
 {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned long base = 0;
-    char path_buf[256];
+    char *buf, *path;
 
     if (!task || !lib_name || !lib_name[0])
         return 0;
@@ -184,17 +190,20 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         return 0;
     }
 
-    // Old-style VMA iteration (mm->mmap)
+    buf = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!buf) {
+        p_mmput(mm);
+        return 0;
+    }
+
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (!vma->vm_file)
             continue;
 
-        // Get full path using d_path
-        char *path = d_path(&vma->vm_file->f_path, path_buf, sizeof(path_buf));
+        path = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
         if (IS_ERR(path))
             continue;
 
-        // Check if lib_name is in path (e.g., "libart.so")
         if (strstr(path, lib_name)) {
             base = vma->vm_start;
             kpm_info("Found lib '%s' at 0x%lx (path: %s)
@@ -203,6 +212,7 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         }
     }
 
+    kfree(buf);
     p_mmput(mm);
     return base;
 }
@@ -221,11 +231,12 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 ",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
-    // Handle new opcodes
+    // ✅ Handle new opcodes
     if (pkt->op_code == OP_FIND_PID_BY_NAME) {
-        char name[16];
+        char name[TASK_COMM_LEN];
         memset(name, 0, sizeof(name));
         strncpy(name, pkt->inline_data, sizeof(name) - 1);
+        name[TASK_COMM_LEN - 1] = '';
 
         pid_t pid = find_pid_by_name(name);
         if (pid <= 0) {
@@ -241,6 +252,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         char lib_name[64];
         memset(lib_name, 0, sizeof(lib_name));
         strncpy(lib_name, pkt->inline_data, sizeof(lib_name) - 1);
+        lib_name[sizeof(lib_name) - 1] = '';
 
         target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
         if (target_pid <= 0) {
@@ -248,17 +260,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
             return;
         }
 
-        p_rcu_read_lock();
         task = p_find_task_by_vpid(target_pid);
         if (!task) {
-            p_rcu_read_unlock();
             pkt->status = STATUS_NO_TASK;
             return;
         }
 
         unsigned long base = find_lib_base_by_name(task, lib_name);
-        p_rcu_read_unlock();
-
         if (base == 0) {
             pkt->status = STATUS_LIB_NOT_FOUND;
             return;
@@ -269,7 +277,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // Existing READ/WRITE logic
+    // ✅ Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         kpm_err("BAD_OPCODE: 0x%x
 ", pkt->op_code);
@@ -518,7 +526,8 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
 
-    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
+    // ⚠️ SECURITY: 0600 = only root can access
+    proc_entry = p_proc_create_data(proc_filename, 0600, NULL, &p_ops, NULL);
     if (!proc_entry) {
         kpm_err("proc_create FAILED
 ");
