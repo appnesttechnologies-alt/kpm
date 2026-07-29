@@ -160,16 +160,14 @@ static inline int is_valid_user_address(uint64_t addr)
     if (addr >= (1ULL << 63)) return 0;
     return 1;
 }
-
-// Find PID by process name using only dynamic functions
-// Find PID by process name using substring (handles 15-char comm limit)
+//FF PID FINDING
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     pid_t found_pid = 0;
     char comm[TASK_COMM_LEN];
 
-    if (!name || !name[0] || !p_next_task || !p_get_task_comm || !p_strstr || !p_task_tgid_nr_ns)
+    if (!p_next_task || !p_get_task_comm || !p_strstr || !p_task_tgid_nr_ns)
         return 0;
 
     task = (struct task_struct *)kallsyms_lookup_name("init_task");
@@ -177,11 +175,12 @@ static pid_t find_pid_by_name(const char *name)
 
     for (task = p_next_task(task); task && task != (struct task_struct *)kallsyms_lookup_name("init_task"); task = p_next_task(task)) {
         p_get_task_comm(comm, task);
-        // Use strstr instead of strcmp so even partial package names match!
-        if (p_strstr(comm, "freefiremax") || p_strstr(comm, name)) {
+        
+        // Free Fire Max ke liye package ya comm match check karo
+        if (p_strstr(comm, "freefiremax") || (name && name[0] && p_strstr(comm, name))) {
             found_pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
             if (found_pid > 0) {
-                kpm_info("Found matching process: comm=%s pid=%d\n", comm, found_pid);
+                kpm_info("Found target process: comm=%s pid=%d\n", comm, found_pid);
                 break;
             }
         }
@@ -189,6 +188,7 @@ static pid_t find_pid_by_name(const char *name)
 
     return found_pid;
 }
+
 
 // Find library base address using dynamic functions
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
