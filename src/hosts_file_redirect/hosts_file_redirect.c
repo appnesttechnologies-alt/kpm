@@ -1,452 +1,475 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <compiler.h>
-#include <hook.h>
 #include <kpmodule.h>
-#include <kputils.h>
-#include <linux/errno.h>
 #include <linux/printk.h>
-#include <linux/string.h>
-#include <linux/sched.h>
-#include <linux/mm.h>
-#include <linux/pid.h>
-#include <linux/slab.h>
-#include <linux/version.h>
-#include <linux/fs.h>
+#include <common.h>
+#include <syscall.h>
 
 
-KPM_NAME("hosts_file_redirect_shm");
-KPM_VERSION(HFR_VERSION);
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM shared-memory memory bridge via char device + mmap ring buffer") ;
+#define ENABLE_DEBUG_LOG 1
 
-#define HFR_DEBUG
-#ifdef HFR_DEBUG
-#define kpm_info(fmt, ...) pr_info("HFR_SHM: " fmt, ##__VA_ARGS__)
-#define kpm_err(fmt, ...)  pr_err("HFR_SHM: " fmt, ##__VA_ARGS__)
+#if ENABLE_DEBUG_LOG
+    #define TAG "[@xmhnb]"
+    #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
 #else
-#define kpm_info(fmt, ...)
-#define kpm_err(fmt, ...)
+    #define logv(fmt, ...) do {} while(0) 
 #endif
 
-#define MAX_INLINE       256
-#define OP_READ_VM       0x2000
-#define OP_WRITE_VM      0x3000
 
-#define STATUS_SUCCESS      0x0000
-#define STATUS_INVALID_SIZE 0x1005
-#define STATUS_OUT_OF_RANGE 0x1006
-#define STATUS_BAD_OPCODE   0x1007
-#define STATUS_NO_TASK      0x1008
-#define STATUS_NO_MM        0x1009
-#define STATUS_VM_FAULT     0x100A
-#define STATUS_PARTIAL_IO   0x100B
-#define STATUS_PROTECTION   0x100C
-#define STATUS_INVALID_ADDR 0x100D
-#define STATUS_NULL_SYMBOL  0x100E
-#define STATUS_RING_EMPTY   0x1010
-#define STATUS_RING_FULL    0x1011
+KPM_NAME("LOL");
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("LOL");
+KPM_DESCRIPTION(" LOL");
 
-#define HFR_FOLL_WRITE      0x01
-#define HFR_RING_ORDER      2
-#define HFR_RING_BYTES      (4096UL << HFR_RING_ORDER)
-#define HFR_RING_MAGIC      0x48465231u
-#define HFR_RING_SLOTS      32
-#define HFR_IOCTL_SUBMIT 0x48465200u
-struct inode;
-struct file;
-struct vm_area_struct;
-struct poll_table_struct;
-typedef unsigned int __poll_t;
+/* ========== ioctl 命令定义 ========== */
+#define OP_READ_MEM                 8001
+#define OP_GET_CPU_NUM_BRPS         8009
+#define OP_GET_CPU_NUM_WRPS         8010
+#define OP_SET_HW_BREAKPOINT        8011
+#define OP_REMOVE_HW_BREAKPOINT     8013
+#define OP_REMOVE_ALL_HW_BREAKPOINT 8014
 
 
+typedef struct {
+    uint32_t pid;
+    uint32_t _pad0;
+    uint64_t addr;
+    uint64_t buffer;
+    uint64_t size;
+} copy_memory_t;
 
-struct file_operations {
-    void *owner;
-    loff_t (*llseek)(struct file *, loff_t, int);
-    ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
-    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
-    long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
-    int (*mmap)(struct file *, struct vm_area_struct *);
-    unsigned int (*poll)(struct file *, struct poll_table_struct *);
-    int (*open)(struct inode *, struct file *);
-    int (*release)(struct inode *, struct file *);
+typedef struct {
+    uint32_t pid;
+    uint32_t _pad0;
+    uint64_t addr;
+    int32_t  type;
+    int32_t  _pad1;
+    uint64_t len;
+} hw_breakpoint_cmd_t;
+
+
+struct bp_node {
+    struct bp_node *next;
+    struct bp_node *prev;
+    uint64_t perf_event;
+    uint32_t pid;
+    uint32_t pad;
+    uint64_t addr;
 };
 
 
+static uint64_t my_page_shift = 12;
+static uint64_t my_va_bits = 48;
+static uint64_t my_pa_bits = 48;
 
 
-struct mutex {
-    void *owner;
-    int count;
-    void *wait_lock;
-    void *wait_list;
+static struct bp_node bp_list = {
+    .next = &bp_list,
+    .prev = &bp_list,
 };
-
-struct hfr_packet {
-    uint32_t seq;
-    uint32_t op_code;
-    uint32_t target_pid;
-    uint32_t size;
-    uint64_t vaddr;
-    uint32_t status;
-    uint32_t reserved;
-    uint8_t inline_data[MAX_INLINE];
-} __attribute__((aligned(8), packed));
-
-struct hfr_ring {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t req_head;
-    uint32_t req_tail;
-    uint32_t rsp_head;
-    uint32_t rsp_tail;
-    uint32_t slots;
-    uint32_t elem_size;
-    struct hfr_packet req[HFR_RING_SLOTS];
-    struct hfr_packet rsp[HFR_RING_SLOTS];
-} __attribute__((aligned(4096)));
-
-struct hfr_ctx {
-    struct hfr_ring *ring;
-    void *ring_pages;
-    struct mutex lock;
-    int major;
-    int stop;
-};
-
-static struct hfr_ctx g_ctx;
+static uint32_t bp_lock = 0;
 
 
-typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
-typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
-typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
-typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
-typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
-typedef void (*mmput_t)(struct mm_struct *);
-typedef struct task_struct *(*get_task_struct_t)(struct task_struct *);
-typedef void (*put_task_struct_t)(struct task_struct *);
-typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
-typedef void (*rcu_read_lock_t)(void);
-typedef void (*rcu_read_unlock_t)(void);
-typedef void (*mutex_init_t)(struct mutex *);
-typedef void (*mutex_lock_t)(struct mutex *);
-typedef void (*mutex_unlock_t)(struct mutex *);
-typedef int (*__register_chrdev_t)(
-    unsigned int major,
-    unsigned int baseminor,
-    unsigned int count,
-    const char *name,
-    const struct file_operations *fops
-);
+static uint64_t kv_memstart_addr = 0;
+static uint64_t kv_kimage_voffset = 0;
+static uint64_t pgd_offset = 0;
 
-typedef void (*__unregister_chrdev_t)(
-    unsigned int major,
-    unsigned int baseminor,
-    unsigned int count,
-    const char *name
-);
-typedef unsigned long (*virt_to_phys_t)(volatile void *address);
-typedef int (*remap_pfn_range_t)(struct vm_area_struct *, unsigned long, unsigned long, unsigned long, unsigned long);
-typedef void *(*__get_free_pages_t)(unsigned int, unsigned int);
-typedef void (*free_pages_t)(unsigned long, unsigned int);
 
-static copy_from_user_t      p_copy_from_user;
-static copy_to_user_t        p_copy_to_user;
-static access_process_vm_t   p_access_process_vm;
-static find_task_by_vpid_t   p_find_task_by_vpid;
-static get_task_mm_t         p_get_task_mm;
-static mmput_t               p_mmput;
-static get_task_struct_t     p_get_task_struct;
-static put_task_struct_t     p_put_task_struct;
-static task_pid_nr_ns_t      p_task_pid_nr_ns;
-static rcu_read_lock_t       p_rcu_read_lock;
-static rcu_read_unlock_t     p_rcu_read_unlock;
-static mutex_init_t          p_mutex_init;
-static mutex_lock_t          p_mutex_lock;
-static mutex_unlock_t        p_mutex_unlock;
-static __register_chrdev_t     p___register_chrdev;
-static __unregister_chrdev_t   p___unregister_chrdev;
-static virt_to_phys_t        p_virt_to_phys;
-static remap_pfn_range_t     p_remap_pfn_range;
-static __get_free_pages_t    p___get_free_pages;
-static free_pages_t          p_free_pages;
+static uint64_t (*kf___arch_copy_from_user)(void *to, const void __user *from, uint64_t n) = 0;
+static uint64_t (*kf___arch_copy_to_user)(void __user *to, const void *from, uint64_t n) = 0;
+static void *(*kf_get_task_pid)(void *task, int type) = 0;
+static void (*kf_put_pid)(void *pid) = 0;
+static void *(*kf_find_task_by_vpid)(uint32_t pid) = 0;
+static volatile uint64_t kf_attach_pid = 0;
+static void *(*kf_get_task_mm)(void *task) = 0;
+static void (*kf_mmput)(void *mm) = 0;
+static int (*kf_pfn_valid)(uint64_t pfn) = 0;
+static int (*kf_valid_phys_addr_range)(uint64_t addr, uint64_t size) = 0;
+static void *(*kf_register_user_hw_breakpoint)(void *attr, void *handler, void *overflow, void *task) = 0;
+static volatile uint64_t kf_modify_user_hw_breakpoint = 0;
+static void (*kf_unregister_hw_breakpoint)(void *event) = 0;
+static void (*kf_perf_event_enable)(void *event) = 0;
+static void *(*kf_memset)(void *s, int c, uint64_t n) = 0;
+static void *(*kf___kmalloc)(uint64_t size, uint32_t flags) = 0;
+static void *(*kf_kmalloc)(uint64_t size, uint32_t flags) = 0;
+static void (*kf_kfree)(void *ptr) = 0;
+static void (*kf__raw_spin_lock)(void *lock) = 0;
+static void (*kf__raw_spin_unlock)(void *lock) = 0;
 
-static inline struct task_struct *hfr_get_current(void)
+
+static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
+
+
+#define LIST_POISON1  0xDEAD000000000100ULL
+#define LIST_POISON2  0xDEAD000000000122ULL
+
+static inline void bp_list_add(struct bp_node *node, struct bp_node *head)
 {
-    struct task_struct *tsk;
-    asm volatile("mrs %0, sp_el0" : "=r" (tsk));
-    return tsk;
+    struct bp_node *old_next = head->next;
+    head->next = node;
+    node->next = (struct bp_node *)head;
+    node->prev = old_next;
+    old_next->next = node;
 }
 
-static inline int is_valid_user_address(uint64_t addr)
+static inline void bp_list_del(struct bp_node *entry)
 {
-    if (!addr) return 0;
-    if (addr >= (1ULL << 63)) return 0;
-    return 1;
+    struct bp_node *n = entry->next;
+    struct bp_node *p = entry->prev;
+    n->prev = p;
+    p->next = n;
+    entry->next = (struct bp_node *)LIST_POISON1;
+    entry->prev = (struct bp_node *)LIST_POISON2;
 }
 
-static inline uint32_t ring_next(uint32_t idx)
+
+uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
 {
-    return (idx + 1u) % HFR_RING_SLOTS;
-}
+    uint64_t ps = my_page_shift;
+    uint64_t vb = my_va_bits;
+    uint64_t es = ps - 3;
+    int64_t levels = (int64_t)((vb - 4) / es);
+    uint64_t *result;
 
-static void process_packet(struct hfr_packet *pkt, pid_t caller_pid)
-{
-    struct task_struct *task = NULL;
-    struct mm_struct *mm = NULL;
-    pid_t target_pid;
-    int transferred;
-    unsigned int gup_flags;
-    int is_write_op = 0;
-    uint8_t temp_buffer[MAX_INLINE];
+    if (levels < 1)
+        return 0;
 
-    if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        pkt->status = STATUS_BAD_OPCODE;
-        return;
-    }
-    if (!pkt->size || pkt->size > MAX_INLINE) {
-        pkt->status = STATUS_INVALID_SIZE;
-        return;
-    }
-    if (!is_valid_user_address(pkt->vaddr)) {
-        pkt->status = STATUS_INVALID_ADDR;
-        return;
-    }
-    if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        pkt->status = STATUS_NULL_SYMBOL;
-        return;
-    }
+    int64_t level = 4 - levels;
+    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+    uint64_t imask = (1U << es) - 1;
 
-    target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    if (target_pid <= 0) {
-        pkt->status = STATUS_OUT_OF_RANGE;
-        return;
-    }
+    while (1) {
+        uint64_t shift = (4 - (uint8_t)level) * es + 3;
+        uint64_t idx = (va >> shift) & imask;
+        result = (uint64_t *)(table_base + idx * 8);
+        uint64_t entry = *result;
+        uint64_t dt = entry & 3;
 
-    if (p_rcu_read_lock) p_rcu_read_lock();
-    task = p_find_task_by_vpid(target_pid);
-    if (!task) {
-        if (p_rcu_read_unlock) p_rcu_read_unlock();
-        pkt->status = STATUS_NO_TASK;
-        return;
-    }
-    if (p_get_task_struct) p_get_task_struct(task);
-    mm = p_get_task_mm(task);
-    if (p_rcu_read_unlock) p_rcu_read_unlock();
-
-    if (!mm) {
-        pkt->status = STATUS_NO_MM;
-        if (p_put_task_struct && task) p_put_task_struct(task);
-        return;
-    }
-
-    is_write_op = (pkt->op_code == OP_WRITE_VM);
-    memset(temp_buffer, 0, sizeof(temp_buffer));
-    if (is_write_op) {
-        memcpy(temp_buffer, pkt->inline_data, pkt->size);
-        gup_flags = HFR_FOLL_WRITE;
-    } else {
-        gup_flags = 0;
-    }
-
-    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-
-    p_mmput(mm);
-    if (p_put_task_struct && task) p_put_task_struct(task);
-
-    if (transferred < 0) {
-        pkt->status = STATUS_VM_FAULT;
-        return;
-    }
-    if (transferred == 0 && pkt->size > 0) {
-        pkt->status = STATUS_PROTECTION;
-        return;
-    }
-    if (!is_write_op && transferred > 0) {
-        memset(pkt->inline_data, 0, MAX_INLINE);
-        memcpy(pkt->inline_data, temp_buffer, transferred);
-    }
-    if ((uint32_t)transferred != pkt->size) {
-        pkt->size = (uint32_t)transferred;
-        pkt->status = STATUS_PARTIAL_IO;
-        return;
-    }
-    pkt->status = STATUS_SUCCESS;
-}
-
-static int hfr_open(struct inode *inode, struct file *file) { return 0; }
-static int hfr_release(struct inode *inode, struct file *file) { return 0; }
-static ssize_t hfr_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) { return 0; }
-
-static ssize_t hfr_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
-{
-    struct hfr_packet pkt;
-    pid_t caller_pid;
-    struct task_struct *curr_task;
-    uint32_t next_rsp;
-
-    if (count != sizeof(pkt)) return -EINVAL;
-    if (!p_copy_from_user || !p_copy_to_user) return -EFAULT;
-    if (p_copy_from_user(&pkt, buf, sizeof(pkt)) != 0) return -EFAULT;
-
-    curr_task = hfr_get_current();
-    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
-    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) return -ESRCH;
-
-    if (p_mutex_lock) p_mutex_lock(&g_ctx.lock);
-    process_packet(&pkt, caller_pid);
-    if (g_ctx.ring) {
-        next_rsp = ring_next(g_ctx.ring->rsp_head);
-        if (next_rsp != g_ctx.ring->rsp_tail) {
-            memcpy(&g_ctx.ring->rsp[g_ctx.ring->rsp_head], &pkt, sizeof(pkt));
-            g_ctx.ring->rsp_head = next_rsp;
+        if (dt == 3) {
+            table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+            level++;
+            if (level >= 3)
+                return result;
+        } else if (dt == 1) {
+            if (level == 0) {
+                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                level++;
+                if (level >= 3)
+                    return result;
+                continue;
+            }
+            return result;
+        } else {
+            return 0;
         }
     }
-    if (p_mutex_unlock) p_mutex_unlock(&g_ctx.lock);
-
-    if (p_copy_to_user((void __user *)buf, &pkt, sizeof(pkt)) != 0) return -EFAULT;
-    return (ssize_t)count;
 }
 
-static long hfr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+
+static void hw_breakpoint_handler(void *event, void *data)
 {
-    struct hfr_packet pkt;
-    pid_t caller_pid;
-    struct task_struct *curr_task;
-    uint32_t next_rsp;
+    logv("hw_breakpoint: Breakpoint hit\n");
+}
 
-    if (!p_copy_from_user || !p_copy_to_user) return -EFAULT;
-    if (cmd != HFR_IOCTL_SUBMIT) return -EINVAL;
-    if (p_copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)) != 0) return -EFAULT;
+static void before_ioctl(hook_fargs4_t *args, void *udata);
 
-    curr_task = hfr_get_current();
-    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
-    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) return -ESRCH;
 
-    if (p_mutex_lock) p_mutex_lock(&g_ctx.lock);
-    process_packet(&pkt, caller_pid);
-    if (g_ctx.ring) {
-        next_rsp = ring_next(g_ctx.ring->rsp_head);
-        if (next_rsp != g_ctx.ring->rsp_tail) {
-            memcpy(&g_ctx.ring->rsp[g_ctx.ring->rsp_head], &pkt, sizeof(pkt));
-            g_ctx.ring->rsp_head = next_rsp;
+static long hello_demo_init(const char *args, const char *event, void *__user reserved)
+{
+    kv_memstart_addr = (uint64_t)kallsyms_lookup_name("memstart_addr");
+    kv_kimage_voffset = (uint64_t)kallsyms_lookup_name("kimage_voffset");
+    kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
+    kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))kallsyms_lookup_name("__arch_copy_to_user");
+    kf_get_task_pid = (typeof(kf_get_task_pid))kallsyms_lookup_name("get_task_pid");
+    kf_put_pid = (typeof(kf_put_pid))kallsyms_lookup_name("put_pid");
+    kf_find_task_by_vpid = (typeof(kf_find_task_by_vpid))kallsyms_lookup_name("find_task_by_vpid");
+    kf_attach_pid = (uint64_t)kallsyms_lookup_name("attach_pid");
+    kf_get_task_mm = (typeof(kf_get_task_mm))kallsyms_lookup_name("get_task_mm");
+    kf_mmput = (typeof(kf_mmput))kallsyms_lookup_name("mmput");
+    kf_pfn_valid = (typeof(kf_pfn_valid))kallsyms_lookup_name("pfn_valid");
+    kf_valid_phys_addr_range = (typeof(kf_valid_phys_addr_range))kallsyms_lookup_name("valid_phys_addr_range");
+    kf_register_user_hw_breakpoint = (typeof(kf_register_user_hw_breakpoint))kallsyms_lookup_name("register_user_hw_breakpoint");
+    kf_modify_user_hw_breakpoint = (uint64_t)kallsyms_lookup_name("modify_user_hw_breakpoint");
+    kf_unregister_hw_breakpoint = (typeof(kf_unregister_hw_breakpoint))kallsyms_lookup_name("unregister_hw_breakpoint");
+    kf_perf_event_enable = (typeof(kf_perf_event_enable))kallsyms_lookup_name("perf_event_enable");
+    kf_memset = (typeof(kf_memset))kallsyms_lookup_name("memset");
+    kf___kmalloc = (typeof(kf___kmalloc))kallsyms_lookup_name("__kmalloc");
+    kf_kmalloc = (typeof(kf_kmalloc))kallsyms_lookup_name("kmalloc");
+    kf_kfree = (typeof(kf_kfree))kallsyms_lookup_name("kfree");
+    kf__raw_spin_lock = (typeof(kf__raw_spin_lock))kallsyms_lookup_name("_raw_spin_lock");
+    kf__raw_spin_unlock = (typeof(kf__raw_spin_unlock))kallsyms_lookup_name("_raw_spin_unlock");
+
+    uint64_t tcr_el1;
+    __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
+    uint64_t tg1 = (tcr_el1 >> 30) & 0x3;
+    my_va_bits = 64 - ((tcr_el1 >> 16) & 0x1F);
+    if (tg1 == 1)
+        my_page_shift = 14;
+    else if (tg1 == 3)
+        my_page_shift = 16;
+    else
+        my_page_shift = 12;
+
+    uint64_t mmfr0;
+    __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
+    uint64_t parange = mmfr0 & 0xF;
+    if (parange > 6)
+        my_pa_bits = 48;
+    else
+        my_pa_bits = pa_bits_table[parange];
+
+    uint64_t ttbr1;
+    __asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+
+    uint64_t init_mm_addr = (uint64_t)kallsyms_lookup_name("init_mm");
+    if (init_mm_addr && init_mm_addr <= 0xFFFFFFFFFFFFFF4FULL) {
+        uint64_t expected_pgd = *(uint64_t *)kv_kimage_voffset
+                              + (ttbr1 & (-1ULL << my_page_shift) & 0xFFFFFFFFFFFEULL);
+        uint64_t off;
+        for (off = 0; off < 176; off += 4) {
+            if (*(uint64_t *)(init_mm_addr + off) == expected_pgd) {
+                pgd_offset = off;
+                break;
+            }
         }
     }
-    if (p_mutex_unlock) p_mutex_unlock(&g_ctx.lock);
 
-    if (p_copy_to_user((void __user *)arg, &pkt, sizeof(pkt)) != 0) return -EFAULT;
+    uint64_t init_task_addr = (uint64_t)kallsyms_lookup_name("init_task");
+    if (init_task_addr) {
+        if (kf_get_task_pid) {
+            void *pid = kf_get_task_pid((void *)init_task_addr, 0);
+            if (kf_put_pid)
+                kf_put_pid(pid);
+        } else {
+            logv("kfunc: %s not found\n", "get_task_pid");
+        }
+    }
+
+    return (long)fp_wrap_syscalln(29, 3, 0, before_ioctl, 0, 0);
+}
+
+
+static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int outlen)
+{
+    logv("welcome to use my kpm\n");
     return 0;
 }
 
-static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
+
+static long hello_demo_exit(void *__user reserved)
 {
-    unsigned long phys;
-    unsigned long size = HFR_RING_BYTES;
-    if (!g_ctx.ring || !p_virt_to_phys || !p_remap_pfn_range) return -EFAULT;
-    phys = p_virt_to_phys((volatile void *)g_ctx.ring);
-    return p_remap_pfn_range(vma, 0, phys >> 12, size, 0);
-}
+    fp_unwrap_syscalln(29, 0, before_ioctl, 0);
 
-static const struct file_operations hfr_fops = {
-    .owner = 0,
-    .llseek = 0,
-    .read = hfr_read,
-    .write = hfr_write,
-    .unlocked_ioctl = hfr_ioctl,
-    .compat_ioctl = hfr_ioctl,
-    .mmap = hfr_mmap,
-    .poll = 0,
-    .open = hfr_open,
-    .release = hfr_release,
-};
-
-static void hfr_ring_init(struct hfr_ring *ring)
-{
-    memset(ring, 0, HFR_RING_BYTES);
-    ring->magic = HFR_RING_MAGIC;
-    ring->version = 1;
-    ring->slots = HFR_RING_SLOTS;
-    ring->elem_size = sizeof(struct hfr_packet);
-}
-
-static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
-{
-    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
-    if (!p_copy_from_user) p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
-    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
-    if (!p_copy_to_user) p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
-    p_access_process_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
-    p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
-    p_get_task_mm = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
-    p_mmput = (mmput_t)kallsyms_lookup_name("mmput");
-    p_get_task_struct = (get_task_struct_t)kallsyms_lookup_name("get_task_struct");
-    p_put_task_struct = (put_task_struct_t)kallsyms_lookup_name("put_task_struct");
-    p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
-    p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
-    p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
-    p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
-    p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
-    p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
-    p___register_chrdev = (__register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
-p___unregister_chrdev = (__unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
-    p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("__virt_to_phys");
-    if (!p_virt_to_phys) p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("virt_to_phys");
-    p_remap_pfn_range = (remap_pfn_range_t)kallsyms_lookup_name("remap_pfn_range");
-    p___get_free_pages = (__get_free_pages_t)kallsyms_lookup_name("__get_free_pages");
-    p_free_pages = (free_pages_t)kallsyms_lookup_name("free_pages");
-
-    if (!p_copy_from_user || !p_copy_to_user || !p_access_process_vm || !p_find_task_by_vpid ||
-        !p_get_task_mm || !p_mmput || !p_task_pid_nr_ns || !p___get_free_pages || !p_free_pages) {
-        kpm_err("critical symbol missing\n");
-        return -EFAULT;
+    kf__raw_spin_lock(&bp_lock);
+    struct bp_node *pos = bp_list.next;
+    while ((void *)pos != (void *)&bp_list) {
+        struct bp_node *next_node = pos->next;
+        bp_list_del(pos);
+        if (kf_unregister_hw_breakpoint)
+            kf_unregister_hw_breakpoint((void *)pos->perf_event);
+        kf_kfree(pos);
+        pos = next_node;
     }
+    kf__raw_spin_unlock(&bp_lock);
 
-    if (p_mutex_init) p_mutex_init(&g_ctx.lock);
-
-    g_ctx.ring_pages = p___get_free_pages(0, HFR_RING_ORDER);
-    if (!g_ctx.ring_pages) {
-        kpm_err("ring alloc failed\n");
-        return -ENOMEM;
-    }
-    g_ctx.ring = (struct hfr_ring *)g_ctx.ring_pages;
-    hfr_ring_init(g_ctx.ring);
-
-    if (p___register_chrdev) {
-    g_ctx.major = p___register_chrdev(0, 0, 1, "hfr_mem_shm", &hfr_fops);
-    if (g_ctx.major < 0) {
-        kpm_err("register_chrdev failed: %d", g_ctx.major);
-        p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
-        g_ctx.ring_pages = 0;
-        g_ctx.ring = 0;
-        return g_ctx.major;
-    }
-} else {
-    p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
-    g_ctx.ring_pages = 0;
-    g_ctx.ring = 0;
-    kpm_err("__register_chrdev missing");
-    return -EFAULT;
-}
-
-    kpm_info("initialized major=%d ring=%px size=%lu\n", g_ctx.major, g_ctx.ring, (unsigned long)HFR_RING_BYTES);
+    logv("hello_demo_exit\n");
     return 0;
 }
 
-static long hfr_memory_exit(void __user *reserved)
+
+static void before_ioctl(hook_fargs4_t *args, void *udata)
 {
-    if (p___unregister_chrdev && g_ctx.major > 0)
-    p___unregister_chrdev((unsigned int)g_ctx.major, 0, 1, "hfr_mem_shm");
-    if (g_ctx.ring_pages && p_free_pages)
-        p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
-    g_ctx.ring_pages = 0;
-    g_ctx.ring = 0;
-    g_ctx.major = 0;
-    return 0;
+    uint64_t *regs = syscall_args(args);
+    int64_t cmd = (int64_t)regs[1];
+    uint64_t user_data = regs[2];
+
+    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_REMOVE_ALL_HW_BREAKPOINT - OP_READ_MEM))
+        return;
+
+    if (cmd == OP_READ_MEM) {
+        copy_memory_t rcmd;
+        if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
+            return;
+        uint64_t remaining = rcmd.size;
+        if (!remaining) return;
+        uint64_t vaddr = rcmd.addr;
+        uint64_t outbuf = rcmd.buffer;
+
+        while (remaining) {
+            uint64_t pgsz = 1ULL << my_page_shift;
+            uint64_t pgoff = vaddr & (pgsz - 1);
+            uint64_t chunk = pgsz - pgoff;
+            if (chunk > remaining) chunk = remaining;
+
+            void *task = kf_find_task_by_vpid(rcmd.pid);
+            if (!task) goto next_chunk;
+            void *mm = kf_get_task_mm(task);
+            if (!mm) goto next_chunk;
+
+            uint64_t ps = my_page_shift;
+            uint64_t vb = my_va_bits;
+            uint64_t es = ps - 3;
+            int64_t levels = (int64_t)((vb - 4) / es);
+            uint64_t phys_addr = 0;
+
+            if (levels >= 1) {
+                int64_t level = 4 - levels;
+                uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
+                uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+                uint64_t imask = (1U << es) - 1;
+                int found = 0;
+
+                while (!found) {
+                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                    uint64_t dt = entry & 3;
+
+                    if (dt == 3) {
+                        tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                        level++;
+                        if (level >= 3) { found = 1; break; }
+                    } else if (dt == 1) {
+                        if (level == 0) {
+                            pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                            level++;
+                            if (level >= 3) { found = 1; break; }
+                            continue;
+                        }
+                        found = 1; break;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (found) {
+                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                    if ((~(uint16_t)entry & 0x401) == 0) {
+                        uint64_t pa_frame = 0;
+                        if (my_pa_bits == 52)
+                            pa_frame = (entry << 36) & 0xF000000000000ULL;
+                        phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
+                        phys_addr |= vaddr & ~(-1ULL << ps);
+                    }
+                }
+            }
+
+            if (kf_mmput) kf_mmput(mm);
+
+            if (phys_addr) {
+                if (kf_pfn_valid(phys_addr >> my_page_shift) &&
+                    kf_valid_phys_addr_range(phys_addr, chunk)) {
+                    uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
+                                 - *(uint64_t *)kv_memstart_addr
+                                 + (-1ULL << my_va_bits)
+                                 + (phys_addr & ~(-1ULL << my_page_shift));
+                    kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
+                }
+            }
+
+        next_chunk:
+            remaining -= chunk;
+            vaddr += chunk;
+            outbuf += chunk;
+        }
+        return;
+    }
+
+    if (cmd == OP_GET_CPU_NUM_BRPS || cmd == OP_GET_CPU_NUM_WRPS) {
+        uint64_t __attribute__((unused)) dfr0;
+        __asm__ volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
+        return;
+    }
+
+    if (cmd == OP_SET_HW_BREAKPOINT) {
+        hw_breakpoint_cmd_t bcmd;
+        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
+            return;
+
+        void *task = kf_find_task_by_vpid(bcmd.pid);
+        if (!task) return;
+
+        char attr[136];
+        if (kf_memset) kf_memset(attr, 0, sizeof(attr));
+
+        *(uint32_t *)(attr + 0x00) = 5;
+        if (kver >> 9 >= 0x285) {
+            *(uint32_t *)(attr + 0x04) = 120;
+            if (kver > 0x50EFF) {
+                *(uint32_t *)(attr + 0x04) = (kver >> 8 > 0x600) ? 136 : 128;
+            }
+        }
+        *(uint64_t *)(attr + 0x10) = 1;
+        *(uint64_t *)(attr + 0x28) |= 0x24;
+        *(uint32_t *)(attr + 0x34) = bcmd.type;
+        *(uint64_t *)(attr + 0x38) = bcmd.addr;
+        *(uint64_t *)(attr + 0x40) = bcmd.len;
+
+        void *ev = kf_register_user_hw_breakpoint(attr, hw_breakpoint_handler, 0, task);
+        if ((uint64_t)ev > 0xFFFFFFFFFFFFF000ULL) return;
+
+        if (kf_perf_event_enable) kf_perf_event_enable(ev);
+
+        void *(*alloc_fn)(uint64_t, uint32_t);
+        alloc_fn = kf_kmalloc ? (void *)kf_kmalloc : (void *)kf___kmalloc;
+        struct bp_node *node = (struct bp_node *)alloc_fn(sizeof(struct bp_node), 0xD0);
+        if (!node) {
+            if (kf_unregister_hw_breakpoint) kf_unregister_hw_breakpoint(ev);
+            return;
+        }
+
+        node->pid = bcmd.pid;
+        node->perf_event = (uint64_t)ev;
+        node->addr = bcmd.addr;
+
+        kf__raw_spin_lock(&bp_lock);
+        bp_list_add(node, &bp_list);
+        kf__raw_spin_unlock(&bp_lock);
+        return;
+    }
+
+    if (cmd == OP_REMOVE_HW_BREAKPOINT) {
+        hw_breakpoint_cmd_t bcmd;
+        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
+            return;
+
+        kf__raw_spin_lock(&bp_lock);
+        struct bp_node *pos = bp_list.next;
+        while ((void *)pos != (void *)&bp_list) {
+            struct bp_node *n = pos->next;
+            if (pos->pid == bcmd.pid && pos->addr == bcmd.addr) {
+                bp_list_del(pos);
+                if (kf_unregister_hw_breakpoint)
+                    kf_unregister_hw_breakpoint((void *)pos->perf_event);
+                kf_kfree(pos);
+                break;
+            }
+            pos = n;
+        }
+        kf__raw_spin_unlock(&bp_lock);
+        return;
+    }
+
+    if (cmd == OP_REMOVE_ALL_HW_BREAKPOINT) {
+        kf__raw_spin_lock(&bp_lock);
+        struct bp_node *pos = bp_list.next;
+        while ((void *)pos != (void *)&bp_list) {
+            struct bp_node *n = pos->next;
+            bp_list_del(pos);
+            if (kf_unregister_hw_breakpoint)
+                kf_unregister_hw_breakpoint((void *)pos->perf_event);
+            kf_kfree(pos);
+            pos = n;
+        }
+        kf__raw_spin_unlock(&bp_lock);
+        return;
+    }
 }
 
-KPM_INIT(hfr_memory_init);
-KPM_EXIT(hfr_memory_exit);
+KPM_INIT(hello_demo_init);
+KPM_CTL0(hello_demo_control0);
+KPM_EXIT(hello_demo_exit);
