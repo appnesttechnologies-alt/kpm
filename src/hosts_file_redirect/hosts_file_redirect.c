@@ -7,6 +7,7 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
+#include <linux/rcupdate.h>
 
 KPM_NAME("core_helper_kpm");
 KPM_VERSION("1.0");
@@ -18,31 +19,19 @@ KPM_DESCRIPTION("Core Helper Module");
 #define kpm_info(fmt, ...) pr_info(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)  pr_err(KPM_PREFIX ": " fmt, ##__VA_ARGS__)
 
-#define MAX_INLINE     256
 #define OP_FETCH_DATA  0x4000
 
 #define STATUS_SUCCESS        0x0000
-#define STATUS_INVALID_SIZE   0x1005
 #define STATUS_PROC_NOT_FOUND 0x1008
 #define STATUS_BAD_OPCODE     0x1007
 
 /*
- * This build environment (KernelPatch's minimal KPM headers) has no
- * linux/proc_fs.h at all - confirmed by the CI failure on
- * hosts_file_redirect.c. So struct proc_ops MUST be defined locally.
- *
- * The bug in the original file was NOT that it defined this locally -
- * that's required here. The bug was that it was MISSING two fields
- * that the real kernel's struct proc_ops has: proc_read_iter and
- * proc_lseek. Because proc_create_data() is a REAL kernel function,
- * it reads/writes this struct using the REAL layout. Our local struct
- * must match that layout field-for-field, in the same order, or
- * proc_write ends up at the wrong byte offset and the kernel jumps
- * into garbage when something calls it -> crash.
- *
- * This layout matches what you confirmed from your own
- * include/linux/proc_fs.h on kernel 5.10.252, and matches the working
- * hosts_file_redirect.c module in this same repo.
+ * Real proc_ops layout for kernel 5.10.x (confirmed from your own
+ * include/linux/proc_fs.h, and matching hosts_file_redirect.c in this
+ * same repo). This build environment has no linux/proc_fs.h at all, so
+ * this MUST be defined locally - the earlier crash was because two
+ * fields (proc_read_iter, proc_lseek) were missing here, which shifted
+ * every field after proc_read to the wrong byte offset.
  */
 struct proc_ops {
     unsigned int proc_flags;
@@ -58,14 +47,21 @@ struct proc_ops {
     unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 };
 
-/*
- * struct file is never dereferenced anywhere in this module - it's only
- * ever passed around as an opaque pointer (matching what the real kernel
- * gives us). So we just forward-declare it instead of defining fake
- * members; there's no struct-layout risk since we never touch its fields.
- */
+/* Never dereferenced - only ever passed as an opaque pointer. */
 struct file;
 
+/*
+ * NOTE: p_state and p_flags are kept in the wire format for compatibility
+ * with your original userspace tool, but this framework's headers do
+ * NOT expose task->state or task->flags generically - see
+ * src/cgroupv2_freeze/cfv2_offsets.c: getting those requires disassembling
+ * real kernel functions at runtime to recover the byte offset, because
+ * there's no debug-info shortcut here. That's a heavier, kernel-version-
+ * specific technique. This version fills p_state/p_flags with 0 and
+ * focuses on what IS reliably available: pid, tgid, comm. Say the word
+ * if you want state/flags added using the offset-scanning approach -
+ * it's doable but a bigger, more fragile piece of code.
+ */
 struct k_packet {
     uint32_t op_code;
     int32_t  target_pid;
@@ -95,21 +91,25 @@ static int fetch_process_data(struct k_packet *pkt)
     struct task_struct *task;
 
     rcu_read_lock();
-    task = pid_task(find_vpid(pkt->target_pid), PIDTYPE_PID);
+    task = find_task_by_vpid(pkt->target_pid);
     if (!task) {
         rcu_read_unlock();
         return -ESRCH;
     }
-    get_task_struct(task);
+
+    pkt->p_pid  = task_pid_vnr(task);
+    pkt->p_tgid = __task_pid_nr_ns(task, PIDTYPE_TGID, NULL);
+
+    const char *comm = get_task_comm(task);
+    memset(pkt->comm, 0, sizeof(pkt->comm));
+    if (comm)
+        memcpy(pkt->comm, comm, sizeof(pkt->comm) - 1);
+
+    /* Not available without runtime offset-scanning - see comment above. */
+    pkt->p_state = 0;
+    pkt->p_flags = 0;
+
     rcu_read_unlock();
-
-    pkt->p_pid = task_pid_nr(task);
-    pkt->p_tgid = task_tgid_nr(task);
-    pkt->p_state = task->__state;
-    pkt->p_flags = task->flags;
-    get_task_comm(pkt->comm, task);
-
-    put_task_struct(task);
     return 0;
 }
 
@@ -132,7 +132,6 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
 {
     struct k_packet local_pkt;
 
-    /* reject anything that isn't exactly one packet, both directions */
     if (count != sizeof(struct k_packet))
         return -EINVAL;
 
@@ -174,6 +173,24 @@ static long core_init(const char *args, const char *event, void __user *reserved
         kpm_err("Failed to resolve symbols\n");
         return -EFAULT;
     }
+
+    /*
+     * These resolve the underlying real kernel functions that
+     * find_task_by_vpid() / __task_pid_nr_ns() / rcu_read_lock() /
+     * rcu_read_unlock() call through internally (via this framework's
+     * kfunc mechanism, matching the pattern used in cgroupv2_freeze.c's
+     * init - e.g. kfunc_lookup_name(wake_up_process)).
+     *
+     * I could not 100% verify the exact macro name/behavior of
+     * kfunc_lookup_name from what you've shared so far (only its usage
+     * site, not its definition in ksyms.h). If this line doesn't
+     * compile, paste kernel/patch/include/ksyms.h and I'll correct it
+     * precisely rather than guess again.
+     */
+    kfunc_lookup_name(find_task_by_vpid);
+    kfunc_lookup_name(__task_pid_nr_ns);
+    kfunc_lookup_name(__rcu_read_lock);
+    kfunc_lookup_name(__rcu_read_unlock);
 
     proc_entry = p_proc_create_data(proc_filename, 0660, NULL, &p_ops, NULL);
     if (!proc_entry) {
