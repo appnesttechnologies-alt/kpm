@@ -12,7 +12,7 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/mm_types.h>
+#include <asm/pgtable.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -20,7 +20,6 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
 KPM_DESCRIPTION("KPM Shared Memory Bridge via access_process_vm");
 
-#define HFR_DEBUG
 #ifdef HFR_DEBUG
 #define kpm_info(fmt, ...) pr_info("HFR: " fmt, ##__VA_ARGS__)
 #define kpm_err(fmt, ...)  pr_err("HFR: " fmt, ##__VA_ARGS__)
@@ -33,37 +32,38 @@ KPM_DESCRIPTION("KPM Shared Memory Bridge via access_process_vm");
 // SHARED MEMORY STRUCTURE
 // ============================================================
 
-#define SHM_SIZE         8192    // 2 pages for safety
+#define SHM_SIZE         8192    // 2 pages
 #define MAX_OPS          128
 #define DATA_BUFFER_SIZE 4096
 
 #define OP_READ_VM       0x2000
 #define OP_WRITE_VM      0x3000
 
+#define HFR_FOLL_WRITE   0x01
+#define FOLL_FORCE       0x10
+
 struct shm_op {
     uint64_t addr;
     uint32_t size;
-    uint32_t op;           // OP_READ_VM or OP_WRITE_VM
-    int32_t  result;       // 0=success, negative=error
+    uint32_t op;
+    int32_t  result;
 } __attribute__((aligned(8), packed));
 
 struct shm_header {
-    uint32_t magic;         // 0x4846524D ("HFRM")
+    uint32_t magic;         // 0x4846524D
     uint32_t target_pid;
-    uint32_t op_count;      
-    uint32_t version;       
-    uint32_t result_count;  
-    uint32_t data_size;     // Total data bytes used
+    uint32_t op_count;
+    uint32_t version;
+    uint32_t result_count;
+    uint32_t data_size;
     uint32_t pad[2];
 } __attribute__((aligned(8), packed));
-
-// Layout: [shm_header][shm_op array][data buffer]
 
 // ============================================================
 // SYMBOL TYPEDEFS
 // ============================================================
 
-typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const struct proc_ops *, void *);
+typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const void *, void *);
 typedef void  (*remove_proc_entry_t)(const char *, void *);
 typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
@@ -76,7 +76,7 @@ typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
 
 // ============================================================
-// FILE OPS FORWARD DECLARATIONS
+// FILE OPS STRUCT (KPM-compatible)
 // ============================================================
 
 struct inode;
@@ -119,7 +119,7 @@ static rcu_read_unlock_t     p_rcu_read_unlock = NULL;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
-static void       *shm_kernel    = NULL;  // Kernel buffer
+static void       *shm_kernel    = NULL;
 static size_t      shm_size      = 0;
 
 // ============================================================
@@ -163,7 +163,7 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
     target_pid = hdr->target_pid ? (pid_t)hdr->target_pid : caller_pid;
     if (target_pid <= 0) {
         struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < count; i++) {
+        for (i = 0; i < (int)count; i++) {
             ops[i].result = -EINVAL;
         }
         hdr->result_count = count;
@@ -177,7 +177,7 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
         struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < count; i++) {
+        for (i = 0; i < (int)count; i++) {
             ops[i].result = -ESRCH;
         }
         hdr->result_count = count;
@@ -191,7 +191,7 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
     if (!mm) {
         if (p_put_task_struct && task) p_put_task_struct(task);
         struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < count; i++) {
+        for (i = 0; i < (int)count; i++) {
             ops[i].result = -ESRCH;
         }
         hdr->result_count = count;
@@ -204,7 +204,7 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
     uint32_t current_offset = 0;
 
     // Process all operations
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < (int)count; i++) {
         struct shm_op *op = &ops[i];
         
         if (op->size == 0 || op->size > 256) {
@@ -229,9 +229,9 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
         
         unsigned int gup_flags;
         if (op->op == OP_WRITE_VM) {
-            gup_flags = 0x01 | 0x10;  // FOLL_WRITE | FOLL_FORCE
+            gup_flags = HFR_FOLL_WRITE | FOLL_FORCE;
         } else {
-            gup_flags = 0x10;          // FOLL_FORCE
+            gup_flags = FOLL_FORCE;
         }
 
         int transferred = p_access_process_vm(task, (unsigned long)op->addr, 
@@ -259,7 +259,7 @@ static void process_batch(struct shm_header *hdr, pid_t caller_pid)
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
     
-    // Increment version for userspace
+    // Increment version for userspace polling
     hdr->version++;
 }
 
@@ -283,8 +283,8 @@ static int proc_mmap_handler(struct file *file, struct vm_area_struct *vma)
         return -EINVAL;
     }
 
-    // Get physical address of kernel buffer
-    pfn = virt_to_phys(shm_kernel) >> PAGE_SHIFT;
+    // Cast pointer to uint64_t for virt_to_phys
+    pfn = virt_to_phys((uint64_t)(unsigned long)shm_kernel) >> PAGE_SHIFT;
     
     // Set VM flags
     vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
@@ -297,8 +297,7 @@ static int proc_mmap_handler(struct file *file, struct vm_area_struct *vma)
         return -EAGAIN;
     }
 
-    kpm_info("mmap: mapped %lu bytes at 0x%lx -> pfn 0x%lx\n", 
-             size, vma->vm_start, pfn);
+    kpm_info("mmap: mapped %lu bytes at 0x%lx\n", size, vma->vm_start);
     return 0;
 }
 
@@ -358,6 +357,7 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer,
     return (ssize_t)hdr->result_count;
 }
 
+// Use const to match KPM's expected proc_ops signature
 static const struct proc_ops p_ops = {
     .proc_flags   = 0,
     .proc_open    = proc_open_handler,
@@ -393,13 +393,9 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
     p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
 
-    kpm_info("Symbols resolved:\n");
-    kpm_info("  proc_create_data: %px\n", p_proc_create_data);
-    kpm_info("  access_process_vm: %px\n", p_access_process_vm);
-    kpm_info("  find_task_by_vpid: %px\n", p_find_task_by_vpid);
-    kpm_info("  get_task_mm: %px\n", p_get_task_mm);
-    kpm_info("  mmput: %px\n", p_mmput);
-    kpm_info("  task_pid_nr_ns: %px\n", p_task_pid_nr_ns);
+    kpm_info("Symbols: proc=%px vm=%px task=%px mm=%px\n",
+             (void *)p_proc_create_data, (void *)p_access_process_vm, 
+             (void *)p_find_task_by_vpid, (void *)p_get_task_mm);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput) {
@@ -407,7 +403,7 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
         return -EFAULT;
     }
 
-    // Allocate shared memory (page-aligned for mmap)
+    // Allocate shared memory
     shm_size = SHM_SIZE;
     shm_kernel = kzalloc(shm_size, GFP_KERNEL);
     if (!shm_kernel) {
@@ -417,16 +413,14 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     // Initialize header
     struct shm_header *hdr = (struct shm_header *)shm_kernel;
+    memset(hdr, 0, sizeof(struct shm_header));
     hdr->magic = 0x4846524D;
     hdr->version = 0;
-    hdr->op_count = 0;
-    hdr->target_pid = 0;
 
-    kpm_info("SHM allocated at %px (phys: %llx, size: %zu)\n", 
-             shm_kernel, virt_to_phys(shm_kernel), shm_size);
+    kpm_info("SHM allocated at %px (size: %zu)\n", shm_kernel, shm_size);
 
-    // Create proc entry
-    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, &p_ops, NULL);
+    // Create proc entry - cast away const for KPM compatibility
+    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, (const void *)&p_ops, NULL);
     if (!proc_entry) {
         kpm_err("proc_create FAILED for /proc/%s\n", proc_filename);
         kfree(shm_kernel);
