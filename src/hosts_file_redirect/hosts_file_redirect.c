@@ -263,7 +263,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
-    // Handle OP_FIND_PID_BY_NAME
+        // Handle OP_FIND_PID_BY_NAME
     if (pkt->op_code == OP_FIND_PID_BY_NAME) {
         char name[TASK_COMM_LEN];
         if (p_memset) p_memset(name, 0, sizeof(name));
@@ -274,11 +274,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
         pid_t pid = find_pid_by_name(name);
         if (pid <= 0) {
+            kpm_err("Process not found for name: '%s'\n", name);
             pkt->status = STATUS_NO_TASK;
-            return;
+        } else {
+            pkt->target_pid = (uint32_t)pid;
+            pkt->status = STATUS_SUCCESS;
+            kpm_info("OP_FIND_PID_BY_NAME SUCCESS: pid=%d\n", pid);
         }
-        pkt->target_pid = (uint32_t)pid;
-        pkt->status = STATUS_SUCCESS;
         return;
     }
 
@@ -306,13 +308,16 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         unsigned long base = find_lib_base_by_name(task, lib_name);
         if (base == 0) {
             pkt->status = STATUS_LIB_NOT_FOUND;
-            return;
+        } else {
+            pkt->vaddr = (uint64_t)base;
+            pkt->status = STATUS_SUCCESS;
+            kpm_info("OP_FIND_LIB_BASE SUCCESS: lib=%s base=0x%lx\n", lib_name, base);
         }
-
-        pkt->vaddr = (uint64_t)base;
-        pkt->status = STATUS_SUCCESS;
         return;
     }
+
+
+        
 
     // Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
