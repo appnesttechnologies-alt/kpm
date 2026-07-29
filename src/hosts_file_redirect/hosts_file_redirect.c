@@ -15,7 +15,10 @@
 #include <linux/sched/task.h>
 #include <linux/dcache.h>
 #include <linux/fs.h>
-#include <linux/rcupdate.h>          // rcu_read_lock/unlock
+#include <linux/rcupdate.h>
+#include <linux/path.h>
+#include <linux/limits.h>
+#include <linux/err.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -144,7 +147,7 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 
-// ✅ FIXED: Find PID by process name
+// Find PID by process name
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
@@ -155,7 +158,7 @@ static pid_t find_pid_by_name(const char *name)
         return 0;
 
     strncpy(target_name, name, TASK_COMM_LEN - 1);
-    target_name[TASK_COMM_LEN - 1] = '';
+    target_name[TASK_COMM_LEN - 1] = '\0';
 
     rcu_read_lock();
     for_each_process(task) {
@@ -170,7 +173,7 @@ static pid_t find_pid_by_name(const char *name)
     return found_pid;
 }
 
-// ✅ FIXED: Find library base address by name
+// Find library base address by name
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
 {
     struct mm_struct *mm;
@@ -193,6 +196,13 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         return 0;
     }
 
+    // Fix: Use mmap_read_lock instead of direct mmap access
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+        mmap_read_lock(mm);
+    #else
+        down_read(&mm->mmap_sem);
+    #endif
+
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (!vma->vm_file)
             continue;
@@ -207,6 +217,12 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
             break;
         }
     }
+
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+        mmap_read_unlock(mm);
+    #else
+        up_read(&mm->mmap_sem);
+    #endif
 
     kfree(buf);
     p_mmput(mm);
@@ -226,12 +242,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
-    // ✅ Handle new opcodes
+    // Handle new opcodes
     if (pkt->op_code == OP_FIND_PID_BY_NAME) {
         char name[TASK_COMM_LEN];
         memset(name, 0, sizeof(name));
-        strncpy(name, pkt->inline_data, sizeof(name) - 1);
-        name[TASK_COMM_LEN - 1] = '';
+        // Fix: Use correct string copy with proper null termination
+        strncpy(name, (const char *)pkt->inline_data, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
 
         pid_t pid = find_pid_by_name(name);
         if (pid <= 0) {
@@ -246,8 +263,9 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (pkt->op_code == OP_FIND_LIB_BASE) {
         char lib_name[64];
         memset(lib_name, 0, sizeof(lib_name));
-        strncpy(lib_name, pkt->inline_data, sizeof(lib_name) - 1);
-        lib_name[sizeof(lib_name) - 1] = '';
+        // Fix: Use correct string copy with proper null termination
+        strncpy(lib_name, (const char *)pkt->inline_data, sizeof(lib_name) - 1);
+        lib_name[sizeof(lib_name) - 1] = '\0';
 
         target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
         if (target_pid <= 0) {
@@ -272,7 +290,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    // ✅ Existing READ/WRITE logic
+    // Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
         kpm_err("BAD_OPCODE: 0x%x", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
@@ -368,8 +386,8 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
-        kpm_info("PARTIAL_IO: wanted %u got %d
-", pkt->size, transferred);
+        // Fix: Properly formatted multi-line string
+        kpm_info("PARTIAL_IO: wanted %u got %d", pkt->size, transferred);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
@@ -402,9 +420,8 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     }
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_from_user failed
-
-            ");
+        // Fix: Properly formatted string
+        kpm_err("copy_from_user failed");
         return -EFAULT;
     }
 
@@ -456,7 +473,8 @@ static const struct proc_ops p_ops = {
     .proc_poll    = NULL,
     .proc_ioctl   = NULL,
     .proc_mmap    = NULL,
-    .proc_get_unmapped_area = NULL,};
+    .proc_get_unmapped_area = NULL,
+};
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
@@ -493,7 +511,6 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     if (p_mutex_init) p_mutex_init(&hfr_mutex);
 
-    // ⚠️ SECURITY: 0600 = only root can access
     proc_entry = p_proc_create_data(proc_filename, 0600, NULL, &p_ops, NULL);
     if (!proc_entry) {
         kpm_err("proc_create FAILED");
