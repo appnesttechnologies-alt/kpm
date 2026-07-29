@@ -175,7 +175,7 @@ static pid_t find_pid_by_name(const char *name)
     if (!name || !name[0])
         return 0;
 
-    if (!p_next_task || !p_get_task_comm || !p_task_tgid_nr_ns || !p_strcmp)
+    if (!p_next_task || !p_get_task_comm || !p_task_tgid_nr_ns || !p_strcmp || !p_task_pid_nr_ns)
         return 0;
 
     init_task_ptr = (struct task_struct *)kallsyms_lookup_name("init_task");
@@ -192,14 +192,15 @@ static pid_t find_pid_by_name(const char *name)
         if (!task)
             break;
 
-        // Only thread group leaders
-        if (task->group_leader != task)
+        // Only thread group leaders - use TGID == PID check instead
+        pid_t pid = p_task_pid_nr_ns(task, PIDTYPE_PID, NULL);
+        pid_t tgid = p_task_tgid_nr_ns(task, PIDTYPE_TGID, NULL);
+        
+        if (pid != tgid)
             continue;
 
         p_memset(comm, 0, sizeof(comm));
         p_get_task_comm(comm, task);
-
-        pid_t pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
 
         // PRINT EVERY PROCESS
         kpm_info("  PID=%d COMM='%s'\n", pid, comm);
