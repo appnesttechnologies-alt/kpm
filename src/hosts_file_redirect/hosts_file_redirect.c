@@ -50,7 +50,7 @@ KPM_DESCRIPTION("KPM shared-memory memory bridge via char device + mmap ring buf
 #define HFR_RING_BYTES      (4096UL << HFR_RING_ORDER)
 #define HFR_RING_MAGIC      0x48465231u
 #define HFR_RING_SLOTS      32
-
+#define HFR_IOCTL_SUBMIT 0x48465200u
 struct inode;
 struct file;
 struct vm_area_struct;
@@ -299,7 +299,7 @@ static long hfr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     uint32_t next_rsp;
 
     if (!p_copy_from_user || !p_copy_to_user) return -EFAULT;
-    if (cmd != 0xHFR0) return -EINVAL;
+    if (cmd != HFR_IOCTL_SUBMIT) return -EINVAL;
     if (p_copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)) != 0) return -EFAULT;
 
     curr_task = hfr_get_current();
