@@ -165,10 +165,8 @@ static inline int is_valid_user_address(uint64_t addr)
 //FF PID FINDING
 static pid_t find_pid_by_name(const char *name)
 {
-    struct task_struct *task, *start;
-    char comm[TASK_COMM_LEN];
-
     struct task_struct *task;
+    char comm[TASK_COMM_LEN];
 
 kpm_info("=== PROCESS LIST START ===");
 
@@ -190,6 +188,7 @@ for_each_process(task) {
 kpm_info("=== PROCESS LIST END ===");
 
 return 0;
+};
 
 
 
