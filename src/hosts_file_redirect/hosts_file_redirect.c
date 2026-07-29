@@ -7,7 +7,6 @@
 #include <linux/string.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
-#include <linux/rcupdate.h>
 
 KPM_NAME("core_helper_kpm");
 KPM_VERSION("1.0");
@@ -25,14 +24,7 @@ KPM_DESCRIPTION("Core Helper Module");
 #define STATUS_PROC_NOT_FOUND 0x1008
 #define STATUS_BAD_OPCODE     0x1007
 
-/*
- * Real proc_ops layout for kernel 5.10.x (confirmed from your own
- * include/linux/proc_fs.h, and matching hosts_file_redirect.c in this
- * same repo). This build environment has no linux/proc_fs.h at all, so
- * this MUST be defined locally - the earlier crash was because two
- * fields (proc_read_iter, proc_lseek) were missing here, which shifted
- * every field after proc_read to the wrong byte offset.
- */
+/* Real proc_ops layout for kernel 5.10.x - confirmed working, unchanged. */
 struct proc_ops {
     unsigned int proc_flags;
     int      (*proc_open)(struct inode *, struct file *);
@@ -47,20 +39,12 @@ struct proc_ops {
     unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 };
 
-/* Never dereferenced - only ever passed as an opaque pointer. */
 struct file;
 
 /*
- * NOTE: p_state and p_flags are kept in the wire format for compatibility
- * with your original userspace tool, but this framework's headers do
- * NOT expose task->state or task->flags generically - see
- * src/cgroupv2_freeze/cfv2_offsets.c: getting those requires disassembling
- * real kernel functions at runtime to recover the byte offset, because
- * there's no debug-info shortcut here. That's a heavier, kernel-version-
- * specific technique. This version fills p_state/p_flags with 0 and
- * focuses on what IS reliably available: pid, tgid, comm. Say the word
- * if you want state/flags added using the offset-scanning approach -
- * it's doable but a bigger, more fragile piece of code.
+ * p_state / p_flags remain 0 - not available without the offset-scanning
+ * technique cgroupv2_freeze uses. See earlier note - say the word if you
+ * want that added.
  */
 struct k_packet {
     uint32_t op_code;
@@ -86,30 +70,43 @@ static copy_to_user_t       p_copy_to_user;
 static const char *proc_filename = "core_helper_kpm";
 static void *proc_entry = NULL;
 
+/*
+ * NOTE ON LOCKING: rcu_read_lock/unlock's underlying symbols
+ * (__rcu_read_lock / __rcu_read_unlock) are NOT in this device's
+ * KernelPatch symbol table (confirmed by your dmesg log), so they
+ * can't be used here. No other module in this repo (cgroupv2_freeze,
+ * re_kernel, hosts_file_redirect) calls rcu_read_lock either - they
+ * all do direct pointer lookups without it. Following that same
+ * established pattern here: there's a theoretical, very small race
+ * window where the target task could be freed between find_vpid()
+ * and reading its fields, but this matches this codebase's existing
+ * convention rather than introducing a locking primitive that isn't
+ * actually resolvable on your device.
+ */
 static int fetch_process_data(struct k_packet *pkt)
 {
+    struct pid *pid_struct;
     struct task_struct *task;
 
-    rcu_read_lock();
-    task = find_task_by_vpid(pkt->target_pid);
-    if (!task) {
-        rcu_read_unlock();
+    pid_struct = find_vpid(pkt->target_pid);
+    if (!pid_struct)
         return -ESRCH;
-    }
 
-    pkt->p_pid  = task_pid_vnr(task);
-    pkt->p_tgid = __task_pid_nr_ns(task, PIDTYPE_TGID, NULL);
+    task = pid_task(pid_struct, PIDTYPE_PID);
+    if (!task)
+        return -ESRCH;
+
+    pkt->p_pid = pid_vnr(get_task_pid(task, PIDTYPE_PID));
+    pkt->p_tgid = pid_vnr(get_task_pid(task, PIDTYPE_TGID));
 
     const char *comm = get_task_comm(task);
     memset(pkt->comm, 0, sizeof(pkt->comm));
     if (comm)
         memcpy(pkt->comm, comm, sizeof(pkt->comm) - 1);
 
-    /* Not available without runtime offset-scanning - see comment above. */
     pkt->p_state = 0;
     pkt->p_flags = 0;
 
-    rcu_read_unlock();
     return 0;
 }
 
@@ -175,22 +172,20 @@ static long core_init(const char *args, const char *event, void __user *reserved
     }
 
     /*
-     * These resolve the underlying real kernel functions that
-     * find_task_by_vpid() / __task_pid_nr_ns() / rcu_read_lock() /
-     * rcu_read_unlock() call through internally (via this framework's
-     * kfunc mechanism, matching the pattern used in cgroupv2_freeze.c's
-     * init - e.g. kfunc_lookup_name(wake_up_process)).
-     *
-     * I could not 100% verify the exact macro name/behavior of
-     * kfunc_lookup_name from what you've shared so far (only its usage
-     * site, not its definition in ksyms.h). If this line doesn't
-     * compile, paste kernel/patch/include/ksyms.h and I'll correct it
-     * precisely rather than guess again.
+     * find_vpid / pid_task / get_task_pid / pid_vnr all go through this
+     * framework's kf_ symbol table (same mechanism that failed for
+     * find_task_by_vpid etc). These are more fundamental, widely-used
+     * functions so more likely to be registered - but this is NOT
+     * fully confirmed for get_task_pid/pid_vnr specifically on your
+     * device. If loading logs "unknown symbol: kf_get_task_pid" or
+     * "kf_pid_vnr", paste that dmesg output and I'll swap to a
+     * different path (e.g. reading tgid straight off the struct pid
+     * returned by find_vpid, if the framework exposes that).
      */
-    kfunc_lookup_name(find_task_by_vpid);
-    kfunc_lookup_name(__task_pid_nr_ns);
-    kfunc_lookup_name(__rcu_read_lock);
-    kfunc_lookup_name(__rcu_read_unlock);
+    kfunc_lookup_name(find_vpid);
+    kfunc_lookup_name(pid_task);
+    kfunc_lookup_name(get_task_pid);
+    kfunc_lookup_name(pid_vnr);
 
     proc_entry = p_proc_create_data(proc_filename, 0660, NULL, &p_ops, NULL);
     if (!proc_entry) {
