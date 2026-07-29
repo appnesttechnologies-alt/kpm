@@ -259,7 +259,7 @@ static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int 
 
 static long hello_demo_exit(void *__user reserved)
 {
-    fp_unwrap_syscalln(29, 0, before_ioctl, 0);
+    fp_unhook_syscall(29, 0, before_ioctl, 0);
 
     kf__raw_spin_lock(&bp_lock);
     struct bp_node *pos = bp_list.next;
