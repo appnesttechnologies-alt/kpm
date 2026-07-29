@@ -164,37 +164,33 @@ static inline int is_valid_user_address(uint64_t addr)
 //FF PID FINDING
 static pid_t find_pid_by_name(const char *name)
 {
-    struct task_struct *task, *init_tsk_ptr = NULL;
-    pid_t found_pid = 0;
+    struct task_struct *task, *start;
     char comm[TASK_COMM_LEN];
 
-    if (!p_next_task || !p_get_task_comm || !p_strstr || !p_task_tgid_nr_ns)
+    task = hfr_get_current();
+    if (!task)
         return 0;
 
-    // ✅ Fix: init_task ki jagah current task se loop start hoga taaki NULL na aaye
-    task = hfr_get_current();
-    if (!task) return 0;
+    start = task;
 
-    init_tsk_ptr = task;
-    
+    kpm_info("=== PROCESS LIST START ===\n");
+
     do {
         p_get_task_comm(comm, task);
-        
-        // 🔥 Kernel ke andar "freefir" keyword match kara rahe hain
-        if (p_strstr(comm, "freefir")) {
-            found_pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
-            if (found_pid > 0) {
-                kpm_info("Found target process: comm=%s pid=%d\n", comm, found_pid);
-                break;
-            }
-        }
-        
+
+        kpm_info("PID=%d COMM=%s TASK=%px\n",
+                 p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL),
+                 comm,
+                 task);
+
         task = p_next_task(task);
-    } while (task && task != init_tsk_ptr);
 
-    return found_pid;
+    } while (task && task != start);
+
+    kpm_info("=== PROCESS LIST END ===\n");
+
+    return 0;
 }
-
 
 
 
