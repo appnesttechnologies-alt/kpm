@@ -163,22 +163,19 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 //FF PID FINDING
+
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     struct task_struct *init_task_ptr;
     pid_t found_pid = 0;
 
-    char buf[256];
-
-    unsigned long start;
-    unsigned long end;
-    size_t len;
+    char comm[TASK_COMM_LEN];
 
     if (!name || !name[0])
         return 0;
 
-    if (!p_next_task || !p_access_process_vm)
+    if (!p_next_task || !p_get_task_comm || !p_task_pid_nr_ns)
         return 0;
 
     init_task_ptr = (struct task_struct *)kallsyms_lookup_name("init_task");
@@ -186,53 +183,43 @@ static pid_t find_pid_by_name(const char *name)
     if (!init_task_ptr)
         return 0;
 
+
     task = init_task_ptr;
 
     do {
+
         task = p_next_task(task);
 
         if (!task)
             break;
 
-        if (!task->mm)
-            continue;
 
-        start = task->mm->arg_start;
-        end   = task->mm->arg_end;
+        memset(comm, 0, sizeof(comm));
 
-        if (!start || end <= start)
-            continue;
+        p_get_task_comm(comm, task);
 
-        len = end - start;
 
-        if (len >= sizeof(buf))
-            len = sizeof(buf) - 1;
+        if (strcmp(comm, name) == 0) {
 
-        if (p_access_process_vm(task,
-                                start,
-                                buf,
-                                len,
-                                0) != len)
-            continue;
+            found_pid = p_task_pid_nr_ns(
+                task,
+                PIDTYPE_PID,
+                NULL
+            );
 
-        buf[len] = '\0';
-
-        if (strcmp(buf, name) == 0) {
-
-            found_pid = task->pid;
-
-            kpm_info("Found process argv=%s pid=%d\n",
-                     buf,
+            kpm_info("FOUND %s pid=%d\n",
+                     comm,
                      found_pid);
 
             break;
         }
 
+
     } while (task != init_task_ptr);
+
 
     return found_pid;
 }
-
 
 // Find library base address using dynamic functions
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
