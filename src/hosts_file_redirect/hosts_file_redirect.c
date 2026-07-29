@@ -126,7 +126,9 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 typedef int (*register_chrdev_t)(unsigned int, const char *, const struct file_operations *);
-typedef int (*unregister_chrdev_t)(unsigned int, const char *);
+typedef int (*__register_chrdev_t)(unsigned int, unsigned int, unsigned int, const char *, const struct file_operations *);
+typedef void (*unregister_chrdev_t)(unsigned int, const char *);
+typedef void (*__unregister_chrdev_t)(unsigned int, unsigned int, unsigned int, const char *);
 typedef unsigned long (*virt_to_phys_t)(volatile void *address);
 typedef int (*remap_pfn_range_t)(struct vm_area_struct *, unsigned long, unsigned long, unsigned long, unsigned long);
 typedef void *(*__get_free_pages_t)(unsigned int, unsigned int);
@@ -146,8 +148,10 @@ static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
-static register_chrdev_t     p_register_chrdev;
-static unregister_chrdev_t   p_unregister_chrdev;
+static register_chrdev_t      p_register_chrdev;
+static __register_chrdev_t    p___register_chrdev;
+static unregister_chrdev_t    p_unregister_chrdev;
+static __unregister_chrdev_t  p___unregister_chrdev;
 static virt_to_phys_t        p_virt_to_phys;
 static remap_pfn_range_t     p_remap_pfn_range;
 static __get_free_pages_t    p___get_free_pages;
@@ -371,10 +375,11 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
-    p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
-    if (!p_register_chrdev) p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("register_chrdev");
-    p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
-    if (!p_unregister_chrdev) p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("unregister_chrdev");
+    p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("register_chrdev");
+p___register_chrdev = (__register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
+
+p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("unregister_chrdev");
+p___unregister_chrdev = (__unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
     p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("__virt_to_phys");
     if (!p_virt_to_phys) p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("virt_to_phys");
     p_remap_pfn_range = (remap_pfn_range_t)kallsyms_lookup_name("remap_pfn_range");
@@ -398,15 +403,29 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     hfr_ring_init(g_ctx.ring);
 
     if (p_register_chrdev) {
-        g_ctx.major = p_register_chrdev(0, "hfr_mem_shm", &hfr_fops);
-        if (g_ctx.major < 0) {
-            p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
-            g_ctx.ring_pages = 0;
-            g_ctx.ring = 0;
-            kpm_err("register_chrdev failed: %d\n", g_ctx.major);
-            return g_ctx.major;
-        }
-    }
+    g_ctx.major = p_register_chrdev(0, "hfr_mem_shm", &hfr_fops);
+} else if (p___register_chrdev) {
+    g_ctx.major = p___register_chrdev(0, 0, 1, "hfr_mem_shm", &hfr_fops);
+} else {
+    p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
+    g_ctx.ring_pages = 0;
+    g_ctx.ring = 0;
+    kpm_err("no chrdev registration symbol
+");
+    return -EFAULT;
+}
+
+if (g_ctx.major < 0) {
+    p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
+    g_ctx.ring_pages = 0;
+    g_ctx.ring = 0;
+    kpm_err("register_chrdev failed: %d
+", g_ctx.major);
+    return g_ctx.major;
+}
+
+kpm_info("chrdev major=%d
+", g_ctx.major);
 
     kpm_info("initialized major=%d ring=%px size=%lu\n", g_ctx.major, g_ctx.ring, (unsigned long)HFR_RING_BYTES);
     return 0;
@@ -414,8 +433,12 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    if (p_unregister_chrdev && g_ctx.major > 0)
+    if (g_ctx.major > 0) {
+    if (p_unregister_chrdev)
         p_unregister_chrdev((unsigned int)g_ctx.major, "hfr_mem_shm");
+    else if (p___unregister_chrdev)
+        p___unregister_chrdev((unsigned int)g_ctx.major, 0, 1, "hfr_mem_shm");
+}
     if (g_ctx.ring_pages && p_free_pages)
         p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
     g_ctx.ring_pages = 0;
