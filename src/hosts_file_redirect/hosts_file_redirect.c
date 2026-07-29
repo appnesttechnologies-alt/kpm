@@ -161,33 +161,40 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 //FF PID FINDING
+//FF PID FINDING
 static pid_t find_pid_by_name(const char *name)
 {
-    struct task_struct *task;
+    struct task_struct *task, *init_tsk_ptr = NULL;
     pid_t found_pid = 0;
     char comm[TASK_COMM_LEN];
 
     if (!p_next_task || !p_get_task_comm || !p_strstr || !p_task_tgid_nr_ns)
         return 0;
 
-    task = (struct task_struct *)kallsyms_lookup_name("init_task");
+    // ✅ Fix: init_task ki jagah current task se loop start hoga taaki NULL na aaye
+    task = hfr_get_current();
     if (!task) return 0;
 
-    for (task = p_next_task(task); task && task != (struct task_struct *)kallsyms_lookup_name("init_task"); task = p_next_task(task)) {
+    init_tsk_ptr = task;
+    
+    do {
         p_get_task_comm(comm, task);
         
-        // Yahan exact match ki jagah substring match hona zaroori hai
-        if (p_strstr(comm, "freefir") || (name && name[0] && p_strstr(comm, name))) {
+        // 🔥 Kernel ke andar "freefir" keyword match kara rahe hain
+        if (p_strstr(comm, "freefir")) {
             found_pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
             if (found_pid > 0) {
                 kpm_info("Found target process: comm=%s pid=%d\n", comm, found_pid);
                 break;
             }
         }
-    }
+        
+        task = p_next_task(task);
+    } while (task && task != init_tsk_ptr);
 
     return found_pid;
 }
+
 
 
 
