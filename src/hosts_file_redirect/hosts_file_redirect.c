@@ -166,8 +166,7 @@ static pid_t find_pid_by_name(const char *name)
     }
     rcu_read_unlock();
 
-    kpm_info("find_pid_by_name('%s') = %d
-", name, found_pid);
+    kpm_info("find_pid_by_name('%s') = %d", name, found_pid);
     return found_pid;
 }
 
@@ -184,8 +183,7 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
 
     mm = p_get_task_mm(task);
     if (!mm) {
-        kpm_err("find_lib_base: no mm for task
-");
+        kpm_err("find_lib_base: no mm for task");
         return 0;
     }
 
@@ -205,8 +203,7 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
 
         if (strstr(path, lib_name)) {
             base = vma->vm_start;
-            kpm_info("Found lib '%s' at 0x%lx (path: %s)
-", lib_name, base, path);
+            kpm_info("Found lib '%s' at 0x%lx (path: %s)", lib_name, base, path);
             break;
         }
     }
@@ -226,8 +223,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
-    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d
-",
+    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
     // ✅ Handle new opcodes
@@ -278,40 +274,34 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     // ✅ Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        kpm_err("BAD_OPCODE: 0x%x
-", pkt->op_code);
+        kpm_err("BAD_OPCODE: 0x%x", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
-        kpm_err("INVALID_SIZE: %u
-", pkt->size);
+        kpm_err("INVALID_SIZE: %u", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
     if (!is_valid_user_address(pkt->vaddr)) {
-        kpm_err("INVALID_ADDR: 0x%llx
-", pkt->vaddr);
+        kpm_err("INVALID_ADDR: 0x%llx", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        kpm_err("NULL_SYMBOL
-");
+        kpm_err("NULL_SYMBOL");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid resolved: %d
-", target_pid);
+    kpm_info("target_pid resolved: %d", target_pid);
     
     if (target_pid <= 0) {
-        kpm_err("OUT_OF_RANGE: pid=%d
-", target_pid);
+        kpm_err("OUT_OF_RANGE: pid=%d", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
@@ -319,27 +309,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (p_rcu_read_lock) p_rcu_read_lock();
 
     task = p_find_task_by_vpid(target_pid);
-    kpm_info("find_task_by_vpid(%d) = %px
-", target_pid, task);
+    kpm_info("find_task_by_vpid(%d) = %px", target_pid, task);
     
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        kpm_err("NO_TASK for pid=%d
-", target_pid);
+        kpm_err("NO_TASK for pid=%d", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
 
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
-    kpm_info("get_task_mm = %px
-", mm);
+    kpm_info("get_task_mm = %px", mm);
 
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
-        kpm_err("NO_MM
-");
+        kpm_err("NO_MM");
         pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
         return;
@@ -355,27 +341,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         gup_flags = FOLL_FORCE;                  
     }
 
-    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d
-",
+    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d",
              task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
     
     transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-    kpm_info("access_process_vm returned: %d
-", transferred);
+    kpm_info("access_process_vm returned: %d", transferred);
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
-        kpm_err("VM_FAULT: %d
-", transferred);
+        kpm_err("VM_FAULT: %d", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
-        kpm_err("PROTECTION
-");
+        kpm_err("PROTECTION");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -393,8 +375,7 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS
-");
+    kpm_info("<<< process_packet SUCCESS");
     pkt->status = STATUS_SUCCESS;
 }
 
@@ -408,47 +389,41 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    kpm_info("*** proc_write_handler: count=%zu expected=%zu
-", count, sizeof(struct k_packet));
+    kpm_info("*** proc_write_handler: count=%zu expected=%zu", count, sizeof(struct k_packet));
 
     if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH: got %zu expected %zu
-", count, sizeof(struct k_packet));
+        kpm_err("SIZE MISMATCH: got %zu expected %zu", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
     if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL
-");
+        kpm_err("copy_from_user NULL");
         return -EFAULT;
     }
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
         kpm_err("copy_from_user failed
-");
+
+            ");
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
     if (!curr_task) {
-        kpm_err("get_current failed
-");
+        kpm_err("get_current failed");
         return -ESRCH;
     }
 
     if (!p_task_pid_nr_ns) {
-        kpm_err("task_pid_nr_ns NULL
-");
+        kpm_err("task_pid_nr_ns NULL");
         return -EFAULT;
     }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    kpm_info("caller_pid from current task: %d
-", caller_pid);
+    kpm_info("caller_pid from current task: %d", caller_pid);
     
     if (caller_pid <= 0) {
-        kpm_err("Invalid caller_pid: %d
-", caller_pid);
+        kpm_err("Invalid caller_pid: %d", caller_pid);
         return -ESRCH;
     }
 
@@ -457,19 +432,16 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user) {
-        kpm_err("copy_to_user NULL
-");
+        kpm_err("copy_to_user NULL");
         return -EFAULT;
     }
     
     if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_to_user failed
-");
+        kpm_err("copy_to_user failed");
         return -EFAULT;
     }
 
-    kpm_info("*** proc_write_handler SUCCESS
-");
+    kpm_info("*** proc_write_handler SUCCESS");
     return (ssize_t)count;
 }
 
@@ -484,13 +456,11 @@ static const struct proc_ops p_ops = {
     .proc_poll    = NULL,
     .proc_ioctl   = NULL,
     .proc_mmap    = NULL,
-    .proc_get_unmapped_area = NULL,
-};
+    .proc_get_unmapped_area = NULL,};
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT START ===
-");
+    kpm_info("=== INIT START ===");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -511,15 +481,13 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px
-",
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
              p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
-        kpm_err("CRITICAL SYMBOL MISSING
-");
+        kpm_err("CRITICAL SYMBOL MISSING");
         return -EFAULT;
     }
 
@@ -528,20 +496,17 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     // ⚠️ SECURITY: 0600 = only root can access
     proc_entry = p_proc_create_data(proc_filename, 0600, NULL, &p_ops, NULL);
     if (!proc_entry) {
-        kpm_err("proc_create FAILED
-");
+        kpm_err("proc_create FAILED");
         return -EFAULT;
     }
 
-    kpm_info("=== INIT SUCCESS /proc/%s ===
-", proc_filename);
+    kpm_info("=== INIT SUCCESS /proc/%s ===", proc_filename);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===
-");
+    kpm_info("=== EXIT ===");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
