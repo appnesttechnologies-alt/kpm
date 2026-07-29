@@ -10,7 +10,6 @@
 #include <linux/mm.h>
 #include <linux/pid.h>
 #include <linux/slab.h>
-#include <linux/mm_types.h>
 #include <linux/version.h>
 
 KPM_NAME("hosts_file_redirect_shm");
@@ -54,6 +53,7 @@ KPM_DESCRIPTION("KPM shared-memory memory bridge via char device + mmap ring buf
 #define HFR_IOCTL_SUBMIT 0x48465200u
 struct inode;
 struct file;
+struct vm_area_struct;
 struct poll_table_struct;
 typedef unsigned int __poll_t;
 
@@ -325,24 +325,10 @@ static long hfr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long phys;
-    unsigned long size = vma->vm_end - vma->vm_start;
-
-    if (!g_ctx.ring || !p_virt_to_phys || !p_remap_pfn_range) {
-        kpm_err("mmap: NULL pointers ring=%px virt_to_phys=%px remap=%px",
-                g_ctx.ring, p_virt_to_phys, p_remap_pfn_range);
-        return -ENXIO;
-    }
-
+    unsigned long size = HFR_RING_BYTES;
+    if (!g_ctx.ring || !p_virt_to_phys || !p_remap_pfn_range) return -EFAULT;
     phys = p_virt_to_phys((volatile void *)g_ctx.ring);
-
-    kpm_err("mmap: vm_start=0x%lx vm_end=0x%lx size=%lu phys=0x%lx pfn=0x%lx",
-            vma->vm_start, vma->vm_end, size, phys, phys >> 12);
-
-    return p_remap_pfn_range(vma,
-                             vma->vm_start,
-                             phys >> 12,
-                             size,
-                             vma->vm_page_prot);
+    return p_remap_pfn_range(vma, 0, phys >> 12, size, 0);
 }
 
 static const struct file_operations hfr_fops = {
