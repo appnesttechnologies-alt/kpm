@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-
 #include <compiler.h>
 #include <hook.h>
 #include <kpmodule.h>
@@ -12,59 +11,108 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <asm/pgtable.h>
 
-KPM_NAME("hosts_file_redirect");
+KPM_NAME("hosts_file_redirect_shm");
 KPM_VERSION(HFR_VERSION);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Surajit");
-KPM_DESCRIPTION("KPM Shared Memory Bridge via access_process_vm");
+KPM_DESCRIPTION("KPM shared-memory memory bridge via char device + mmap ring buffer") ;
 
+#define HFR_DEBUG
 #ifdef HFR_DEBUG
-#define kpm_info(fmt, ...) pr_info("HFR: " fmt, ##__VA_ARGS__)
-#define kpm_err(fmt, ...)  pr_err("HFR: " fmt, ##__VA_ARGS__)
+#define kpm_info(fmt, ...) pr_info("HFR_SHM: " fmt, ##__VA_ARGS__)
+#define kpm_err(fmt, ...)  pr_err("HFR_SHM: " fmt, ##__VA_ARGS__)
 #else
 #define kpm_info(fmt, ...)
 #define kpm_err(fmt, ...)
 #endif
 
-// ============================================================
-// SHARED MEMORY STRUCTURE
-// ============================================================
-
-#define SHM_SIZE         8192    // 2 pages
-#define MAX_OPS          128
-#define DATA_BUFFER_SIZE 4096
-
+#define MAX_INLINE       256
 #define OP_READ_VM       0x2000
 #define OP_WRITE_VM      0x3000
 
-#define HFR_FOLL_WRITE   0x01
-#define FOLL_FORCE       0x10
+#define STATUS_SUCCESS      0x0000
+#define STATUS_INVALID_SIZE 0x1005
+#define STATUS_OUT_OF_RANGE 0x1006
+#define STATUS_BAD_OPCODE   0x1007
+#define STATUS_NO_TASK      0x1008
+#define STATUS_NO_MM        0x1009
+#define STATUS_VM_FAULT     0x100A
+#define STATUS_PARTIAL_IO   0x100B
+#define STATUS_PROTECTION   0x100C
+#define STATUS_INVALID_ADDR 0x100D
+#define STATUS_NULL_SYMBOL  0x100E
+#define STATUS_RING_EMPTY   0x1010
+#define STATUS_RING_FULL    0x1011
 
-struct shm_op {
-    uint64_t addr;
-    uint32_t size;
-    uint32_t op;
-    int32_t  result;
-} __attribute__((aligned(8), packed));
+#define HFR_FOLL_WRITE      0x01
+#define HFR_RING_ORDER      2
+#define HFR_RING_BYTES      (4096UL << HFR_RING_ORDER)
+#define HFR_RING_MAGIC      0x48465231u
+#define HFR_RING_SLOTS      32
 
-struct shm_header {
-    uint32_t magic;         // 0x4846524D
+struct inode;
+struct file;
+struct vm_area_struct;
+struct poll_table_struct;
+typedef unsigned int __poll_t;
+
+struct mutex {
+    void *owner;
+    int count;
+    void *wait_lock;
+    void *wait_list;
+};
+
+struct hfr_packet {
+    uint32_t seq;
+    uint32_t op_code;
     uint32_t target_pid;
-    uint32_t op_count;
-    uint32_t version;
-    uint32_t result_count;
-    uint32_t data_size;
-    uint32_t pad[2];
+    uint32_t size;
+    uint64_t vaddr;
+    uint32_t status;
+    uint32_t reserved;
+    uint8_t inline_data[MAX_INLINE];
 } __attribute__((aligned(8), packed));
 
-// ============================================================
-// SYMBOL TYPEDEFS
-// ============================================================
+struct hfr_ring {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t req_head;
+    uint32_t req_tail;
+    uint32_t rsp_head;
+    uint32_t rsp_tail;
+    uint32_t slots;
+    uint32_t elem_size;
+    struct hfr_packet req[HFR_RING_SLOTS];
+    struct hfr_packet rsp[HFR_RING_SLOTS];
+} __attribute__((aligned(4096)));
 
-typedef void *(*proc_create_data_t)(const char *, uint16_t, void *, const void *, void *);
-typedef void  (*remove_proc_entry_t)(const char *, void *);
+struct hfr_ctx {
+    struct hfr_ring *ring;
+    void *ring_pages;
+    struct mutex lock;
+    int major;
+    int stop;
+};
+
+static struct hfr_ctx g_ctx;
+
+struct file_operations {
+    void *owner;
+    loff_t (*llseek)(struct file *, loff_t, int);
+    ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
+    long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
+    int (*mmap)(struct file *, struct vm_area_struct *);
+    unsigned int (*poll)(struct file *, struct poll_table_struct *);
+    int (*open)(struct inode *, struct file *);
+    int (*release)(struct inode *, struct file *);
+};
+
+typedef unsigned long (*copy_from_user_t)(void *, const void __user *, unsigned long);
+typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
 typedef int (*access_process_vm_t)(struct task_struct *, unsigned long, void *, int, unsigned int);
 typedef struct task_struct *(*find_task_by_vpid_t)(pid_t);
 typedef struct mm_struct *(*get_task_mm_t)(struct task_struct *);
@@ -74,57 +122,36 @@ typedef void (*put_task_struct_t)(struct task_struct *);
 typedef pid_t (*task_pid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
 typedef void (*rcu_read_lock_t)(void);
 typedef void (*rcu_read_unlock_t)(void);
+typedef void (*mutex_init_t)(struct mutex *);
+typedef void (*mutex_lock_t)(struct mutex *);
+typedef void (*mutex_unlock_t)(struct mutex *);
+typedef int (*register_chrdev_t)(unsigned int, const char *, const struct file_operations *);
+typedef int (*unregister_chrdev_t)(unsigned int, const char *);
+typedef unsigned long (*virt_to_phys_t)(volatile void *address);
+typedef int (*remap_pfn_range_t)(struct vm_area_struct *, unsigned long, unsigned long, unsigned long, unsigned long);
+typedef void *(*__get_free_pages_t)(unsigned int, unsigned int);
+typedef void (*free_pages_t)(unsigned long, unsigned int);
 
-// ============================================================
-// FILE OPS STRUCT (KPM-compatible)
-// ============================================================
-
-struct inode;
-struct file;
-struct kiocb;
-struct iov_iter;
-struct poll_table_struct;
-struct vm_area_struct;
-typedef unsigned int __poll_t;
-
-struct proc_ops {
-    unsigned int proc_flags;
-    int      (*proc_open)(struct inode *, struct file *);
-    ssize_t  (*proc_read)(struct file *, char __user *, size_t, loff_t *);
-    ssize_t  (*proc_read_iter)(struct kiocb *, struct iov_iter *);
-    ssize_t  (*proc_write)(struct file *, const char __user *, size_t, loff_t *);
-    loff_t   (*proc_lseek)(struct file *, loff_t, int);
-    int      (*proc_release)(struct inode *, struct file *);
-    __poll_t (*proc_poll)(struct file *, struct poll_table_struct *);
-    long     (*proc_ioctl)(struct file *, unsigned int, unsigned long);
-    int      (*proc_mmap)(struct file *, struct vm_area_struct *);
-    unsigned long (*proc_get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
-};
-
-// ============================================================
-// GLOBALS
-// ============================================================
-
-static proc_create_data_t    p_proc_create_data = NULL;
-static remove_proc_entry_t   p_remove_proc_entry = NULL;
-static access_process_vm_t   p_access_process_vm = NULL;
-static find_task_by_vpid_t   p_find_task_by_vpid = NULL;
-static get_task_mm_t         p_get_task_mm = NULL;
-static mmput_t               p_mmput = NULL;
-static get_task_struct_t     p_get_task_struct = NULL;
-static put_task_struct_t     p_put_task_struct = NULL;
-static task_pid_nr_ns_t      p_task_pid_nr_ns = NULL;
-static rcu_read_lock_t       p_rcu_read_lock = NULL;
-static rcu_read_unlock_t     p_rcu_read_unlock = NULL;
-
-static const char *proc_filename = "hfr_mem";
-static void       *proc_entry    = NULL;
-static void       *shm_kernel    = NULL;
-static size_t      shm_size      = 0;
-
-// ============================================================
-// HELPER: Get current task
-// ============================================================
+static copy_from_user_t      p_copy_from_user;
+static copy_to_user_t        p_copy_to_user;
+static access_process_vm_t   p_access_process_vm;
+static find_task_by_vpid_t   p_find_task_by_vpid;
+static get_task_mm_t         p_get_task_mm;
+static mmput_t               p_mmput;
+static get_task_struct_t     p_get_task_struct;
+static put_task_struct_t     p_put_task_struct;
+static task_pid_nr_ns_t      p_task_pid_nr_ns;
+static rcu_read_lock_t       p_rcu_read_lock;
+static rcu_read_unlock_t     p_rcu_read_unlock;
+static mutex_init_t          p_mutex_init;
+static mutex_lock_t          p_mutex_lock;
+static mutex_unlock_t        p_mutex_unlock;
+static register_chrdev_t     p_register_chrdev;
+static unregister_chrdev_t   p_unregister_chrdev;
+static virt_to_phys_t        p_virt_to_phys;
+static remap_pfn_range_t     p_remap_pfn_range;
+static __get_free_pages_t    p___get_free_pages;
+static free_pages_t          p_free_pages;
 
 static inline struct task_struct *hfr_get_current(void)
 {
@@ -133,256 +160,205 @@ static inline struct task_struct *hfr_get_current(void)
     return tsk;
 }
 
-// ============================================================
-// BATCH PROCESSING
-// ============================================================
+static inline int is_valid_user_address(uint64_t addr)
+{
+    if (!addr) return 0;
+    if (addr >= (1ULL << 63)) return 0;
+    return 1;
+}
 
-static void process_batch(struct shm_header *hdr, pid_t caller_pid)
+static inline uint32_t ring_next(uint32_t idx)
+{
+    return (idx + 1u) % HFR_RING_SLOTS;
+}
+
+static void process_packet(struct hfr_packet *pkt, pid_t caller_pid)
 {
     struct task_struct *task = NULL;
     struct mm_struct *mm = NULL;
     pid_t target_pid;
-    int i;
-    uint32_t count;
+    int transferred;
+    unsigned int gup_flags;
+    int is_write_op = 0;
+    uint8_t temp_buffer[MAX_INLINE];
 
-    if (!hdr || hdr->magic != 0x4846524D) {
-        kpm_err("Invalid magic: 0x%x\n", hdr ? hdr->magic : 0);
+    if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
+        pkt->status = STATUS_BAD_OPCODE;
+        return;
+    }
+    if (!pkt->size || pkt->size > MAX_INLINE) {
+        pkt->status = STATUS_INVALID_SIZE;
+        return;
+    }
+    if (!is_valid_user_address(pkt->vaddr)) {
+        pkt->status = STATUS_INVALID_ADDR;
+        return;
+    }
+    if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
+        pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
-    count = hdr->op_count;
-    if (count > MAX_OPS) count = MAX_OPS;
-    if (count == 0) {
-        hdr->result_count = 0;
-        return;
-    }
-
-    hdr->result_count = 0;
-    hdr->data_size = 0;
-
-    target_pid = hdr->target_pid ? (pid_t)hdr->target_pid : caller_pid;
+    target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
     if (target_pid <= 0) {
-        struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < (int)count; i++) {
-            ops[i].result = -EINVAL;
-        }
-        hdr->result_count = count;
+        pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
 
-    // Find target task
     if (p_rcu_read_lock) p_rcu_read_lock();
     task = p_find_task_by_vpid(target_pid);
-    
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < (int)count; i++) {
-            ops[i].result = -ESRCH;
-        }
-        hdr->result_count = count;
+        pkt->status = STATUS_NO_TASK;
         return;
     }
-
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
+        pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
-        struct shm_op *ops = (struct shm_op *)(hdr + 1);
-        for (i = 0; i < (int)count; i++) {
-            ops[i].result = -ESRCH;
-        }
-        hdr->result_count = count;
         return;
     }
 
-    // Get pointers
-    struct shm_op *ops = (struct shm_op *)(hdr + 1);
-    uint8_t *data_base = (uint8_t *)ops + (MAX_OPS * sizeof(struct shm_op));
-    uint32_t current_offset = 0;
-
-    // Process all operations
-    for (i = 0; i < (int)count; i++) {
-        struct shm_op *op = &ops[i];
-        
-        if (op->size == 0 || op->size > 256) {
-            op->result = -EINVAL;
-            hdr->result_count++;
-            continue;
-        }
-
-        if (op->addr < 0x1000) {
-            op->result = -EINVAL;
-            hdr->result_count++;
-            continue;
-        }
-
-        if (current_offset + op->size > DATA_BUFFER_SIZE) {
-            op->result = -ENOSPC;
-            hdr->result_count++;
-            break;
-        }
-
-        void *data_ptr = data_base + current_offset;
-        
-        unsigned int gup_flags;
-        if (op->op == OP_WRITE_VM) {
-            gup_flags = HFR_FOLL_WRITE | FOLL_FORCE;
-        } else {
-            gup_flags = FOLL_FORCE;
-        }
-
-        int transferred = p_access_process_vm(task, (unsigned long)op->addr, 
-                                               data_ptr, (int)op->size, gup_flags);
-        
-        if (transferred < 0) {
-            op->result = transferred;
-            op->size = 0;
-        } else if (transferred == 0 && op->size > 0) {
-            op->result = -EACCES;
-            op->size = 0;
-        } else {
-            op->result = 0;
-            if (op->op == OP_READ_VM) {
-                op->size = (uint32_t)transferred;
-            }
-            current_offset += op->size;
-        }
-        
-        hdr->result_count++;
+    is_write_op = (pkt->op_code == OP_WRITE_VM);
+    memset(temp_buffer, 0, sizeof(temp_buffer));
+    if (is_write_op) {
+        memcpy(temp_buffer, pkt->inline_data, pkt->size);
+        gup_flags = HFR_FOLL_WRITE;
+    } else {
+        gup_flags = 0;
     }
 
-    hdr->data_size = current_offset;
+    transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
 
-    if (mm) p_mmput(mm);
+    p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
-    
-    // Increment version for userspace polling
-    hdr->version++;
+
+    if (transferred < 0) {
+        pkt->status = STATUS_VM_FAULT;
+        return;
+    }
+    if (transferred == 0 && pkt->size > 0) {
+        pkt->status = STATUS_PROTECTION;
+        return;
+    }
+    if (!is_write_op && transferred > 0) {
+        memset(pkt->inline_data, 0, MAX_INLINE);
+        memcpy(pkt->inline_data, temp_buffer, transferred);
+    }
+    if ((uint32_t)transferred != pkt->size) {
+        pkt->size = (uint32_t)transferred;
+        pkt->status = STATUS_PARTIAL_IO;
+        return;
+    }
+    pkt->status = STATUS_SUCCESS;
 }
 
-// ============================================================
-// MMAP HANDLER
-// ============================================================
+static int hfr_open(struct inode *inode, struct file *file) { return 0; }
+static int hfr_release(struct inode *inode, struct file *file) { return 0; }
+static ssize_t hfr_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) { return 0; }
 
-static int proc_mmap_handler(struct file *file, struct vm_area_struct *vma)
+static ssize_t hfr_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
-    unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long pfn;
-    int ret;
+    struct hfr_packet pkt;
+    pid_t caller_pid;
+    struct task_struct *curr_task;
+    uint32_t next_rsp;
 
-    if (!shm_kernel) {
-        kpm_err("mmap: shm_kernel is NULL\n");
-        return -ENOMEM;
+    if (count != sizeof(pkt)) return -EINVAL;
+    if (!p_copy_from_user || !p_copy_to_user) return -EFAULT;
+    if (p_copy_from_user(&pkt, buf, sizeof(pkt)) != 0) return -EFAULT;
+
+    curr_task = hfr_get_current();
+    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
+    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
+    if (caller_pid <= 0) return -ESRCH;
+
+    if (p_mutex_lock) p_mutex_lock(&g_ctx.lock);
+    process_packet(&pkt, caller_pid);
+    if (g_ctx.ring) {
+        next_rsp = ring_next(g_ctx.ring->rsp_head);
+        if (next_rsp != g_ctx.ring->rsp_tail) {
+            memcpy(&g_ctx.ring->rsp[g_ctx.ring->rsp_head], &pkt, sizeof(pkt));
+            g_ctx.ring->rsp_head = next_rsp;
+        }
     }
+    if (p_mutex_unlock) p_mutex_unlock(&g_ctx.lock);
 
-    if (size > shm_size) {
-        kpm_err("mmap: requested %lu > shm_size %zu\n", size, shm_size);
-        return -EINVAL;
+    if (p_copy_to_user((void __user *)buf, &pkt, sizeof(pkt)) != 0) return -EFAULT;
+    return (ssize_t)count;
+}
+
+static long hfr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct hfr_packet pkt;
+    pid_t caller_pid;
+    struct task_struct *curr_task;
+    uint32_t next_rsp;
+
+    if (!p_copy_from_user || !p_copy_to_user) return -EFAULT;
+    if (cmd != 0xHFR0) return -EINVAL;
+    if (p_copy_from_user(&pkt, (void __user *)arg, sizeof(pkt)) != 0) return -EFAULT;
+
+    curr_task = hfr_get_current();
+    if (!curr_task || !p_task_pid_nr_ns) return -ESRCH;
+    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
+    if (caller_pid <= 0) return -ESRCH;
+
+    if (p_mutex_lock) p_mutex_lock(&g_ctx.lock);
+    process_packet(&pkt, caller_pid);
+    if (g_ctx.ring) {
+        next_rsp = ring_next(g_ctx.ring->rsp_head);
+        if (next_rsp != g_ctx.ring->rsp_tail) {
+            memcpy(&g_ctx.ring->rsp[g_ctx.ring->rsp_head], &pkt, sizeof(pkt));
+            g_ctx.ring->rsp_head = next_rsp;
+        }
     }
+    if (p_mutex_unlock) p_mutex_unlock(&g_ctx.lock);
 
-    // Cast pointer to uint64_t for virt_to_phys
-    pfn = virt_to_phys((uint64_t)(unsigned long)shm_kernel) >> PAGE_SHIFT;
-    
-    // Set VM flags
-    vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
-    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-
-    // Map the physical pages to userspace
-    ret = remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
-    if (ret) {
-        kpm_err("mmap: remap_pfn_range failed: %d\n", ret);
-        return -EAGAIN;
-    }
-
-    kpm_info("mmap: mapped %lu bytes at 0x%lx\n", size, vma->vm_start);
+    if (p_copy_to_user((void __user *)arg, &pkt, sizeof(pkt)) != 0) return -EFAULT;
     return 0;
 }
 
-// ============================================================
-// FILE OPERATIONS
-// ============================================================
-
-static int proc_open_handler(struct inode *inode, struct file *file) 
-{ 
-    return 0; 
-}
-
-static int proc_release_handler(struct inode *inode, struct file *file) 
-{ 
-    return 0; 
-}
-
-static ssize_t proc_read_handler(struct file *file, char __user *buffer, 
-                                  size_t count, loff_t *pos) 
-{ 
-    return 0; 
-}
-
-static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
-                                   size_t count, loff_t *pos)
+static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    pid_t caller_pid;
-    struct task_struct *curr_task;
-
-    if (!shm_kernel) {
-        kpm_err("write: shm_kernel is NULL\n");
-        return -ENOMEM;
-    }
-
-    curr_task = hfr_get_current();
-    if (!curr_task) {
-        kpm_err("write: get_current failed\n");
-        return -ESRCH;
-    }
-
-    if (!p_task_pid_nr_ns) {
-        kpm_err("write: task_pid_nr_ns is NULL\n");
-        return -EFAULT;
-    }
-
-    caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    if (caller_pid <= 0) {
-        kpm_err("write: invalid caller_pid: %d\n", caller_pid);
-        return -ESRCH;
-    }
-
-    // Process batch from shared memory
-    process_batch((struct shm_header *)shm_kernel, caller_pid);
-
-    // Return number of ops completed
-    struct shm_header *hdr = (struct shm_header *)shm_kernel;
-    return (ssize_t)hdr->result_count;
+    unsigned long phys;
+    unsigned long size = HFR_RING_BYTES;
+    if (!g_ctx.ring || !p_virt_to_phys || !p_remap_pfn_range) return -EFAULT;
+    phys = p_virt_to_phys((volatile void *)g_ctx.ring);
+    return p_remap_pfn_range(vma, 0, phys >> 12, size, 0);
 }
 
-// Use const to match KPM's expected proc_ops signature
-static const struct proc_ops p_ops = {
-    .proc_flags   = 0,
-    .proc_open    = proc_open_handler,
-    .proc_read    = proc_read_handler,
-    .proc_read_iter = NULL,
-    .proc_write   = proc_write_handler,
-    .proc_lseek   = NULL,
-    .proc_release = proc_release_handler,
-    .proc_poll    = NULL,
-    .proc_ioctl   = NULL,
-    .proc_mmap    = proc_mmap_handler,
-    .proc_get_unmapped_area = NULL,
+static const struct file_operations hfr_fops = {
+    .owner = 0,
+    .llseek = 0,
+    .read = hfr_read,
+    .write = hfr_write,
+    .unlocked_ioctl = hfr_ioctl,
+    .compat_ioctl = hfr_ioctl,
+    .mmap = hfr_mmap,
+    .poll = 0,
+    .open = hfr_open,
+    .release = hfr_release,
 };
 
-// ============================================================
-// INIT / EXIT
-// ============================================================
+static void hfr_ring_init(struct hfr_ring *ring)
+{
+    memset(ring, 0, HFR_RING_BYTES);
+    ring->magic = HFR_RING_MAGIC;
+    ring->version = 1;
+    ring->slots = HFR_RING_SLOTS;
+    ring->elem_size = sizeof(struct hfr_packet);
+}
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT START ===\n");
-    
-    // Resolve all symbols
-    p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
-    p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
+    p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("_copy_from_user");
+    if (!p_copy_from_user) p_copy_from_user = (copy_from_user_t)kallsyms_lookup_name("copy_from_user");
+    p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("_copy_to_user");
+    if (!p_copy_to_user) p_copy_to_user = (copy_to_user_t)kallsyms_lookup_name("copy_to_user");
     p_access_process_vm = (access_process_vm_t)kallsyms_lookup_name("access_process_vm");
     p_find_task_by_vpid = (find_task_by_vpid_t)kallsyms_lookup_name("find_task_by_vpid");
     p_get_task_mm = (get_task_mm_t)kallsyms_lookup_name("get_task_mm");
@@ -392,60 +368,59 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_task_pid_nr_ns = (task_pid_nr_ns_t)kallsyms_lookup_name("__task_pid_nr_ns");
     p_rcu_read_lock = (rcu_read_lock_t)kallsyms_lookup_name("__rcu_read_lock");
     p_rcu_read_unlock = (rcu_read_unlock_t)kallsyms_lookup_name("__rcu_read_unlock");
+    p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
+    p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
+    p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
+    p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("__register_chrdev");
+    if (!p_register_chrdev) p_register_chrdev = (register_chrdev_t)kallsyms_lookup_name("register_chrdev");
+    p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("__unregister_chrdev");
+    if (!p_unregister_chrdev) p_unregister_chrdev = (unregister_chrdev_t)kallsyms_lookup_name("unregister_chrdev");
+    p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("__virt_to_phys");
+    if (!p_virt_to_phys) p_virt_to_phys = (virt_to_phys_t)kallsyms_lookup_name("virt_to_phys");
+    p_remap_pfn_range = (remap_pfn_range_t)kallsyms_lookup_name("remap_pfn_range");
+    p___get_free_pages = (__get_free_pages_t)kallsyms_lookup_name("__get_free_pages");
+    p_free_pages = (free_pages_t)kallsyms_lookup_name("free_pages");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px mm=%px\n",
-             (void *)p_proc_create_data, (void *)p_access_process_vm, 
-             (void *)p_find_task_by_vpid, (void *)p_get_task_mm);
-
-    if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
-        !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput) {
-        kpm_err("CRITICAL SYMBOL MISSING\n");
+    if (!p_copy_from_user || !p_copy_to_user || !p_access_process_vm || !p_find_task_by_vpid ||
+        !p_get_task_mm || !p_mmput || !p_task_pid_nr_ns || !p___get_free_pages || !p_free_pages) {
+        kpm_err("critical symbol missing\n");
         return -EFAULT;
     }
 
-    // Allocate shared memory
-    shm_size = SHM_SIZE;
-    shm_kernel = kzalloc(shm_size, GFP_KERNEL);
-    if (!shm_kernel) {
-        kpm_err("Failed to allocate %zu bytes\n", shm_size);
+    if (p_mutex_init) p_mutex_init(&g_ctx.lock);
+
+    g_ctx.ring_pages = p___get_free_pages(0, HFR_RING_ORDER);
+    if (!g_ctx.ring_pages) {
+        kpm_err("ring alloc failed\n");
         return -ENOMEM;
     }
+    g_ctx.ring = (struct hfr_ring *)g_ctx.ring_pages;
+    hfr_ring_init(g_ctx.ring);
 
-    // Initialize header
-    struct shm_header *hdr = (struct shm_header *)shm_kernel;
-    memset(hdr, 0, sizeof(struct shm_header));
-    hdr->magic = 0x4846524D;
-    hdr->version = 0;
-
-    kpm_info("SHM allocated at %px (size: %zu)\n", shm_kernel, shm_size);
-
-    // Create proc entry - cast away const for KPM compatibility
-    proc_entry = p_proc_create_data(proc_filename, 0666, NULL, (const void *)&p_ops, NULL);
-    if (!proc_entry) {
-        kpm_err("proc_create FAILED for /proc/%s\n", proc_filename);
-        kfree(shm_kernel);
-        shm_kernel = NULL;
-        return -EFAULT;
+    if (p_register_chrdev) {
+        g_ctx.major = p_register_chrdev(0, "hfr_mem_shm", &hfr_fops);
+        if (g_ctx.major < 0) {
+            p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
+            g_ctx.ring_pages = 0;
+            g_ctx.ring = 0;
+            kpm_err("register_chrdev failed: %d\n", g_ctx.major);
+            return g_ctx.major;
+        }
     }
 
-    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
+    kpm_info("initialized major=%d ring=%px size=%lu\n", g_ctx.major, g_ctx.ring, (unsigned long)HFR_RING_BYTES);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===\n");
-    
-    if (proc_entry && p_remove_proc_entry) {
-        p_remove_proc_entry(proc_filename, NULL);
-        proc_entry = NULL;
-    }
-    
-    if (shm_kernel) {
-        kfree(shm_kernel);
-        shm_kernel = NULL;
-    }
-    
+    if (p_unregister_chrdev && g_ctx.major > 0)
+        p_unregister_chrdev((unsigned int)g_ctx.major, "hfr_mem_shm");
+    if (g_ctx.ring_pages && p_free_pages)
+        p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
+    g_ctx.ring_pages = 0;
+    g_ctx.ring = 0;
+    g_ctx.major = 0;
     return 0;
 }
 
