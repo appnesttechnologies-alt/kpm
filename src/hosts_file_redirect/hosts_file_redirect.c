@@ -162,28 +162,31 @@ static inline int is_valid_user_address(uint64_t addr)
 }
 
 // Find PID by process name using only dynamic functions
+// Find PID by process name using substring (handles 15-char comm limit)
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
     pid_t found_pid = 0;
     char comm[TASK_COMM_LEN];
 
-    if (!name || !name[0] || !p_next_task || !p_get_task_comm || !p_strcmp || !p_task_tgid_nr_ns)
+    if (!name || !name[0] || !p_next_task || !p_get_task_comm || !p_strstr || !p_task_tgid_nr_ns)
         return 0;
 
-    // Start from init_task symbol
     task = (struct task_struct *)kallsyms_lookup_name("init_task");
     if (!task) return 0;
 
     for (task = p_next_task(task); task && task != (struct task_struct *)kallsyms_lookup_name("init_task"); task = p_next_task(task)) {
         p_get_task_comm(comm, task);
-        if (p_strcmp(comm, name) == 0) {
+        // Use strstr instead of strcmp so even partial package names match!
+        if (p_strstr(comm, "freefiremax") || p_strstr(comm, name)) {
             found_pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
-            break;
+            if (found_pid > 0) {
+                kpm_info("Found matching process: comm=%s pid=%d\n", comm, found_pid);
+                break;
+            }
         }
     }
 
-    kpm_info("find_pid_by_name('%s') = %d\n", name, found_pid);
     return found_pid;
 }
 
