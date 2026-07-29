@@ -1,5 +1,3 @@
-Dono ko dekh theek s ...
-
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <compiler.h>
