@@ -410,8 +410,7 @@ p___unregister_chrdev = (__unregister_chrdev_t)kallsyms_lookup_name("__unregiste
     p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
     g_ctx.ring_pages = 0;
     g_ctx.ring = 0;
-    kpm_err("no chrdev registration symbol
-");
+    kpm_err("no chrdev registration symbol");
     return -EFAULT;
 }
 
@@ -419,13 +418,11 @@ if (g_ctx.major < 0) {
     p_free_pages((unsigned long)g_ctx.ring_pages, HFR_RING_ORDER);
     g_ctx.ring_pages = 0;
     g_ctx.ring = 0;
-    kpm_err("register_chrdev failed: %d
-", g_ctx.major);
+    kpm_err("register_chrdev failed: %d", g_ctx.major);
     return g_ctx.major;
 }
 
-kpm_info("chrdev major=%d
-", g_ctx.major);
+kpm_info("chrdev major=%d", g_ctx.major);
 
     kpm_info("initialized major=%d ring=%px size=%lu\n", g_ctx.major, g_ctx.ring, (unsigned long)HFR_RING_BYTES);
     return 0;
