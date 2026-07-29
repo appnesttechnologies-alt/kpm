@@ -246,7 +246,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
         }
     }
 
-    return (long)fp_wrap_syscalln(29, 3, 0, before_ioctl, 0, 0);
+    return (long)fp_unhook_syscall(29, 3, 0, before_ioctl, 0, 0);
 }
 
 
