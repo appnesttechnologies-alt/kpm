@@ -169,55 +169,56 @@ static pid_t find_pid_by_name(const char *name)
     struct task_struct *task;
     struct task_struct *init_task_ptr;
     pid_t found_pid = 0;
-
     char comm[TASK_COMM_LEN];
+    int count = 0;
 
     if (!name || !name[0])
         return 0;
 
-    if (!p_next_task || !p_get_task_comm || !p_task_pid_nr_ns)
+    if (!p_next_task || !p_get_task_comm || !p_task_tgid_nr_ns || !p_strcmp)
         return 0;
 
     init_task_ptr = (struct task_struct *)kallsyms_lookup_name("init_task");
-
     if (!init_task_ptr)
         return 0;
 
+    kpm_info("========== SEARCHING & DUMPING ALL PROCS ==========\n");
+    kpm_info("Looking for: '%s'\n", name);
 
     task = init_task_ptr;
 
     do {
-
         task = p_next_task(task);
-
         if (!task)
             break;
 
+        // Only thread group leaders
+        if (task->group_leader != task)
+            continue;
 
-        memset(comm, 0, sizeof(comm));
-
+        p_memset(comm, 0, sizeof(comm));
         p_get_task_comm(comm, task);
 
+        pid_t pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
 
-        if (strcmp(comm, name) == 0) {
+        // PRINT EVERY PROCESS
+        kpm_info("  PID=%d COMM='%s'\n", pid, comm);
 
-            found_pid = p_task_pid_nr_ns(
-                task,
-                PIDTYPE_PID,
-                NULL
-            );
+        // Check match
+        if (p_strcmp(comm, name) == 0) {
+            found_pid = pid;
+            kpm_info("  >>> MATCH FOUND! PID=%d <<<\n", found_pid);
+        }
 
-            kpm_info("FOUND %s pid=%d\n",
-                     comm,
-                     found_pid);
-
+        count++;
+        if (count >= 500) {
+            kpm_info("... stopped at 500\n");
             break;
         }
 
-
     } while (task != init_task_ptr);
 
-
+    kpm_info("========== TOTAL SCANNED: %d | FOUND PID: %d ==========\n", count, found_pid);
     return found_pid;
 }
 
