@@ -176,8 +176,8 @@ static pid_t find_pid_by_name(const char *name)
     for (task = p_next_task(task); task && task != (struct task_struct *)kallsyms_lookup_name("init_task"); task = p_next_task(task)) {
         p_get_task_comm(comm, task);
         
-        // Free Fire Max ke liye package ya comm match check karo
-        if (p_strstr(comm, "freefiremax") || (name && name[0] && p_strstr(comm, name))) {
+        // Yahan exact match ki jagah substring match hona zaroori hai
+        if (p_strstr(comm, "freefir") || (name && name[0] && p_strstr(comm, name))) {
             found_pid = p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
             if (found_pid > 0) {
                 kpm_info("Found target process: comm=%s pid=%d\n", comm, found_pid);
@@ -188,6 +188,7 @@ static pid_t find_pid_by_name(const char *name)
 
     return found_pid;
 }
+
 
 
 // Find library base address using dynamic functions
