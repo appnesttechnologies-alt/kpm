@@ -13,12 +13,8 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/sched/task.h>
-#include <linux/dcache.h>
 #include <linux/fs.h>
-#include <linux/rcupdate.h>
-#include <linux/path.h>
-#include <linux/limits.h>
-#include <linux/err.h>
+#include <linux/dcache.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -169,34 +165,27 @@ static pid_t find_pid_by_name(const char *name)
     }
     rcu_read_unlock();
 
-    kpm_info("find_pid_by_name('%s') = %d", name, found_pid);
+    kpm_info("find_pid_by_name('%s') = %d\n", name, found_pid);
     return found_pid;
 }
 
-// Find library base address by name
+// Find library base address by name - simplified version without d_path
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
 {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned long base = 0;
-    char *buf, *path;
 
     if (!task || !lib_name || !lib_name[0])
         return 0;
 
     mm = p_get_task_mm(task);
     if (!mm) {
-        kpm_err("find_lib_base: no mm for task");
+        kpm_err("find_lib_base: no mm for task\n");
         return 0;
     }
 
-    buf = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!buf) {
-        p_mmput(mm);
-        return 0;
-    }
-
-    // Fix: Use mmap_read_lock instead of direct mmap access
+    // Lock the mmap semaphore
     #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
         mmap_read_lock(mm);
     #else
@@ -204,17 +193,54 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
     #endif
 
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (!vma->vm_file)
-            continue;
-
-        path = d_path(&vma->vm_file->f_path, buf, PATH_MAX);
-        if (IS_ERR(path))
-            continue;
-
-        if (strstr(path, lib_name)) {
-            base = vma->vm_start;
-            kpm_info("Found lib '%s' at 0x%lx (path: %s)", lib_name, base, path);
-            break;
+        // Check if VMA has a file mapping
+        if (vma->vm_file) {
+            // Try to get the dentry path component by component
+            struct dentry *dentry = vma->vm_file->f_path.dentry;
+            if (dentry) {
+                const unsigned char *d_name;
+                int d_len;
+                
+                // Check the dentry name directly
+                d_name = dentry->d_name.name;
+                d_len = dentry->d_name.len;
+                
+                if (d_name && d_len > 0 && d_len < 256) {
+                    char fname[256];
+                    memcpy(fname, d_name, d_len);
+                    fname[d_len] = '\0';
+                    
+                    // Check if this dentry name contains our library name
+                    if (strstr(fname, lib_name)) {
+                        base = vma->vm_start;
+                        kpm_info("Found lib '%s' at 0x%lx (file: %s)\n", lib_name, base, fname);
+                        break;
+                    }
+                    
+                    // Also check parent dentry for full path matching
+                    if (dentry->d_parent && dentry->d_parent != dentry) {
+                        struct dentry *parent = dentry->d_parent;
+                        const unsigned char *p_name = parent->d_name.name;
+                        int p_len = parent->d_name.len;
+                        
+                        if (p_name && p_len > 0 && p_len < 256) {
+                            char pname[256];
+                            memcpy(pname, p_name, p_len);
+                            pname[p_len] = '\0';
+                            
+                            // Combine parent name with file name
+                            char fullpath[512];
+                            snprintf(fullpath, sizeof(fullpath), "%s/%s", pname, fname);
+                            
+                            if (strstr(fullpath, lib_name)) {
+                                base = vma->vm_start;
+                                kpm_info("Found lib '%s' at 0x%lx (path: %s)\n", lib_name, base, fullpath);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -224,7 +250,6 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         up_read(&mm->mmap_sem);
     #endif
 
-    kfree(buf);
     p_mmput(mm);
     return base;
 }
@@ -239,14 +264,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     int is_write_op = 0;
     uint8_t temp_buffer[MAX_INLINE];
 
-    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d",
+    kpm_info(">>> process_packet ENTER: op=0x%x pid=%u addr=0x%llx size=%u caller_pid=%d\n",
              pkt->op_code, pkt->target_pid, pkt->vaddr, pkt->size, caller_pid);
 
-    // Handle new opcodes
+    // Handle OP_FIND_PID_BY_NAME
     if (pkt->op_code == OP_FIND_PID_BY_NAME) {
         char name[TASK_COMM_LEN];
         memset(name, 0, sizeof(name));
-        // Fix: Use correct string copy with proper null termination
         strncpy(name, (const char *)pkt->inline_data, sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
 
@@ -260,10 +284,10 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         return;
     }
 
+    // Handle OP_FIND_LIB_BASE
     if (pkt->op_code == OP_FIND_LIB_BASE) {
         char lib_name[64];
         memset(lib_name, 0, sizeof(lib_name));
-        // Fix: Use correct string copy with proper null termination
         strncpy(lib_name, (const char *)pkt->inline_data, sizeof(lib_name) - 1);
         lib_name[sizeof(lib_name) - 1] = '\0';
 
@@ -292,34 +316,34 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
 
     // Existing READ/WRITE logic
     if (pkt->op_code != OP_READ_VM && pkt->op_code != OP_WRITE_VM) {
-        kpm_err("BAD_OPCODE: 0x%x", pkt->op_code);
+        kpm_err("BAD_OPCODE: 0x%x\n", pkt->op_code);
         pkt->status = STATUS_BAD_OPCODE;
         return;
     }
 
     if (!pkt->size || pkt->size > MAX_INLINE) {
-        kpm_err("INVALID_SIZE: %u", pkt->size);
+        kpm_err("INVALID_SIZE: %u\n", pkt->size);
         pkt->status = STATUS_INVALID_SIZE;
         return;
     }
 
     if (!is_valid_user_address(pkt->vaddr)) {
-        kpm_err("INVALID_ADDR: 0x%llx", pkt->vaddr);
+        kpm_err("INVALID_ADDR: 0x%llx\n", pkt->vaddr);
         pkt->status = STATUS_INVALID_ADDR;
         return;
     }
 
     if (!p_access_process_vm || !p_find_task_by_vpid || !p_get_task_mm || !p_mmput) {
-        kpm_err("NULL_SYMBOL");
+        kpm_err("NULL_SYMBOL\n");
         pkt->status = STATUS_NULL_SYMBOL;
         return;
     }
 
     target_pid = pkt->target_pid ? (pid_t)pkt->target_pid : caller_pid;
-    kpm_info("target_pid resolved: %d", target_pid);
+    kpm_info("target_pid resolved: %d\n", target_pid);
     
     if (target_pid <= 0) {
-        kpm_err("OUT_OF_RANGE: pid=%d", target_pid);
+        kpm_err("OUT_OF_RANGE: pid=%d\n", target_pid);
         pkt->status = STATUS_OUT_OF_RANGE;
         return;
     }
@@ -327,23 +351,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     if (p_rcu_read_lock) p_rcu_read_lock();
 
     task = p_find_task_by_vpid(target_pid);
-    kpm_info("find_task_by_vpid(%d) = %px", target_pid, task);
+    kpm_info("find_task_by_vpid(%d) = %px\n", target_pid, task);
     
     if (!task) {
         if (p_rcu_read_unlock) p_rcu_read_unlock();
-        kpm_err("NO_TASK for pid=%d", target_pid);
+        kpm_err("NO_TASK for pid=%d\n", target_pid);
         pkt->status = STATUS_NO_TASK;
         return;
     }
 
     if (p_get_task_struct) p_get_task_struct(task);
     mm = p_get_task_mm(task);
-    kpm_info("get_task_mm = %px", mm);
+    kpm_info("get_task_mm = %px\n", mm);
 
     if (p_rcu_read_unlock) p_rcu_read_unlock();
 
     if (!mm) {
-        kpm_err("NO_MM");
+        kpm_err("NO_MM\n");
         pkt->status = STATUS_NO_MM;
         if (p_put_task_struct && task) p_put_task_struct(task);
         return;
@@ -359,23 +383,23 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
         gup_flags = FOLL_FORCE;                  
     }
 
-    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d",
+    kpm_info("Calling access_process_vm: task=%px addr=0x%llx size=%d write=%d\n",
              task, (unsigned long)pkt->vaddr, (int)pkt->size, is_write_op);
     
     transferred = p_access_process_vm(task, (unsigned long)pkt->vaddr, temp_buffer, (int)pkt->size, gup_flags);
-    kpm_info("access_process_vm returned: %d", transferred);
+    kpm_info("access_process_vm returned: %d\n", transferred);
 
     if (mm) p_mmput(mm);
     if (p_put_task_struct && task) p_put_task_struct(task);
 
     if (transferred < 0) {
-        kpm_err("VM_FAULT: %d", transferred);
+        kpm_err("VM_FAULT: %d\n", transferred);
         pkt->status = STATUS_VM_FAULT;
         return;
     }
 
     if (transferred == 0 && pkt->size > 0) {
-        kpm_err("PROTECTION");
+        kpm_err("PROTECTION\n");
         pkt->status = STATUS_PROTECTION;
         return;
     }
@@ -386,14 +410,13 @@ static void process_packet(struct k_packet *pkt, pid_t caller_pid)
     }
 
     if ((uint32_t)transferred != pkt->size) {
-        // Fix: Properly formatted multi-line string
-        kpm_info("PARTIAL_IO: wanted %u got %d", pkt->size, transferred);
+        kpm_info("PARTIAL_IO: wanted %u got %d\n", pkt->size, transferred);
         pkt->size = (uint32_t)transferred;
         pkt->status = STATUS_PARTIAL_IO;
         return;
     }
 
-    kpm_info("<<< process_packet SUCCESS");
+    kpm_info("<<< process_packet SUCCESS\n");
     pkt->status = STATUS_SUCCESS;
 }
 
@@ -407,40 +430,39 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     pid_t caller_pid;
     struct task_struct *curr_task;
 
-    kpm_info("*** proc_write_handler: count=%zu expected=%zu", count, sizeof(struct k_packet));
+    kpm_info("*** proc_write_handler: count=%zu expected=%zu\n", count, sizeof(struct k_packet));
 
     if (count != sizeof(struct k_packet)) {
-        kpm_err("SIZE MISMATCH: got %zu expected %zu", count, sizeof(struct k_packet));
+        kpm_err("SIZE MISMATCH: got %zu expected %zu\n", count, sizeof(struct k_packet));
         return -EINVAL;
     }
 
     if (!p_copy_from_user) {
-        kpm_err("copy_from_user NULL");
+        kpm_err("copy_from_user NULL\n");
         return -EFAULT;
     }
     
     if (p_copy_from_user(&local_pkt, buffer, sizeof(struct k_packet)) != 0) {
-        // Fix: Properly formatted string
-        kpm_err("copy_from_user failed");
+        kpm_err("copy_from_user failed\n");
         return -EFAULT;
     }
 
     curr_task = hfr_get_current();
     if (!curr_task) {
-        kpm_err("get_current failed");
+        kpm_err("get_current failed\n");
         return -ESRCH;
     }
 
     if (!p_task_pid_nr_ns) {
-        kpm_err("task_pid_nr_ns NULL");
+        kpm_err("task_pid_nr_ns NULL\n");
         return -EFAULT;
     }
 
     caller_pid = p_task_pid_nr_ns(curr_task, PIDTYPE_PID, NULL);
-    kpm_info("caller_pid from current task: %d", caller_pid);
+    kpm_info("caller_pid from current task: %d\n", caller_pid);
     
     if (caller_pid <= 0) {
-        kpm_err("Invalid caller_pid: %d", caller_pid);
+        kpm_err("Invalid caller_pid: %d\n", caller_pid);
         return -ESRCH;
     }
 
@@ -449,16 +471,16 @@ static ssize_t proc_write_handler(struct file *file, const char __user *buffer, 
     if (p_mutex_unlock) p_mutex_unlock(&hfr_mutex);
 
     if (!p_copy_to_user) {
-        kpm_err("copy_to_user NULL");
+        kpm_err("copy_to_user NULL\n");
         return -EFAULT;
     }
     
     if (p_copy_to_user((void __user *)buffer, &local_pkt, sizeof(struct k_packet)) != 0) {
-        kpm_err("copy_to_user failed");
+        kpm_err("copy_to_user failed\n");
         return -EFAULT;
     }
 
-    kpm_info("*** proc_write_handler SUCCESS");
+    kpm_info("*** proc_write_handler SUCCESS\n");
     return (ssize_t)count;
 }
 
@@ -478,7 +500,7 @@ static const struct proc_ops p_ops = {
 
 static long hfr_memory_init(const char *args, const char *event, void __user *reserved)
 {
-    kpm_info("=== INIT START ===");
+    kpm_info("=== INIT START ===\n");
     
     p_proc_create_data = (proc_create_data_t)kallsyms_lookup_name("proc_create_data");
     p_remove_proc_entry = (remove_proc_entry_t)kallsyms_lookup_name("remove_proc_entry");
@@ -499,13 +521,13 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px",
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
              p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
-        kpm_err("CRITICAL SYMBOL MISSING");
+        kpm_err("CRITICAL SYMBOL MISSING\n");
         return -EFAULT;
     }
 
@@ -513,17 +535,17 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
 
     proc_entry = p_proc_create_data(proc_filename, 0600, NULL, &p_ops, NULL);
     if (!proc_entry) {
-        kpm_err("proc_create FAILED");
+        kpm_err("proc_create FAILED\n");
         return -EFAULT;
     }
 
-    kpm_info("=== INIT SUCCESS /proc/%s ===", proc_filename);
+    kpm_info("=== INIT SUCCESS /proc/%s ===\n", proc_filename);
     return 0;
 }
 
 static long hfr_memory_exit(void __user *reserved)
 {
-    kpm_info("=== EXIT ===");
+    kpm_info("=== EXIT ===\n");
     if (proc_entry && p_remove_proc_entry) p_remove_proc_entry(proc_filename, NULL);
     return 0;
 }
