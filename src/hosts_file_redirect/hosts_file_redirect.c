@@ -15,7 +15,6 @@
 #include <linux/sched/task.h>
 #include <linux/dcache.h>
 #include <linux/fs.h>
-#include <linux/sched/signal.h>      // TASK_COMM_LEN
 #include <linux/rcupdate.h>          // rcu_read_lock/unlock
 
 KPM_NAME("hosts_file_redirect");
