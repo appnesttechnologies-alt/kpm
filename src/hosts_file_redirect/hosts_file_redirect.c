@@ -15,6 +15,7 @@
 #include <linux/sched/task.h>
 #include <linux/fs.h>
 #include <linux/dcache.h>
+#include <linux/rcupdate.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -108,6 +109,9 @@ typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
 
+// Additional function pointer for dentry_path_raw
+typedef char *(*dentry_path_raw_t)(struct dentry *, char *, int);
+
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
 static copy_from_user_t      p_copy_from_user;
@@ -124,6 +128,7 @@ static rcu_read_unlock_t     p_rcu_read_unlock;
 static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
+static dentry_path_raw_t     p_dentry_path_raw;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -169,19 +174,32 @@ static pid_t find_pid_by_name(const char *name)
     return found_pid;
 }
 
-// Find library base address by name - simplified version without d_path
+// Find library base address by name using dentry_path_raw
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
 {
     struct mm_struct *mm;
     struct vm_area_struct *vma;
     unsigned long base = 0;
+    char *path_buffer = NULL;
 
     if (!task || !lib_name || !lib_name[0])
         return 0;
 
+    if (!p_dentry_path_raw) {
+        kpm_err("find_lib_base: dentry_path_raw not available\n");
+        return 0;
+    }
+
     mm = p_get_task_mm(task);
     if (!mm) {
         kpm_err("find_lib_base: no mm for task\n");
+        return 0;
+    }
+
+    // Allocate buffer for path
+    path_buffer = kmalloc(512, GFP_KERNEL);
+    if (!path_buffer) {
+        p_mmput(mm);
         return 0;
     }
 
@@ -193,52 +211,13 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
     #endif
 
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        // Check if VMA has a file mapping
         if (vma->vm_file) {
-            // Try to get the dentry path component by component
-            struct dentry *dentry = vma->vm_file->f_path.dentry;
-            if (dentry) {
-                const unsigned char *d_name;
-                int d_len;
-                
-                // Check the dentry name directly
-                d_name = dentry->d_name.name;
-                d_len = dentry->d_name.len;
-                
-                if (d_name && d_len > 0 && d_len < 256) {
-                    char fname[256];
-                    memcpy(fname, d_name, d_len);
-                    fname[d_len] = '\0';
-                    
-                    // Check if this dentry name contains our library name
-                    if (strstr(fname, lib_name)) {
-                        base = vma->vm_start;
-                        kpm_info("Found lib '%s' at 0x%lx (file: %s)\n", lib_name, base, fname);
-                        break;
-                    }
-                    
-                    // Also check parent dentry for full path matching
-                    if (dentry->d_parent && dentry->d_parent != dentry) {
-                        struct dentry *parent = dentry->d_parent;
-                        const unsigned char *p_name = parent->d_name.name;
-                        int p_len = parent->d_name.len;
-                        
-                        if (p_name && p_len > 0 && p_len < 256) {
-                            char pname[256];
-                            memcpy(pname, p_name, p_len);
-                            pname[p_len] = '\0';
-                            
-                            // Combine parent name with file name
-                            char fullpath[512];
-                            snprintf(fullpath, sizeof(fullpath), "%s/%s", pname, fname);
-                            
-                            if (strstr(fullpath, lib_name)) {
-                                base = vma->vm_start;
-                                kpm_info("Found lib '%s' at 0x%lx (path: %s)\n", lib_name, base, fullpath);
-                                break;
-                            }
-                        }
-                    }
+            char *path = p_dentry_path_raw(vma->vm_file->f_path.dentry, path_buffer, 512);
+            if (path && !IS_ERR(path)) {
+                if (strstr(path, lib_name)) {
+                    base = vma->vm_start;
+                    kpm_info("Found lib '%s' at 0x%lx (path: %s)\n", lib_name, base, path);
+                    break;
                 }
             }
         }
@@ -250,6 +229,7 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         up_read(&mm->mmap_sem);
     #endif
 
+    kfree(path_buffer);
     p_mmput(mm);
     return base;
 }
@@ -520,10 +500,11 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_init = (mutex_init_t)kallsyms_lookup_name("__mutex_init");
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
+    p_dentry_path_raw = (dentry_path_raw_t)kallsyms_lookup_name("dentry_path_raw");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px\n",
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px dentry_path_raw=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user);
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user, p_dentry_path_raw);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
