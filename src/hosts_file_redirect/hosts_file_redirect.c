@@ -13,7 +13,6 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/mm_types.h>
-#include <asm/pgtable.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
