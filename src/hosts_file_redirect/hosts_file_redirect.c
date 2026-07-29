@@ -323,7 +323,6 @@ static long hfr_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 }
 
 static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
-static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long phys;
     unsigned long size = vma->vm_end - vma->vm_start;
@@ -337,7 +336,7 @@ static int hfr_mmap(struct file *file, struct vm_area_struct *vma)
     phys = p_virt_to_phys((volatile void *)g_ctx.ring);
 
     kpm_err("mmap: vm_start=0x%lx vm_end=0x%lx size=%lu phys=0x%lx pfn=0x%lx",
-            vma->vm_start, vma->vm_end, size, phys, phys >> PAGE_SHIFT);
+            vma->vm_start, vma->vm_end, size, phys, phys >> 12);
 
     return p_remap_pfn_range(vma,
                              vma->vm_start,
