@@ -1,3 +1,4 @@
+
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
@@ -15,11 +16,11 @@
 #endif
 
 
-KPM_NAME("LOL");
+KPM_NAME("@xmhnb");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("LOL");
-KPM_DESCRIPTION(" LOL");
+KPM_AUTHOR("小迷糊开源官方群@xmhnb");
+KPM_DESCRIPTION("小迷糊开源HOOK_ioctl内核模块");
 
 /* ========== ioctl 命令定义 ========== */
 #define OP_READ_MEM                 8001
@@ -246,7 +247,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
         }
     }
 
-    return (long)fp_unhook_syscall(29, 3, 0, before_ioctl, 0, 0);
+    return (long)fp_hook_syscalln(29, 3, before_ioctl, NULL, NULL);
 }
 
 
@@ -259,7 +260,7 @@ static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int 
 
 static long hello_demo_exit(void *__user reserved)
 {
-    fp_unhook_syscall(29, 0, before_ioctl, 0);
+    fp_unwrap_syscalln(29, 0, before_ioctl, 0);
 
     kf__raw_spin_lock(&bp_lock);
     struct bp_node *pos = bp_list.next;
