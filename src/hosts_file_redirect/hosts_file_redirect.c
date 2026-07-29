@@ -12,10 +12,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/sched/task.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/rcupdate.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -108,9 +104,9 @@ typedef void (*rcu_read_unlock_t)(void);
 typedef void (*mutex_init_t)(struct mutex *);
 typedef void (*mutex_lock_t)(struct mutex *);
 typedef void (*mutex_unlock_t)(struct mutex *);
-
-// Additional function pointer for dentry_path_raw
-typedef char *(*dentry_path_raw_t)(struct dentry *, char *, int);
+typedef char *(*dentry_path_raw_t)(void *, char *, int);
+typedef void (*down_read_t)(void *);
+typedef void (*up_read_t)(void *);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -129,6 +125,8 @@ static mutex_init_t          p_mutex_init;
 static mutex_lock_t          p_mutex_lock;
 static mutex_unlock_t        p_mutex_unlock;
 static dentry_path_raw_t     p_dentry_path_raw;
+static down_read_t           p_down_read;
+static up_read_t             p_up_read;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -174,19 +172,19 @@ static pid_t find_pid_by_name(const char *name)
     return found_pid;
 }
 
-// Find library base address by name using dentry_path_raw
+// Find library base address by name using dynamic kernel functions
 static unsigned long find_lib_base_by_name(struct task_struct *task, const char *lib_name)
 {
     struct mm_struct *mm;
-    struct vm_area_struct *vma;
     unsigned long base = 0;
     char *path_buffer = NULL;
+    void *vma_ptr;
 
     if (!task || !lib_name || !lib_name[0])
         return 0;
 
-    if (!p_dentry_path_raw) {
-        kpm_err("find_lib_base: dentry_path_raw not available\n");
+    if (!p_dentry_path_raw || !p_down_read || !p_up_read) {
+        kpm_err("find_lib_base: required functions not resolved\n");
         return 0;
     }
 
@@ -196,41 +194,66 @@ static unsigned long find_lib_base_by_name(struct task_struct *task, const char 
         return 0;
     }
 
-    // Allocate buffer for path
     path_buffer = kmalloc(512, GFP_KERNEL);
     if (!path_buffer) {
         p_mmput(mm);
         return 0;
     }
 
-    // Lock the mmap semaphore
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-        mmap_read_lock(mm);
-    #else
-        down_read(&mm->mmap_sem);
-    #endif
+    // Lock mmap_sem using dynamic down_read
+    p_down_read(&mm->mmap_sem);
 
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (vma->vm_file) {
-            char *path = p_dentry_path_raw(vma->vm_file->f_path.dentry, path_buffer, 512);
-            if (path && !IS_ERR(path)) {
-                if (strstr(path, lib_name)) {
-                    base = vma->vm_start;
-                    kpm_info("Found lib '%s' at 0x%lx (path: %s)\n", lib_name, base, path);
-                    break;
+    // Manually walk VMA list using offsets
+    // struct vm_area_struct layout (common aarch64):
+    // +0:  vm_start
+    // +8:  vm_end  
+    // +16: vm_next (pointer)
+    // +24: vm_prev (pointer)
+    // +32: vm_rb node (24 bytes)
+    // +56: rb_subtree_gap (8 bytes)
+    // +64: vma_mm (pointer)
+    // +72: vm_page_prot (8 bytes)
+    // +80: vm_flags (8 bytes)
+    // +88: vm_ops (pointer)
+    // +96: vm_file (pointer) - offset may vary
+    // We'll read directly from the pointer cast
+
+    vma_ptr = *(void **)((unsigned long)mm + 0); // mm->mmap is at offset 0?
+    // Actually mm->mmap is not at offset 0. Let's use the proper way:
+    vma_ptr = mm->mmap;
+
+    while (vma_ptr) {
+        unsigned long vm_start = *(unsigned long *)(vma_ptr + 0);
+        unsigned long vm_next = *(unsigned long *)(vma_ptr + 16);
+        void *vm_file = *(void **)(vma_ptr + 96); // offset 96 for vm_file (may vary)
+
+        if (vm_file) {
+            // vm_file->f_path.dentry is at offset 24 in struct file
+            void *f_path_dentry = *(void **)((unsigned long)vm_file + 24);
+            
+            if (f_path_dentry) {
+                char *path = p_dentry_path_raw(f_path_dentry, path_buffer, 512);
+                if (path && (unsigned long)path < 0xffff000000000000ULL && (unsigned long)path > 0x1000) {
+                    if (strstr(path, lib_name)) {
+                        base = vm_start;
+                        kpm_info("Found lib '%s' at 0x%lx (path: %s)\n", lib_name, base, path);
+                        break;
+                    }
                 }
             }
         }
+        
+        vma_ptr = (void *)vm_next;
     }
 
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-        mmap_read_unlock(mm);
-    #else
-        up_read(&mm->mmap_sem);
-    #endif
-
+    p_up_read(&mm->mmap_sem);
     kfree(path_buffer);
     p_mmput(mm);
+    
+    if (base == 0) {
+        kpm_info("find_lib_base: '%s' not found in task mappings\n", lib_name);
+    }
+    
     return base;
 }
 
@@ -501,10 +524,12 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_mutex_lock = (mutex_lock_t)kallsyms_lookup_name("mutex_lock");
     p_mutex_unlock = (mutex_unlock_t)kallsyms_lookup_name("mutex_unlock");
     p_dentry_path_raw = (dentry_path_raw_t)kallsyms_lookup_name("dentry_path_raw");
+    p_down_read = (down_read_t)kallsyms_lookup_name("down_read");
+    p_up_read = (up_read_t)kallsyms_lookup_name("up_read");
 
-    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px dentry_path_raw=%px\n",
+    kpm_info("Symbols: proc=%px vm=%px task=%px pid=%px mm=%px mmput=%px copy_from=%px copy_to=%px dentry=%px down=%px up=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid, p_task_pid_nr_ns,
-             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user, p_dentry_path_raw);
+             p_get_task_mm, p_mmput, p_copy_from_user, p_copy_to_user, p_dentry_path_raw, p_down_read, p_up_read);
 
     if (!p_proc_create_data || !p_access_process_vm || !p_find_task_by_vpid || 
         !p_task_pid_nr_ns || !p_get_task_mm || !p_mmput || !p_copy_from_user || !p_copy_to_user) {
