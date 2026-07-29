@@ -1,3 +1,5 @@
+Dono ko dekh theek s ...
+
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <compiler.h>
@@ -12,7 +14,6 @@
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/init_task.h>
 
 KPM_NAME("hosts_file_redirect");
 KPM_VERSION(HFR_VERSION);
@@ -113,9 +114,9 @@ typedef void *(*memcpy_t)(void *, const void *, unsigned long);
 typedef char *(*dentry_path_raw_t)(void *, char *, int);
 typedef void (*down_read_t)(void *);
 typedef void (*up_read_t)(void *);
-
+typedef struct task_struct *(*next_task_t)(struct task_struct *);
 typedef pid_t (*task_tgid_nr_ns_t)(struct task_struct *, enum pid_type, struct pid_namespace *);
-
+typedef char *(*get_task_comm_t)(char *, struct task_struct *);
 
 static proc_create_data_t    p_proc_create_data;
 static remove_proc_entry_t   p_remove_proc_entry;
@@ -140,9 +141,9 @@ static memcpy_t              p_memcpy;
 static dentry_path_raw_t     p_dentry_path_raw;
 static down_read_t           p_down_read;
 static up_read_t             p_up_read;
-
+static next_task_t           p_next_task;
 static task_tgid_nr_ns_t     p_task_tgid_nr_ns;
-
+static get_task_comm_t       p_get_task_comm;
 
 static const char *proc_filename = "hfr_mem";
 static void       *proc_entry    = NULL;
@@ -162,34 +163,75 @@ static inline int is_valid_user_address(uint64_t addr)
     return 1;
 }
 //FF PID FINDING
-//FF PID FINDING
 static pid_t find_pid_by_name(const char *name)
 {
     struct task_struct *task;
-    char comm[TASK_COMM_LEN];
+    struct task_struct *init_task_ptr;
+    pid_t found_pid = 0;
 
-kpm_info("=== PROCESS LIST START ===");
+    char buf[256];
 
-for_each_process(task) {
+    unsigned long start;
+    unsigned long end;
+    size_t len;
 
-    strncpy(comm, get_task_comm(task), TASK_COMM_LEN);
-    comm[TASK_COMM_LEN - 1] = '\0';
+    if (!name || !name[0])
+        return 0;
 
-    kpm_info("PID=%d COMM=%s TASK=%px",
-             p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL),
-             comm,
-             task);
+    if (!p_next_task || !p_access_process_vm)
+        return 0;
 
-    if (strstr(comm, name)) {
-        return p_task_tgid_nr_ns(task, PIDTYPE_PID, NULL);
-    }
+    init_task_ptr = (struct task_struct *)kallsyms_lookup_name("init_task");
+
+    if (!init_task_ptr)
+        return 0;
+
+    task = init_task_ptr;
+
+    do {
+        task = p_next_task(task);
+
+        if (!task)
+            break;
+
+        if (!task->mm)
+            continue;
+
+        start = task->mm->arg_start;
+        end   = task->mm->arg_end;
+
+        if (!start || end <= start)
+            continue;
+
+        len = end - start;
+
+        if (len >= sizeof(buf))
+            len = sizeof(buf) - 1;
+
+        if (p_access_process_vm(task,
+                                start,
+                                buf,
+                                len,
+                                0) != len)
+            continue;
+
+        buf[len] = '\0';
+
+        if (strcmp(buf, name) == 0) {
+
+            found_pid = task->pid;
+
+            kpm_info("Found process argv=%s pid=%d\n",
+                     buf,
+                     found_pid);
+
+            break;
+        }
+
+    } while (task != init_task_ptr);
+
+    return found_pid;
 }
-
-kpm_info("=== PROCESS LIST END ===");
-
-return 0;
-};
-
 
 
 // Find library base address using dynamic functions
@@ -537,9 +579,10 @@ static long hfr_memory_init(const char *args, const char *event, void __user *re
     p_dentry_path_raw = (dentry_path_raw_t)kallsyms_lookup_name("dentry_path_raw");
     p_down_read = (down_read_t)kallsyms_lookup_name("down_read");
     p_up_read = (up_read_t)kallsyms_lookup_name("up_read");
-        p_task_tgid_nr_ns = (task_tgid_nr_ns_t)kallsyms_lookup_name("task_tgid_nr_ns");
+    p_next_task = (next_task_t)kallsyms_lookup_name("next_task");
+    p_task_tgid_nr_ns = (task_tgid_nr_ns_t)kallsyms_lookup_name("task_tgid_nr_ns");
     if (!p_task_tgid_nr_ns) p_task_tgid_nr_ns = (task_tgid_nr_ns_t)kallsyms_lookup_name("__task_tgid_nr_ns");
- 
+    p_get_task_comm = (get_task_comm_t)kallsyms_lookup_name("get_task_comm");
 
     kpm_info("Symbols resolved: proc=%px vm=%px task=%px\n",
              p_proc_create_data, p_access_process_vm, p_find_task_by_vpid);
