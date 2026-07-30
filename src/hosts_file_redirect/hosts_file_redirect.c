@@ -11,12 +11,12 @@
     #define TAG "[FCK]"
     #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
 #else
-    #define logv(fmt, ...) do {} while(0) 
+    #define logv(fmt, ...) do {} while(0)
 #endif
 
 
 KPM_NAME("FCK");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.0.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FKC");
 KPM_DESCRIPTION("FCK");
@@ -29,7 +29,7 @@ KPM_DESCRIPTION("FCK");
 #define OP_SET_HW_BREAKPOINT        8011
 #define OP_REMOVE_HW_BREAKPOINT     8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT 8014
-#define OP_GET_LIB_BASE             8015   // NEW
+#define OP_GET_LIB_BASE             8015
 
 
 typedef struct {
@@ -49,12 +49,11 @@ typedef struct {
     uint64_t len;
 } hw_breakpoint_cmd_t;
 
-// NEW
 typedef struct {
     uint32_t pid;
     uint32_t _pad0;
-    uint64_t lib_name;   // userspace ptr to lib name string
-    uint64_t result;     // userspace ptr to write base addr into
+    uint64_t lib_name;   // userspace ptr -> char[]
+    uint64_t result;     // userspace ptr -> uint64_t
 } get_lib_base_t;
 
 
@@ -105,7 +104,12 @@ static void *(*kf_kmalloc)(uint64_t size, uint32_t flags) = 0;
 static void (*kf_kfree)(void *ptr) = 0;
 static void (*kf__raw_spin_lock)(void *lock) = 0;
 static void (*kf__raw_spin_unlock)(void *lock) = 0;
-static char *(*kf_strstr)(const char *s1, const char *s2) = 0;   // NEW
+
+/* new */
+static void (*kf_mmap_read_lock)(void *mm) = 0;
+static void (*kf_mmap_read_unlock)(void *mm) = 0;
+static char *(*kf_d_path)(const void *path, char *buf, int buflen) = 0;
+static char *(*kf_strstr)(const char *s1, const char *s2) = 0;
 
 
 static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
@@ -131,6 +135,116 @@ static inline void bp_list_del(struct bp_node *entry)
     p->next = n;
     entry->next = (struct bp_node *)LIST_POISON1;
     entry->prev = (struct bp_node *)LIST_POISON2;
+}
+
+
+/*
+ * no extra kernel headers, so opaque layout.
+ * this is 5.10-ish/vendor-style best effort only.
+ */
+struct kpm_path {
+    uint64_t mnt;
+    uint64_t dentry;
+};
+
+struct kpm_file {
+    uint8_t pad0[24];
+    struct kpm_path f_path;
+};
+
+struct kpm_vma {
+    uint64_t vm_start;        /* 0x00 */
+    uint64_t vm_end;          /* 0x08 */
+    uint64_t vm_next;         /* 0x10 */
+    uint8_t  pad0[0x78 - 0x18];
+    uint64_t vm_pgoff;        /* 0x78 */
+    uint64_t vm_file;         /* 0x80 */
+};
+
+static int kstr_contains(const char *a, const char *b)
+{
+    if (!a || !b || !*b)
+        return 0;
+    if (!kf_strstr)
+        return 0;
+    return kf_strstr(a, b) ? 1 : 0;
+}
+
+static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
+{
+    void *task;
+    void *mm;
+    uint64_t result = 0;
+    char *path_buf;
+
+    task = kf_find_task_by_vpid(pid);
+    if (!task)
+        return 0;
+
+    mm = kf_get_task_mm(task);
+    if (!mm)
+        return 0;
+
+    path_buf = kf_kmalloc ? (char *)kf_kmalloc(512, 0xD0)
+                          : (char *)kf___kmalloc(512, 0xD0);
+    if (!path_buf) {
+        if (kf_mmput)
+            kf_mmput(mm);
+        return 0;
+    }
+
+    if (kf_mmap_read_lock)
+        kf_mmap_read_lock(mm);
+
+    /*
+     * no extra headers -> treat first qword as mmap head.
+     * this is fragile, but fits your current style constraints.
+     */
+    {
+        uint64_t vma_addr = *(uint64_t *)mm;
+        int guard = 0;
+
+        while (vma_addr && guard++ < 4096) {
+            struct kpm_vma *vma = (struct kpm_vma *)vma_addr;
+            uint64_t file_ptr = vma->vm_file;
+
+            if (file_ptr) {
+                struct kpm_file *file = (struct kpm_file *)file_ptr;
+                char *p = 0;
+
+                if (kf_d_path)
+                    p = kf_d_path((const void *)&file->f_path, path_buf, 512);
+
+                if (p && (uint64_t)p < 0xFFFFFFFFFFFFF000ULL) {
+                    if (kstr_contains(p, lib_name)) {
+                        if (vma->vm_pgoff == 0) {
+                            result = vma->vm_start;
+                            break;
+                        }
+                        if (!result || vma->vm_start < result)
+                            result = vma->vm_start;
+                    }
+                }
+            }
+
+            if (!vma->vm_next || vma->vm_next == vma_addr)
+                break;
+
+            if (vma->vm_next < 0xFFFFFF0000000000ULL)
+                break;
+
+            vma_addr = vma->vm_next;
+        }
+    }
+
+    if (kf_mmap_read_unlock)
+        kf_mmap_read_unlock(mm);
+
+    kf_kfree(path_buf);
+    if (kf_mmput)
+        kf_mmput(mm);
+
+    return result;
 }
 
 
@@ -180,58 +294,10 @@ uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
 
 static void hw_breakpoint_handler(void *event, void *data)
 {
-    logv("hw_breakpoint: Breakpoint hit\n");
+    logv("hw_breakpoint: Breakpoint hit");
 }
 
 static void before_ioctl(hook_fargs4_t *args, void *udata);
-
-
-// NEW — find lib base by name substring match using only existing deps
-static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
-{
-    void *task = kf_find_task_by_vpid(pid);
-    if (!task) return 0;
-
-    void *mm = kf_get_task_mm(task);
-    if (!mm) return 0;
-
-    uint64_t result = 0;
-
-    // mm->mmap (first VMA) is at offset 0x00 in mm_struct for kernels < 6.1
-    // For 6.1+ maple tree kernels mm->mmap may be absent; this covers common 5.x/6.0.x arm64
-    uint64_t vma_ptr = *(uint64_t *)((uint64_t)mm + 0x00);
-
-    while (vma_ptr && vma_ptr < 0xFFFFFFFF00000000ULL) {
-        uint64_t vm_start = *(uint64_t *)(vma_ptr + 0x00);
-        uint64_t vm_next  = *(uint64_t *)(vma_ptr + 0x10);   // vm_area_struct.vm_next
-        uint64_t vm_file  = *(uint64_t *)(vma_ptr + 0x40);   // vm_area_struct.vm_file (5.x)
-        // guard: on some 6.x kernels vm_file is at +0x48; try both
-        if (!vm_file)
-            vm_file = *(uint64_t *)(vma_ptr + 0x48);
-
-        if (vm_file && vm_file < 0xFFFFFFFF00000000ULL) {
-            // struct file: f_path at +0x10, f_path.dentry at f_path+0x08 => file+0x18
-            uint64_t dentry   = *(uint64_t *)(vm_file + 0x18);
-            if (dentry && dentry < 0xFFFFFFFF00000000ULL) {
-                // dentry: d_name (qstr) at +0x20, qstr.name (char*) at qstr+0x08 => dentry+0x28
-                uint64_t name_ptr = *(uint64_t *)(dentry + 0x28);
-                if (name_ptr && name_ptr < 0xFFFFFFFF00000000ULL) {
-                    // name_ptr is kernel VA — direct deref is safe
-                    if (kf_strstr((const char *)name_ptr, lib_name)) {
-                        // only report first (lowest) mapping = base
-                        result = vm_start;
-                        break;
-                    }
-                }
-            }
-        }
-
-        vma_ptr = vm_next;
-    }
-
-    if (kf_mmput) kf_mmput(mm);
-    return result;
-}
 
 
 static long hello_demo_init(const char *args, const char *event, void *__user reserved)
@@ -258,7 +324,12 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     kf_kfree = (typeof(kf_kfree))kallsyms_lookup_name("kfree");
     kf__raw_spin_lock = (typeof(kf__raw_spin_lock))kallsyms_lookup_name("_raw_spin_lock");
     kf__raw_spin_unlock = (typeof(kf__raw_spin_unlock))kallsyms_lookup_name("_raw_spin_unlock");
-    kf_strstr = (typeof(kf_strstr))kallsyms_lookup_name("strstr");   // NEW
+
+    /* new */
+    kf_mmap_read_lock = (typeof(kf_mmap_read_lock))kallsyms_lookup_name("mmap_read_lock");
+    kf_mmap_read_unlock = (typeof(kf_mmap_read_unlock))kallsyms_lookup_name("mmap_read_unlock");
+    kf_d_path = (typeof(kf_d_path))kallsyms_lookup_name("d_path");
+    kf_strstr = (typeof(kf_strstr))kallsyms_lookup_name("strstr");
 
     uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
@@ -302,7 +373,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
             if (kf_put_pid)
                 kf_put_pid(pid);
         } else {
-            logv("kfunc: %s not found\n", "get_task_pid");
+            logv("kfunc: %s not found", "get_task_pid");
         }
     }
 
@@ -312,7 +383,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
 
 static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int outlen)
 {
-    logv("welcome to use my kpm\n");
+    logv("welcome to use my kpm");
     return 0;
 }
 
@@ -333,7 +404,7 @@ static long hello_demo_exit(void *__user reserved)
     }
     kf__raw_spin_unlock(&bp_lock);
 
-    logv("hello_demo_exit\n");
+    logv("hello_demo_exit");
     return 0;
 }
 
@@ -344,7 +415,6 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     int64_t cmd = (int64_t)regs[1];
     uint64_t user_data = regs[2];
 
-    // NEW: extend range check to include OP_GET_LIB_BASE
     if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_GET_LIB_BASE - OP_READ_MEM))
         return;
 
@@ -422,38 +492,37 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             if (kf_mmput) kf_mmput(mm);
 
             if (phys_addr) {
-    if (kf_pfn_valid(phys_addr >> my_page_shift) &&
-        kf_valid_phys_addr_range(phys_addr, chunk)) {
-        uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
-                     - *(uint64_t *)kv_memstart_addr
-                     + (-1ULL << my_va_bits)
-                     + (phys_addr & ~(-1ULL << my_page_shift));
+                if (kf_pfn_valid(phys_addr >> my_page_shift) &&
+                    kf_valid_phys_addr_range(phys_addr, chunk)) {
+                    uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
+                                 - *(uint64_t *)kv_memstart_addr
+                                 + (-1ULL << my_va_bits)
+                                 + (phys_addr & ~(-1ULL << my_page_shift));
 
-        if (cmd == OP_READ_MEM) {
-            kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
-        } else {
-            // ✅ SAFE: userspace → kernel buffer → phys
-            uint8_t *tmp;
-            uint64_t not_copied;
+                    if (cmd == OP_READ_MEM) {
+                        kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
+                    } else {
+                        uint8_t *tmp;
+                        uint64_t not_copied;
 
-            tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(chunk, 0xD0)
-                             : (uint8_t *)kf___kmalloc(chunk, 0xD0);
-            if (!tmp)
-                goto next_chunk;
+                        tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(chunk, 0xD0)
+                                         : (uint8_t *)kf___kmalloc(chunk, 0xD0);
+                        if (!tmp)
+                            goto next_chunk;
 
-            not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
-            if (not_copied) {
-                kf_kfree(tmp);
-                goto next_chunk;
+                        not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
+                        if (not_copied) {
+                            kf_kfree(tmp);
+                            goto next_chunk;
+                        }
+
+                        for (uint64_t i = 0; i < chunk; i++)
+                            *(volatile uint8_t *)(kva + i) = tmp[i];
+
+                        kf_kfree(tmp);
+                    }
+                }
             }
-
-            for (uint64_t i = 0; i < chunk; i++)
-                *(volatile uint8_t *)(kva + i) = tmp[i];
-
-            kf_kfree(tmp);
-        }
-    }
-}
 
         next_chunk:
             remaining -= chunk;
@@ -553,23 +622,30 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         return;
     }
 
-    // NEW
     if (cmd == OP_GET_LIB_BASE) {
         get_lib_base_t gcmd;
+        char lib_name[256];
+        uint64_t base = 0;
+
         if (kf___arch_copy_from_user(&gcmd, (void __user *)user_data, sizeof(gcmd)))
             return;
 
-        // copy lib name from userspace into kernel buffer
-        char lib_name[256];
-        if (kf_memset) kf_memset(lib_name, 0, sizeof(lib_name));
+        if (!gcmd.lib_name || !gcmd.result)
+            return;
+
+        if (kf_memset)
+            kf_memset(lib_name, 0, sizeof(lib_name));
+
         if (kf___arch_copy_from_user(lib_name, (void __user *)gcmd.lib_name, sizeof(lib_name) - 1))
             return;
-        lib_name[255] = '\0';
 
-        if (!kf_strstr) return;
+        lib_name[sizeof(lib_name) - 1] = '';
 
-        uint64_t base = find_lib_base(gcmd.pid, lib_name);
-        logv("get_lib_base: pid=%u lib=%s base=0x%llx\n", gcmd.pid, lib_name, base);
+        if (!lib_name[0])
+            return;
+
+        base = find_lib_base(gcmd.pid, lib_name);
+        logv("get_lib_base: pid=%u lib=%s base=0x%llx", gcmd.pid, lib_name, base);
 
         kf___arch_copy_to_user((void __user *)gcmd.result, &base, sizeof(base));
         return;
