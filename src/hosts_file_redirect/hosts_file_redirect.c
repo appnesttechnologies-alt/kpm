@@ -4,13 +4,20 @@
 #include <common.h>
 #include <syscall.h>
 
+#include <linux/mm.h>
+#include <linux/mm_types.h>
+#include <linux/fs.h>
+#include <linux/path.h>
+#include <linux/dcache.h>
+#include <linux/slab.h>
+
 #define ENABLE_DEBUG_LOG 1
 
 #if ENABLE_DEBUG_LOG
     #define TAG "[FCK]"
     #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
 #else
-    #define logv(fmt, ...) do {} while(0) 
+    #define logv(fmt, ...) do {} while (0)
 #endif
 
 KPM_NAME("FCK");
@@ -48,9 +55,9 @@ typedef struct {
 typedef struct {
     uint32_t pid;
     uint32_t _pad0;
-    uint64_t name;      // user ptr to char[]
-    uint64_t name_len;  // includes ''
-    uint64_t base;      // out: user ptr to u64
+    uint64_t name;
+    uint64_t name_len;
+    uint64_t base;
 } module_base_cmd_t;
 
 struct bp_node {
@@ -97,8 +104,8 @@ static void (*kf_kfree)(void *ptr) = 0;
 static void (*kf__raw_spin_lock)(void *lock) = 0;
 static void (*kf__raw_spin_unlock)(void *lock) = 0;
 
-static void (*kf_mmap_read_lock)(void *mm) = 0;
-static void (*kf_mmap_read_unlock)(void *mm) = 0;
+static void (*kf_mmap_read_lock)(struct mm_struct *mm) = 0;
+static void (*kf_mmap_read_unlock)(struct mm_struct *mm) = 0;
 static char *(*kf_d_path)(const struct path *path, char *buf, int buflen) = 0;
 static long (*kf_strnlen_user)(const char __user *str, long count) = 0;
 
@@ -111,9 +118,9 @@ static inline void bp_list_add(struct bp_node *node, struct bp_node *head)
 {
     struct bp_node *old_next = head->next;
     head->next = node;
-    node->next = (struct bp_node *)head;
-    node->prev = old_next;
-    old_next->next = node;
+    node->next = old_next;
+    node->prev = head;
+    old_next->prev = node;
 }
 
 static inline void bp_list_del(struct bp_node *entry)
@@ -124,6 +131,29 @@ static inline void bp_list_del(struct bp_node *entry)
     p->next = n;
     entry->next = (struct bp_node *)LIST_POISON1;
     entry->prev = (struct bp_node *)LIST_POISON2;
+}
+
+static int str_contains(const char *hay, const char *needle)
+{
+    const char *h;
+    const char *n;
+
+    if (!hay || !needle)
+        return 0;
+    if (!*needle)
+        return 1;
+
+    for (; *hay; hay++) {
+        h = hay;
+        n = needle;
+        while (*h && *n && (*h == *n)) {
+            h++;
+            n++;
+        }
+        if (!*n)
+            return 1;
+    }
+    return 0;
 }
 
 uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
@@ -137,70 +167,56 @@ uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
     if (levels < 1)
         return 0;
 
-    int64_t level = 4 - levels;
-    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
-    uint64_t imask = (1U << es) - 1;
+    {
+        int64_t level = 4 - levels;
+        uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+        uint64_t imask = (1U << es) - 1;
 
-    while (1) {
-        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-        uint64_t idx = (va >> shift) & imask;
-        result = (uint64_t *)(table_base + idx * 8);
-        uint64_t entry = *result;
-        uint64_t dt = entry & 3;
+        while (1) {
+            uint64_t shift = (4 - (uint8_t)level) * es + 3;
+            uint64_t idx = (va >> shift) & imask;
+            result = (uint64_t *)(table_base + idx * 8);
+            {
+                uint64_t entry = *result;
+                uint64_t dt = entry & 3;
 
-        if (dt == 3) {
-            table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-            level++;
-            if (level >= 3)
-                return result;
-        } else if (dt == 1) {
-            if (level == 0) {
-                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                level++;
-                if (level >= 3) { found = 1; break; }
-                continue;
+                if (dt == 3) {
+                    table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                    level++;
+                    if (level >= 3)
+                        return result;
+                } else if (dt == 1) {
+                    if (level == 0) {
+                        pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                        table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                        level++;
+                        if (level >= 3)
+                            return result;
+                        continue;
+                    }
+                    return result;
+                } else {
+                    return 0;
+                }
             }
-            return result;
-        } else {
-            return 0;
         }
     }
 }
 
-static void hw_breakpoint_handler(void *event, void *data)
-{
-    logv("hw_breakpoint: Breakpoint hit");
-}
-
-static void before_ioctl(hook_fargs4_t *args, void *udata);
-
-static int str_contains(const char *hay, const char *needle)
-{
-    if (!*needle) return 1;
-    for (; *hay; hay++) {
-        const char *h = hay;
-        const char *n = needle;
-        while (*h && *n && *h == *n) {
-            h++;
-            n++;
-        }
-        if (!*n) return 1;
-    }
-    return 0;
-}
-
-static uint64_t find_module_base_locked(void *mm, const char *libname)
+static uint64_t find_module_base_locked(struct mm_struct *mm, const char *libname)
 {
     struct vm_area_struct *vma;
     uint64_t result = 0;
     char *tmpbuf;
 
-    tmpbuf = kf_kmalloc ? kf_kmalloc(512, 0xD0) : kf___kmalloc(512, 0xD0);
+    if (!mm || !libname || !*libname)
+        return 0;
+
+    tmpbuf = kf_kmalloc ? (char *)kf_kmalloc(512, 0xD0) : (char *)kf___kmalloc(512, 0xD0);
     if (!tmpbuf)
         return 0;
 
-    for (vma = ((struct mm_struct *)mm)->mmap; vma; vma = vma->vm_next) {
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
         struct file *file;
         char *path;
 
@@ -212,7 +228,9 @@ static uint64_t find_module_base_locked(void *mm, const char *libname)
             continue;
 
         path = kf_d_path(&file->f_path, tmpbuf, 512);
-        if ((uint64_t)path > 0xFFFFFFFFFFFFF000ULL || !path)
+        if (!path)
+            continue;
+        if ((uint64_t)path > 0xFFFFFFFFFFFFF000ULL)
             continue;
 
         if (!str_contains(path, libname))
@@ -223,7 +241,7 @@ static uint64_t find_module_base_locked(void *mm, const char *libname)
             break;
         }
 
-        if (!result || vma->vm_start < result)
+        if (!result || ((uint64_t)vma->vm_start < result))
             result = (uint64_t)vma->vm_start;
     }
 
@@ -234,14 +252,14 @@ static uint64_t find_module_base_locked(void *mm, const char *libname)
 static uint64_t find_module_base(uint32_t pid, const char *libname)
 {
     void *task;
-    void *mm;
+    struct mm_struct *mm;
     uint64_t base = 0;
 
     task = kf_find_task_by_vpid(pid);
     if (!task)
         return 0;
 
-    mm = kf_get_task_mm(task);
+    mm = (struct mm_struct *)kf_get_task_mm(task);
     if (!mm)
         return 0;
 
@@ -259,8 +277,24 @@ static uint64_t find_module_base(uint32_t pid, const char *libname)
     return base;
 }
 
+static void hw_breakpoint_handler(void *event, void *data)
+{
+    logv("hw_breakpoint: Breakpoint hit
+");
+}
+
+static void before_ioctl(hook_fargs4_t *args, void *udata);
+
 static long hello_demo_init(const char *args, const char *event, void *__user reserved)
 {
+    uint64_t tcr_el1;
+    uint64_t mmfr0;
+    uint64_t parange;
+    uint64_t tg1;
+    uint64_t ttbr1;
+    uint64_t init_mm_addr;
+    uint64_t init_task_addr;
+
     kv_memstart_addr = (uint64_t)kallsyms_lookup_name("memstart_addr");
     kv_kimage_voffset = (uint64_t)kallsyms_lookup_name("kimage_voffset");
     kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
@@ -283,15 +317,13 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     kf_kfree = (typeof(kf_kfree))kallsyms_lookup_name("kfree");
     kf__raw_spin_lock = (typeof(kf__raw_spin_lock))kallsyms_lookup_name("_raw_spin_lock");
     kf__raw_spin_unlock = (typeof(kf__raw_spin_unlock))kallsyms_lookup_name("_raw_spin_unlock");
-
     kf_mmap_read_lock = (typeof(kf_mmap_read_lock))kallsyms_lookup_name("mmap_read_lock");
     kf_mmap_read_unlock = (typeof(kf_mmap_read_unlock))kallsyms_lookup_name("mmap_read_unlock");
     kf_d_path = (typeof(kf_d_path))kallsyms_lookup_name("d_path");
     kf_strnlen_user = (typeof(kf_strnlen_user))kallsyms_lookup_name("strnlen_user");
 
-    uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
-    uint64_t tg1 = (tcr_el1 >> 30) & 0x3;
+    tg1 = (tcr_el1 >> 30) & 0x3;
     my_va_bits = 64 - ((tcr_el1 >> 16) & 0x1F);
     if (tg1 == 1)
         my_page_shift = 14;
@@ -300,18 +332,16 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     else
         my_page_shift = 12;
 
-    uint64_t mmfr0;
     __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
-    uint64_t parange = mmfr0 & 0xF;
+    parange = mmfr0 & 0xF;
     if (parange > 6)
         my_pa_bits = 48;
     else
         my_pa_bits = pa_bits_table[parange];
 
-    uint64_t ttbr1;
     __asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
 
-    uint64_t init_mm_addr = (uint64_t)kallsyms_lookup_name("init_mm");
+    init_mm_addr = (uint64_t)kallsyms_lookup_name("init_mm");
     if (init_mm_addr && init_mm_addr <= 0xFFFFFFFFFFFFFF4FULL) {
         uint64_t expected_pgd = *(uint64_t *)kv_kimage_voffset
                               + (ttbr1 & (-1ULL << my_page_shift) & 0xFFFFFFFFFFFEULL);
@@ -324,7 +354,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
         }
     }
 
-    uint64_t init_task_addr = (uint64_t)kallsyms_lookup_name("init_task");
+    init_task_addr = (uint64_t)kallsyms_lookup_name("init_task");
     if (init_task_addr) {
         if (kf_get_task_pid) {
             void *pid = kf_get_task_pid((void *)init_task_addr, 0);
@@ -346,10 +376,12 @@ static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int 
 
 static long hello_demo_exit(void *__user reserved)
 {
+    struct bp_node *pos;
+
     fp_unhook_syscall(29, 0, before_ioctl);
 
     kf__raw_spin_lock(&bp_lock);
-    struct bp_node *pos = bp_list.next;
+    pos = bp_list.next;
     while ((void *)pos != (void *)&bp_list) {
         struct bp_node *next_node = pos->next;
         bp_list_del(pos);
@@ -370,119 +402,144 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     int64_t cmd = (int64_t)regs[1];
     uint64_t user_data = regs[2];
 
-    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_REMOVE_ALL_HW_BREAKPOINT - OP_READ_MEM))
+    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_GET_MODULE_BASE - OP_READ_MEM))
         return;
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         copy_memory_t rcmd;
         if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
             return;
-        uint64_t remaining = rcmd.size;
-        if (!remaining) return;
-        uint64_t vaddr = rcmd.addr;
-        uint64_t outbuf = rcmd.buffer;
 
-        while (remaining) {
-            uint64_t pgsz = 1ULL << my_page_shift;
-            uint64_t pgoff = vaddr & (pgsz - 1);
-            uint64_t chunk = pgsz - pgoff;
-            if (chunk > remaining) chunk = remaining;
+        {
+            uint64_t remaining = rcmd.size;
+            uint64_t vaddr = rcmd.addr;
+            uint64_t outbuf = rcmd.buffer;
 
-            void *task = kf_find_task_by_vpid(rcmd.pid);
-            if (!task) goto next_chunk;
-            void *mm = kf_get_task_mm(task);
-            if (!mm) goto next_chunk;
+            if (!remaining)
+                return;
 
-            uint64_t ps = my_page_shift;
-            uint64_t vb = my_va_bits;
-            uint64_t es = ps - 3;
-            int64_t levels = (int64_t)((vb - 4) / es);
-            uint64_t phys_addr = 0;
+            while (remaining) {
+                uint64_t pgsz = 1ULL << my_page_shift;
+                uint64_t pgoff = vaddr & (pgsz - 1);
+                uint64_t chunk = pgsz - pgoff;
+                void *task;
+                void *mm;
+                uint64_t ps;
+                uint64_t vb;
+                uint64_t es;
+                int64_t levels;
+                uint64_t phys_addr = 0;
 
-            if (levels >= 1) {
-                int64_t level = 4 - levels;
-                uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
-                uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
-                uint64_t imask = (1U << es) - 1;
-                int found = 0;
+                if (chunk > remaining)
+                    chunk = remaining;
 
-                while (!found) {
-                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx = (vaddr >> shift) & imask;
-                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                    uint64_t dt = entry & 3;
+                task = kf_find_task_by_vpid(rcmd.pid);
+                if (!task)
+                    goto next_chunk;
 
-                    if (dt == 3) {
-                        tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                        level++;
-                        if (level >= 3) { found = 1; break; }
-                    } else if (dt == 1) {
-                        if (level == 0) {
-                            pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                mm = kf_get_task_mm(task);
+                if (!mm)
+                    goto next_chunk;
+
+                ps = my_page_shift;
+                vb = my_va_bits;
+                es = ps - 3;
+                levels = (int64_t)((vb - 4) / es);
+
+                if (levels >= 1) {
+                    int64_t level = 4 - levels;
+                    uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
+                    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+                    uint64_t imask = (1U << es) - 1;
+                    int found = 0;
+
+                    while (!found) {
+                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                        uint64_t idx = (vaddr >> shift) & imask;
+                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                        uint64_t dt = entry & 3;
+
+                        if (dt == 3) {
                             tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
                             level++;
-                            if (level >= 3) { found = 1; break; }
-                            continue;
+                            if (level >= 3) {
+                                found = 1;
+                                break;
+                            }
+                        } else if (dt == 1) {
+                            if (level == 0) {
+                                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                                tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                                level++;
+                                if (level >= 3) {
+                                    found = 1;
+                                    break;
+                                }
+                                continue;
+                            }
+                            found = 1;
+                            break;
+                        } else {
+                            break;
                         }
-                        found = 1; break;
-                    } else {
-                        break;
+                    }
+
+                    if (found) {
+                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                        uint64_t idx = (vaddr >> shift) & imask;
+                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                        if ((~(uint16_t)entry & 0x401) == 0) {
+                            uint64_t pa_frame = 0;
+                            if (my_pa_bits == 52)
+                                pa_frame = (entry << 36) & 0xF000000000000ULL;
+                            phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
+                            phys_addr |= vaddr & ~(-1ULL << ps);
+                        }
                     }
                 }
 
-                if (found) {
-                    uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx = (vaddr >> shift) & imask;
-                    uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                    if ((~(uint16_t)entry & 0x401) == 0) {
-                        uint64_t pa_frame = 0;
-                        if (my_pa_bits == 52)
-                            pa_frame = (entry << 36) & 0xF000000000000ULL;
-                        phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
-                        phys_addr |= vaddr & ~(-1ULL << ps);
-                    }
-                }
-            }
+                if (kf_mmput)
+                    kf_mmput(mm);
 
-            if (kf_mmput) kf_mmput(mm);
+                if (phys_addr) {
+                    if (kf_pfn_valid(phys_addr >> my_page_shift) &&
+                        kf_valid_phys_addr_range(phys_addr, chunk)) {
+                        uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
+                                     - *(uint64_t *)kv_memstart_addr
+                                     + (-1ULL << my_va_bits)
+                                     + (phys_addr & ~(-1ULL << my_page_shift));
 
-            if (phys_addr) {
-                if (kf_pfn_valid(phys_addr >> my_page_shift) &&
-                    kf_valid_phys_addr_range(phys_addr, chunk)) {
-                    uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
-                                 - *(uint64_t *)kv_memstart_addr
-                                 + (-1ULL << my_va_bits)
-                                 + (phys_addr & ~(-1ULL << my_page_shift));
+                        if (cmd == OP_READ_MEM) {
+                            kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
+                        } else {
+                            uint8_t *tmp;
+                            uint64_t not_copied;
+                            uint64_t i;
 
-                    if (cmd == OP_READ_MEM) {
-                        kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
-                    } else {
-                        uint8_t *tmp;
-                        uint64_t not_copied;
+                            tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(chunk, 0xD0)
+                                             : (uint8_t *)kf___kmalloc(chunk, 0xD0);
+                            if (!tmp)
+                                goto next_chunk;
 
-                        tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(chunk, 0xD0)
-                                         : (uint8_t *)kf___kmalloc(chunk, 0xD0);
-                        if (!tmp)
-                            goto next_chunk;
+                            not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
+                            if (not_copied) {
+                                kf_kfree(tmp);
+                                goto next_chunk;
+                            }
 
-                        not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
-                        if (not_copied) {
+                            for (i = 0; i < chunk; i++)
+                                *(volatile uint8_t *)(kva + i) = tmp[i];
+
                             kf_kfree(tmp);
-                            goto next_chunk;
                         }
-
-                        for (uint64_t i = 0; i < chunk; i++)
-                            *(volatile uint8_t *)(kva + i) = tmp[i];
-
-                        kf_kfree(tmp);
                     }
                 }
-            }
 
-        next_chunk:
-            remaining -= chunk;
-            vaddr += chunk;
-            outbuf += chunk;
+next_chunk:
+                remaining -= chunk;
+                vaddr += chunk;
+                outbuf += chunk;
+            }
         }
         return;
     }
@@ -498,45 +555,54 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
             return;
 
-        void *task = kf_find_task_by_vpid(bcmd.pid);
-        if (!task) return;
+        {
+            void *task = kf_find_task_by_vpid(bcmd.pid);
+            char attr[136];
+            void *ev;
+            void *(*alloc_fn)(uint64_t, uint32_t);
+            struct bp_node *node;
 
-        char attr[136];
-        if (kf_memset) kf_memset(attr, 0, sizeof(attr));
+            if (!task)
+                return;
 
-        *(uint32_t *)(attr + 0x00) = 5;
-        if (kver >> 9 >= 0x285) {
-            *(uint32_t *)(attr + 0x04) = 120;
-            if (kver > 0x50EFF) {
-                *(uint32_t *)(attr + 0x04) = (kver >> 8 > 0x600) ? 136 : 128;
+            if (kf_memset)
+                kf_memset(attr, 0, sizeof(attr));
+
+            *(uint32_t *)(attr + 0x00) = 5;
+            if (kver >> 9 >= 0x285) {
+                *(uint32_t *)(attr + 0x04) = 120;
+                if (kver > 0x50EFF)
+                    *(uint32_t *)(attr + 0x04) = (kver >> 8 > 0x600) ? 136 : 128;
             }
+            *(uint64_t *)(attr + 0x10) = 1;
+            *(uint64_t *)(attr + 0x28) |= 0x24;
+            *(uint32_t *)(attr + 0x34) = bcmd.type;
+            *(uint64_t *)(attr + 0x38) = bcmd.addr;
+            *(uint64_t *)(attr + 0x40) = bcmd.len;
+
+            ev = kf_register_user_hw_breakpoint(attr, hw_breakpoint_handler, 0, task);
+            if ((uint64_t)ev > 0xFFFFFFFFFFFFF000ULL)
+                return;
+
+            if (kf_perf_event_enable)
+                kf_perf_event_enable(ev);
+
+            alloc_fn = kf_kmalloc ? (void *)kf_kmalloc : (void *)kf___kmalloc;
+            node = (struct bp_node *)alloc_fn(sizeof(struct bp_node), 0xD0);
+            if (!node) {
+                if (kf_unregister_hw_breakpoint)
+                    kf_unregister_hw_breakpoint(ev);
+                return;
+            }
+
+            node->pid = bcmd.pid;
+            node->perf_event = (uint64_t)ev;
+            node->addr = bcmd.addr;
+
+            kf__raw_spin_lock(&bp_lock);
+            bp_list_add(node, &bp_list);
+            kf__raw_spin_unlock(&bp_lock);
         }
-        *(uint64_t *)(attr + 0x10) = 1;
-        *(uint64_t *)(attr + 0x28) |= 0x24;
-        *(uint32_t *)(attr + 0x34) = bcmd.type;
-        *(uint64_t *)(attr + 0x38) = bcmd.addr;
-        *(uint64_t *)(attr + 0x40) = bcmd.len;
-
-        void *ev = kf_register_user_hw_breakpoint(attr, hw_breakpoint_handler, 0, task);
-        if ((uint64_t)ev > 0xFFFFFFFFFFFFF000ULL) return;
-
-        if (kf_perf_event_enable) kf_perf_event_enable(ev);
-
-        void *(*alloc_fn)(uint64_t, uint32_t);
-        alloc_fn = kf_kmalloc ? (void *)kf_kmalloc : (void *)kf___kmalloc;
-        struct bp_node *node = (struct bp_node *)alloc_fn(sizeof(struct bp_node), 0xD0);
-        if (!node) {
-            if (kf_unregister_hw_breakpoint) kf_unregister_hw_breakpoint(ev);
-            return;
-        }
-
-        node->pid = bcmd.pid;
-        node->perf_event = (uint64_t)ev;
-        node->addr = bcmd.addr;
-
-        kf__raw_spin_lock(&bp_lock);
-        bp_list_add(node, &bp_list);
-        kf__raw_spin_unlock(&bp_lock);
         return;
     }
 
@@ -545,26 +611,32 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
             return;
 
-        kf__raw_spin_lock(&bp_lock);
-        struct bp_node *pos = bp_list.next;
-        while ((void *)pos != (void *)&bp_list) {
-            struct bp_node *n = pos->next;
-            if (pos->pid == bcmd.pid && pos->addr == bcmd.addr) {
-                bp_list_del(pos);
-                if (kf_unregister_hw_breakpoint)
-                    kf_unregister_hw_breakpoint((void *)pos->perf_event);
-                kf_kfree(pos);
-                break;
+        {
+            struct bp_node *pos;
+
+            kf__raw_spin_lock(&bp_lock);
+            pos = bp_list.next;
+            while ((void *)pos != (void *)&bp_list) {
+                struct bp_node *n = pos->next;
+                if (pos->pid == bcmd.pid && pos->addr == bcmd.addr) {
+                    bp_list_del(pos);
+                    if (kf_unregister_hw_breakpoint)
+                        kf_unregister_hw_breakpoint((void *)pos->perf_event);
+                    kf_kfree(pos);
+                    break;
+                }
+                pos = n;
             }
-            pos = n;
+            kf__raw_spin_unlock(&bp_lock);
         }
-        kf__raw_spin_unlock(&bp_lock);
         return;
     }
 
     if (cmd == OP_REMOVE_ALL_HW_BREAKPOINT) {
+        struct bp_node *pos;
+
         kf__raw_spin_lock(&bp_lock);
-        struct bp_node *pos = bp_list.next;
+        pos = bp_list.next;
         while ((void *)pos != (void *)&bp_list) {
             struct bp_node *n = pos->next;
             bp_list_del(pos);
@@ -579,7 +651,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
     if (cmd == OP_GET_MODULE_BASE) {
         module_base_cmd_t mcmd;
-        char *kname = NULL;
+        char *kname;
         uint64_t base = 0;
         long nlen;
 
@@ -589,15 +661,17 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (!mcmd.name || !mcmd.name_len || mcmd.name_len > 256 || !mcmd.base)
             return;
 
-        kname = kf_kmalloc ? kf_kmalloc(mcmd.name_len, 0xD0)
-                           : kf___kmalloc(mcmd.name_len, 0xD0);
+        kname = kf_kmalloc ? (char *)kf_kmalloc(mcmd.name_len, 0xD0)
+                           : (char *)kf___kmalloc(mcmd.name_len, 0xD0);
         if (!kname)
             return;
 
-        nlen = kf_strnlen_user ? kf_strnlen_user((const char __user *)(uintptr_t)mcmd.name, mcmd.name_len) : 0;
-        if (nlen <= 0 || nlen > mcmd.name_len) {
-            kf_kfree(kname);
-            return;
+        if (kf_strnlen_user) {
+            nlen = kf_strnlen_user((const char __user *)(uintptr_t)mcmd.name, mcmd.name_len);
+            if (nlen <= 0 || nlen > (long)mcmd.name_len) {
+                kf_kfree(kname);
+                return;
+            }
         }
 
         if (kf___arch_copy_from_user(kname, (void __user *)(uintptr_t)mcmd.name, mcmd.name_len)) {
@@ -608,8 +682,8 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         kname[mcmd.name_len - 1] = '';
 
         base = find_module_base(mcmd.pid, kname);
-
         kf___arch_copy_to_user((void __user *)(uintptr_t)mcmd.base, &base, sizeof(base));
+
         kf_kfree(kname);
         return;
     }
