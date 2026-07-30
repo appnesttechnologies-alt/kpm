@@ -370,7 +370,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
                     kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
                 } else {
                     uint8_t tmp[128];
-                    kf___arch_copy_from_user(tmp, (void __user *)inbuf, chunk);
+                    kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
                     for (uint64_t i = 0; i < chunk; i++)
                         *(volatile uint8_t *)(kva + i) = tmp[i];
                 }
