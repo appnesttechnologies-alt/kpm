@@ -112,6 +112,8 @@ static char *(*kf_d_path)(const void *path, char *buf, int buflen) = 0;
 static char *(*kf_strstr)(const char *s1, const char *s2) = 0;
 
 
+
+
 static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
 
 
@@ -217,65 +219,88 @@ static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
     uint64_t vma, base = 0;
     int n = 0;
 
-    if (!pid || !lib_name || !*lib_name)
-        return 0;
-
-    /* Mandatory only: task/mm/path/memset */
-    if (!kf_find_task_by_vpid || !kf_get_task_mm || !kf_mmput ||
-        !kf_d_path || !kf_memset) {
-        logv("find_lib_base: missing mandatory kfuncs");
+    if (!pid || !lib_name || !*lib_name) {
+        logv("find_lib_base: bad input pid=%u lib=%p", pid, lib_name);
         return 0;
     }
 
+    if (!kf_find_task_by_vpid) { logv("MISS kf_find_task_by_vpid"); return 0; }
+    if (!kf_get_task_mm)       { logv("MISS kf_get_task_mm"); return 0; }
+    if (!kf_mmput)             { logv("MISS kf_mmput"); return 0; }
+    if (!kf_d_path)            { logv("MISS kf_d_path"); return 0; }
+    if (!kf_memset)            { logv("MISS kf_memset"); return 0; }
+
     task = kf_find_task_by_vpid(pid);
+    logv("find_lib_base: task=%p", task);
     if (!task)
         return 0;
 
     mm = kf_get_task_mm(task);
+    logv("find_lib_base: mm=%p", mm);
     if (!mm)
         return 0;
 
-    /* Make locking optional */
-    if (kf_mmap_read_lock)
+    if (kf_mmap_read_lock) {
+        logv("find_lib_base: taking mmap_read_lock");
         kf_mmap_read_lock(mm);
+    } else {
+        logv("find_lib_base: mmap_read_lock unavailable");
+    }
 
-    vma = *(uint64_t *)((uint8_t *)mm + 0x00);
+    vma = *(uint64_t *)((uint8_t *)mm + OFF_MM_MMAP);
     logv("find_lib_base: pid=%u lib=%s first_vma=%p", pid, lib_name, (void *)vma);
 
-    while (vma && n++ < 4096) {
-        uint64_t vm_start = *(uint64_t *)(vma + 0x00);
-        uint64_t vm_end   = *(uint64_t *)(vma + 0x08);
-        uint64_t vm_next  = *(uint64_t *)(vma + 0x10);
-        uint64_t vm_file  = *(uint64_t *)(vma + 0x98);
+    while (vma && n++ < 256) {
+        uint64_t vm_start = *(uint64_t *)(vma + OFF_VM_START);
+        uint64_t vm_end   = *(uint64_t *)(vma + OFF_VM_END);
+        uint64_t vm_next  = *(uint64_t *)(vma + OFF_VM_NEXT);
+        uint64_t vm_file  = *(uint64_t *)(vma + OFF_VM_FILE);
 
-        if (vm_file && vm_file >= 0xFFFFFF0000000000ULL) {
+        logv("VMA[%d] vma=%p start=%016llx end=%016llx next=%p file=%p",
+             n, (void *)vma, vm_start, vm_end, (void *)vm_next, (void *)vm_file);
+
+        if (vm_file) {
             char buf[512];
             char *path;
 
             kf_memset(buf, 0, sizeof(buf));
-            path = kf_d_path((void *)(vm_file + 0x08), buf, sizeof(buf));
+            logv("VMA[%d] trying d_path(file+0x%X) file=%p",
+                 n, OFF_F_PATH, (void *)vm_file);
+
+            path = kf_d_path((void *)(vm_file + OFF_F_PATH), buf, sizeof(buf));
+            logv("VMA[%d] d_path ret=%p", n, path);
 
             if ((uint64_t)path >= 0xFFFFFFFFFFFFF000ULL) {
-                logv("map: %016llx-%016llx d_path ERR file=%p",
-                     vm_start, vm_end, (void *)vm_file);
-            } else if ((uint64_t)path >= 0xFFFFFF0000000000ULL) {
-                logv("map: %016llx-%016llx %s", vm_start, vm_end, path);
+                logv("VMA[%d] d_path ERR file=%p ret=%p",
+                     n, (void *)vm_file, path);
+            } else {
+                logv("VMA[%d] PATH=%s", n, path);
+
                 if (!base && local_str_contains(path, lib_name)) {
                     base = vm_start;
-                    logv("MATCH: %s => 0x%llx (%s)", lib_name, base, path);
+                    logv("MATCH: lib=%s base=0x%llx path=%s", lib_name, base, path);
+                    break;
                 }
             }
+        } else {
+            logv("VMA[%d] vm_file is NULL", n);
         }
 
-        if (!vm_next || vm_next == vma)
+        if (!vm_next || vm_next == vma) {
+            logv("VMA[%d] stopping: vm_next=%p", n, (void *)vm_next);
             break;
+        }
+
         vma = vm_next;
     }
 
-    if (kf_mmap_read_unlock)
+    if (kf_mmap_read_unlock) {
+        logv("find_lib_base: releasing mmap_read_lock");
         kf_mmap_read_unlock(mm);
+    }
 
     kf_mmput(mm);
+    logv("find_lib_base: final base=0x%llx", base);
     return base;
 }
 
@@ -363,6 +388,17 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     kf_mmap_read_unlock = (typeof(kf_mmap_read_unlock))kallsyms_lookup_name("mmap_read_unlock");
     kf_d_path = (typeof(kf_d_path))kallsyms_lookup_name("d_path");
     kf_strstr = (typeof(kf_strstr))kallsyms_lookup_name("strstr");
+
+
+logv("SYM find_task_by_vpid=%p", kf_find_task_by_vpid);
+logv("SYM get_task_mm=%p", kf_get_task_mm);
+logv("SYM mmput=%p", kf_mmput);
+logv("SYM mmap_read_lock=%p", kf_mmap_read_lock);
+logv("SYM mmap_read_unlock=%p", kf_mmap_read_unlock);
+logv("SYM d_path=%p", kf_d_path);
+logv("SYM strstr=%p", kf_strstr);
+logv("SYM memset=%p", kf_memset);
+
 
     uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
@@ -688,4 +724,3 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 KPM_INIT(hello_demo_init);
 KPM_CTL0(hello_demo_control0);
 KPM_EXIT(hello_demo_exit);
-
