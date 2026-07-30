@@ -9,20 +9,20 @@
 #define ENABLE_DEBUG_LOG 1
 
 #if ENABLE_DEBUG_LOG
-    #define TAG "[@fkr]"
+    #define TAG "[@xmhnb]"
     #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
 #else
     #define logv(fmt, ...) do {} while(0) 
 #endif
 
 
-KPM_NAME("FKR");
+KPM_NAME("@xmhnb");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("FKR FKR FKR FKR");
-KPM_DESCRIPTION("FKR FKR FKR FKR FKR");
+KPM_AUTHOR("小迷糊开源官方群@xmhnb");
+KPM_DESCRIPTION("小迷糊开源HOOK_ioctl内核模块");
 
-
+/* ========== ioctl 命令定义 ========== */
 #define OP_READ_MEM                 8001
 #define OP_GET_CPU_NUM_BRPS         8009
 #define OP_GET_CPU_NUM_WRPS         8010
