@@ -24,6 +24,7 @@ KPM_DESCRIPTION("FCK");
 
 
 #define OP_READ_MEM                 8001
+#define OP_WRITE_MEM                8002
 #define OP_GET_CPU_NUM_BRPS         8009
 #define OP_GET_CPU_NUM_WRPS         8010
 #define OP_SET_HW_BREAKPOINT        8011
