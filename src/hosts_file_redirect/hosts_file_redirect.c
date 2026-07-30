@@ -7,7 +7,6 @@
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/fs.h>
-#include <linux/path.h>
 #include <linux/dcache.h>
 #include <linux/slab.h>
 
