@@ -187,19 +187,13 @@ struct kpm_target_vm_area {
 static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
 {
     void *task = kf_find_task_by_vpid(pid);
-    if (!task) {
-        logv("find_lib: task not found");
-        return 0;
-    }
+    if (!task) return 0;
 
     void *mm = kf_get_task_mm(task);
-    if (!mm) {
-        logv("find_lib: mm NULL");
-        return 0;
-    }
+    if (!mm) return 0;
 
     uint64_t result = 0;
-    uint64_t vma_addr = *(uint64_t *)mm;  // mm->mmap
+    uint64_t vma_addr = *(uint64_t *)mm;
     int count = 0;
 
     logv("find_lib: scanning for '%s'", lib_name);
@@ -207,15 +201,9 @@ static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
     while (vma_addr && vma_addr >= 0xFFFFFF0000000000ULL && count < 500) {
         count++;
 
-        // ** __randomize_layout ke saath, ye offsets guess hain **
-        // vm_start=0x00, vm_end=0x08 always (first 2 members, fixed by compiler)
         uint64_t vm_start = *(uint64_t *)(vma_addr + 0x00);
-        
-        // vm_next - try 0x10 pehle
-        uint64_t vm_next = *(uint64_t *)(vma_addr + 0x10);
+        uint64_t vm_next  = *(uint64_t *)(vma_addr + 0x10);
 
-        // ** BRUTE FORCE: vm_file ke liye multiple offsets try karo **
-        // __randomize_layout ke saath vm_file kahin bhi ho sakta hai
         uint64_t file_offsets[] = {
             0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70,
             0x78, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8
@@ -227,40 +215,48 @@ static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
             
             if (!vm_file || vm_file < 0xFFFFFF0000000000ULL) continue;
             
-            // ** USE kf_d_path - offset independent! **
             if (kf_d_path) {
                 char path_buf[512];
-                memset(path_buf, 0, sizeof(path_buf));
                 
-                // f_path offset bhi randomize_layout hai, try 0x08 and 0x10
+                // USE kf_memset instead of memset
+                if (kf_memset) {
+                    kf_memset(path_buf, 0, sizeof(path_buf));
+                } else {
+                    // Manual zero
+                    for (int z = 0; z < 512; z++) path_buf[z] = 0;
+                }
+                
                 uint64_t fpath_offs[] = {0x08, 0x10, 0x18};
                 
                 for (int j = 0; j < 3 && !found; j++) {
                     char *path = kf_d_path((const void *)(vm_file + fpath_offs[j]), 
-                                           path_buf, sizeof(path_buf));
+                                           path_buf, 512);  // sizeof se avoid karo
                     
-                    // Valid path check
                     if (path && (unsigned long)path > 0x1000 && 
-                        (unsigned long)path < 0xFFFFFFFFFFFF0000ULL && 
-                        strlen(path) > 1) {
+                        (unsigned long)path < 0xFFFFFFFFFFFF0000ULL) {
                         
-                        if (count <= 3) {
-                            logv("find_lib: VMA[%d] start=0x%llx path=%s", 
-                                 count, vm_start, path);
-                        }
+                        // Manual strlen
+                        int path_len = 0;
+                        while (path[path_len] && path_len < 511) path_len++;
                         
-                        if (kf_strstr && kf_strstr(path, lib_name)) {
-                            result = vm_start;
-                            logv("find_lib: FOUND %s at 0x%llx (file_off=0x%llx, fpath_off=0x%llx)", 
-                                 lib_name, result, file_offsets[i], fpath_offs[j]);
-                            found = 1;
+                        if (path_len > 1) {
+                            if (count <= 3) {
+                                logv("find_lib: VMA[%d] start=0x%llx path=%s", 
+                                     count, vm_start, path);
+                            }
+                            
+                            if (kf_strstr && kf_strstr(path, lib_name)) {
+                                result = vm_start;
+                                logv("find_lib: FOUND! base=0x%llx (file_off=0x%llx fpath_off=0x%llx)", 
+                                     result, file_offsets[i], fpath_offs[j]);
+                                found = 1;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // vm_next validation
         if (!vm_next || vm_next == vma_addr || 
             vm_next < 0xFFFFFF0000000000ULL || vm_next > 0xFFFFFFFFFFFF0000ULL) {
             break;
