@@ -278,8 +278,7 @@ static uint64_t find_module_base(uint32_t pid, const char *libname)
 
 static void hw_breakpoint_handler(void *event, void *data)
 {
-    logv("hw_breakpoint: Breakpoint hit
-");
+    logv("hw_breakpoint: Breakpoint hit");
 }
 
 static void before_ioctl(hook_fargs4_t *args, void *udata);
