@@ -4,7 +4,6 @@
 #include <common.h>
 #include <syscall.h>
 
-
 #define ENABLE_DEBUG_LOG 1
 
 #if ENABLE_DEBUG_LOG
@@ -14,13 +13,11 @@
     #define logv(fmt, ...) do {} while(0)
 #endif
 
-
 KPM_NAME("FCK");
-KPM_VERSION("1.0.1");
+KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FKC");
 KPM_DESCRIPTION("FCK");
-
 
 #define OP_READ_MEM                 8001
 #define OP_WRITE_MEM                8002
@@ -29,8 +26,7 @@ KPM_DESCRIPTION("FCK");
 #define OP_SET_HW_BREAKPOINT        8011
 #define OP_REMOVE_HW_BREAKPOINT     8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT 8014
-#define OP_GET_LIB_BASE             8015
-
+#define OP_FIND_LIB_BASE            8015
 
 typedef struct {
     uint32_t pid;
@@ -52,10 +48,9 @@ typedef struct {
 typedef struct {
     uint32_t pid;
     uint32_t _pad0;
-    uint64_t lib_name;   // userspace ptr -> char[]
-    uint64_t result;     // userspace ptr -> uint64_t
-} get_lib_base_t;
-
+    uint64_t lib_name_ptr;
+    uint64_t out_base_addr;
+} find_lib_cmd_t;
 
 struct bp_node {
     struct bp_node *next;
@@ -66,11 +61,9 @@ struct bp_node {
     uint64_t addr;
 };
 
-
 static uint64_t my_page_shift = 12;
 static uint64_t my_va_bits = 48;
 static uint64_t my_pa_bits = 48;
-
 
 static struct bp_node bp_list = {
     .next = &bp_list,
@@ -78,11 +71,9 @@ static struct bp_node bp_list = {
 };
 static uint32_t bp_lock = 0;
 
-
 static uint64_t kv_memstart_addr = 0;
 static uint64_t kv_kimage_voffset = 0;
 static uint64_t pgd_offset = 0;
-
 
 static uint64_t (*kf___arch_copy_from_user)(void *to, const void __user *from, uint64_t n) = 0;
 static uint64_t (*kf___arch_copy_to_user)(void __user *to, const void *from, uint64_t n) = 0;
@@ -105,17 +96,7 @@ static void (*kf_kfree)(void *ptr) = 0;
 static void (*kf__raw_spin_lock)(void *lock) = 0;
 static void (*kf__raw_spin_unlock)(void *lock) = 0;
 
-/* new */
-static void (*kf_mmap_read_lock)(void *mm) = 0;
-static void (*kf_mmap_read_unlock)(void *mm) = 0;
-static char *(*kf_d_path)(const void *path, char *buf, int buflen) = 0;
-static char *(*kf_strstr)(const char *s1, const char *s2) = 0;
-
-
-
-
 static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
-
 
 #define LIST_POISON1  0xDEAD000000000100ULL
 #define LIST_POISON2  0xDEAD000000000122ULL
@@ -139,172 +120,193 @@ static inline void bp_list_del(struct bp_node *entry)
     entry->prev = (struct bp_node *)LIST_POISON2;
 }
 
+#define FLB_OFF_UNKNOWN 0xFFFFFFFFU
+#define FLB_KVA_MIN     0xFFFF000000000000ULL
+#define FLB_SCAN_MAX    640U
 
-/*
- * no extra kernel headers, so opaque layout.
- * this is 5.10-ish/vendor-style best effort only.
- */
+typedef struct {
+    uint32_t mm_mmap;
+    uint32_t vma_vm_start;
+    uint32_t vma_vm_end;
+    uint32_t vma_vm_next;
+    uint32_t vma_vm_file;
+    uint32_t file_f_path;
+    uint32_t path_dentry;
+    uint32_t dentry_d_name;
+    uint32_t qstr_name;
+    int      ready;
+} flb_ctx_t;
 
+static flb_ctx_t g_flb;
 
-
-
-
-static int kstr_contains(const char *a, const char *b)
+static inline int flb_is_kptr(uint64_t v)
 {
-    if (!a || !b || !*b)
-        return 0;
-    if (!kf_strstr)
-        return 0;
-    return kf_strstr(a, b) ? 1 : 0;
+    return v > FLB_KVA_MIN && v != 0xFFFFFFFFFFFFFFFFULL;
 }
 
-struct kpm_target_file {
-    uint64_t pad0;
-    uint64_t pad1;
-    uint64_t f_path_mnt;
-    uint64_t f_path_dentry;
-};
-
-struct kpm_target_vm_area {
-    uint64_t vm_start;
-    uint64_t vm_end;
-    uint64_t vm_next;
-    uint64_t vm_prev;
-    uint64_t vm_rb0;
-    uint64_t vm_rb1;
-    uint64_t vm_rb2;
-    uint64_t rb_subtree_gap;
-    uint64_t vm_mm;
-    uint64_t vm_page_prot;
-    uint64_t vm_flags;
-    uint64_t anon_vma_chain_next;
-    uint64_t anon_vma_chain_prev;
-    uint64_t anon_vma;
-    uint64_t vm_ops;
-    uint64_t vm_pgoff;
-    uint64_t vm_file;
-};
-
-
-
-#define OFF_MM_MMAP   0x00
-#define OFF_VM_START  0x00
-#define OFF_VM_END    0x08
-#define OFF_VM_NEXT   0x10
-#define OFF_VM_FILE   0x98
-#define OFF_F_PATH    0x08
-
-
-static int local_str_contains(const char *haystack, const char *needle)
+static inline uint64_t flb_rd(uint64_t base, uint32_t off)
 {
-    const char *h, *n, *s;
-    if (!haystack || !needle || !*needle)
-        return 0;
-    for (s = haystack; *s; s++) {
-        h = s;
-        n = needle;
-        while (*h && *n && *h == *n) {
-            h++;
-            n++;
-        }
-        if (!*n)
+    if (!base || off == FLB_OFF_UNKNOWN) return 0;
+    return *(volatile uint64_t *)(base + off);
+}
+
+static inline const char *flb_basename(const char *p)
+{
+    const char *r = p;
+    for (; *p; p++) if (*p == '/') r = p + 1;
+    return r;
+}
+
+static inline int flb_streq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == '\0' && *b == '\0';
+}
+
+static int flb_probe_file_offsets(flb_ctx_t *c, uint64_t fptr)
+{
+    for (uint32_t fp = 0; fp + 8 <= FLB_SCAN_MAX; fp += 8) {
+        uint64_t mnt = *(volatile uint64_t *)(fptr + fp);
+        if (!flb_is_kptr(mnt)) continue;
+        uint64_t dentry = *(volatile uint64_t *)(fptr + fp + 8);
+        if (!flb_is_kptr(dentry)) continue;
+
+        for (uint32_t dp = 0; dp + 8 <= FLB_SCAN_MAX; dp += 8) {
+            uint64_t nameval = *(volatile uint64_t *)(dentry + dp);
+            if (!flb_is_kptr(nameval)) continue;
+            const char *name = (const char *)nameval;
+            int ok = 0;
+            for (int i = 0; i < 256; i++) {
+                char ch = name[i];
+                if (ch == '\0') { ok = (i > 0); break; }
+                if ((unsigned char)ch > 127) break;
+            }
+            if (!ok) continue;
+            c->file_f_path   = fp;
+            c->path_dentry   = fp + 8;
+            c->dentry_d_name = dp;
+            c->qstr_name     = dp;
             return 1;
+        }
     }
     return 0;
 }
 
-static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
+static int flb_init(flb_ctx_t *c)
 {
-    void *task, *mm;
-    uint64_t vma, base = 0;
-    int n = 0;
+    if (c->ready) return 1;
 
-    if (!pid || !lib_name || !*lib_name) {
-        logv("find_lib_base: bad input pid=%u lib=%p", pid, lib_name);
-        return 0;
-    }
+    void *task = kf_find_task_by_vpid(1);
+    if (!task) return 0;
+    void *mm = kf_get_task_mm(task);
+    if (!mm) return 0;
 
-    if (!kf_find_task_by_vpid) { logv("MISS kf_find_task_by_vpid"); return 0; }
-    if (!kf_get_task_mm)       { logv("MISS kf_get_task_mm"); return 0; }
-    if (!kf_mmput)             { logv("MISS kf_mmput"); return 0; }
-    if (!kf_d_path)            { logv("MISS kf_d_path"); return 0; }
-    if (!kf_memset)            { logv("MISS kf_memset"); return 0; }
+    uint64_t mm64 = (uint64_t)mm;
 
-    task = kf_find_task_by_vpid(pid);
-    logv("find_lib_base: task=%p", task);
-    if (!task)
-        return 0;
+    c->mm_mmap      = FLB_OFF_UNKNOWN;
+    c->vma_vm_start = FLB_OFF_UNKNOWN;
+    c->vma_vm_end   = FLB_OFF_UNKNOWN;
+    c->vma_vm_next  = FLB_OFF_UNKNOWN;
+    c->vma_vm_file  = FLB_OFF_UNKNOWN;
 
-    mm = kf_get_task_mm(task);
-    logv("find_lib_base: mm=%p", mm);
-    if (!mm)
-        return 0;
+    for (uint32_t mo = 0; mo + 8 <= FLB_SCAN_MAX; mo += 8) {
+        if (mo == pgd_offset) continue;
+        uint64_t vma0 = *(volatile uint64_t *)(mm64 + mo);
+        if (!flb_is_kptr(vma0)) continue;
 
-    if (kf_mmap_read_lock) {
-        logv("find_lib_base: taking mmap_read_lock");
-        kf_mmap_read_lock(mm);
-    } else {
-        logv("find_lib_base: mmap_read_lock unavailable");
-    }
+        for (uint32_t so = 0; so + 16 <= FLB_SCAN_MAX; so += 8) {
+            uint64_t vs = *(volatile uint64_t *)(vma0 + so);
+            uint64_t ve = *(volatile uint64_t *)(vma0 + so + 8);
+            if (vs == 0 || ve <= vs) continue;
+            if (vs & 0xFFF) continue;
+            if ((ve - vs) > 0x100000000ULL) continue;
 
-    vma = *(uint64_t *)((uint8_t *)mm + OFF_MM_MMAP);
-    logv("find_lib_base: pid=%u lib=%s first_vma=%p", pid, lib_name, (void *)vma);
-
-    while (vma && n++ < 256) {
-        uint64_t vm_start = *(uint64_t *)(vma + OFF_VM_START);
-        uint64_t vm_end   = *(uint64_t *)(vma + OFF_VM_END);
-        uint64_t vm_next  = *(uint64_t *)(vma + OFF_VM_NEXT);
-        uint64_t vm_file  = *(uint64_t *)(vma + OFF_VM_FILE);
-
-        logv("VMA[%d] vma=%p start=%016llx end=%016llx next=%p file=%p",
-             n, (void *)vma, vm_start, vm_end, (void *)vm_next, (void *)vm_file);
-
-        if (vm_file) {
-            char buf[512];
-            char *path;
-
-            kf_memset(buf, 0, sizeof(buf));
-            logv("VMA[%d] trying d_path(file+0x%X) file=%p",
-                 n, OFF_F_PATH, (void *)vm_file);
-
-            path = kf_d_path((void *)(vm_file + OFF_F_PATH), buf, sizeof(buf));
-            logv("VMA[%d] d_path ret=%p", n, path);
-
-            if ((uint64_t)path >= 0xFFFFFFFFFFFFF000ULL) {
-                logv("VMA[%d] d_path ERR file=%p ret=%p",
-                     n, (void *)vm_file, path);
-            } else {
-                logv("VMA[%d] PATH=%s", n, path);
-
-                if (!base && local_str_contains(path, lib_name)) {
-                    base = vm_start;
-                    logv("MATCH: lib=%s base=0x%llx path=%s", lib_name, base, path);
-                    break;
+            for (uint32_t no = so + 16; no + 8 <= FLB_SCAN_MAX; no += 8) {
+                uint64_t vnext = *(volatile uint64_t *)(vma0 + no);
+                if (!flb_is_kptr(vnext) && vnext != 0) continue;
+                if (vnext && flb_is_kptr(vnext)) {
+                    uint64_t vs2 = *(volatile uint64_t *)(vnext + so);
+                    uint64_t ve2 = *(volatile uint64_t *)(vnext + so + 8);
+                    if (vs2 == 0 || ve2 <= vs2 || (vs2 & 0xFFF)) continue;
                 }
+
+                c->mm_mmap      = mo;
+                c->vma_vm_start = so;
+                c->vma_vm_end   = so + 8;
+                c->vma_vm_next  = no;
+                goto found_vma;
             }
-        } else {
-            logv("VMA[%d] vm_file is NULL", n);
         }
-
-        if (!vm_next || vm_next == vma) {
-            logv("VMA[%d] stopping: vm_next=%p", n, (void *)vm_next);
-            break;
-        }
-
-        vma = vm_next;
-    }
-
-    if (kf_mmap_read_unlock) {
-        logv("find_lib_base: releasing mmap_read_lock");
-        kf_mmap_read_unlock(mm);
     }
 
     kf_mmput(mm);
-    logv("find_lib_base: final base=0x%llx", base);
-    return base;
+    return 0;
+
+found_vma:;
+    uint64_t vma_cur = *(volatile uint64_t *)(mm64 + c->mm_mmap);
+    int file_offsets_found = 0;
+
+    while (flb_is_kptr(vma_cur) && !file_offsets_found) {
+        for (uint32_t fo = 0; fo + 8 <= FLB_SCAN_MAX; fo += 8) {
+            if (fo == c->vma_vm_start || fo == c->vma_vm_end || fo == c->vma_vm_next) continue;
+            uint64_t fptr = *(volatile uint64_t *)(vma_cur + fo);
+            if (!flb_is_kptr(fptr)) continue;
+            if (flb_probe_file_offsets(c, fptr)) {
+                c->vma_vm_file = fo;
+                file_offsets_found = 1;
+                break;
+            }
+        }
+        vma_cur = *(volatile uint64_t *)(vma_cur + c->vma_vm_next);
+    }
+
+    kf_mmput(mm);
+
+    if (!file_offsets_found) return 0;
+
+    c->ready = 1;
+    return 1;
 }
 
+static uint64_t flb_get_vma_name(flb_ctx_t *c, uint64_t vma)
+{
+    uint64_t fptr = flb_rd(vma, c->vma_vm_file);
+    if (!flb_is_kptr(fptr)) return 0;
+    uint64_t dptr = flb_rd(fptr, c->path_dentry);
+    if (!flb_is_kptr(dptr)) return 0;
+    return flb_rd(dptr, c->qstr_name);
+}
 
+static uint64_t find_lib_base(uint32_t pid, const char *libname)
+{
+    if (!libname || !*libname) return 0;
+    if (!flb_init(&g_flb)) return 0;
+
+    void *task = kf_find_task_by_vpid(pid);
+    if (!task) return 0;
+    void *mm = kf_get_task_mm(task);
+    if (!mm) return 0;
+
+    uint64_t mm64   = (uint64_t)mm;
+    uint64_t result = 0;
+    uint64_t vma    = flb_rd(mm64, g_flb.mm_mmap);
+
+    while (flb_is_kptr(vma)) {
+        uint64_t nameptr = flb_get_vma_name(&g_flb, vma);
+        if (nameptr) {
+            const char *fullpath = (const char *)nameptr;
+            const char *base     = flb_basename(fullpath);
+            if (flb_streq(base, libname)) {
+                result = flb_rd(vma, g_flb.vma_vm_start);
+                break;
+            }
+        }
+        vma = flb_rd(vma, g_flb.vma_vm_next);
+    }
+
+    kf_mmput(mm);
+    return result;
+}
 
 uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
 {
@@ -349,14 +351,12 @@ uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
     }
 }
 
-
 static void hw_breakpoint_handler(void *event, void *data)
 {
-    logv("hw_breakpoint: Breakpoint hit");
+    logv("hw_breakpoint: Breakpoint hit\n");
 }
 
 static void before_ioctl(hook_fargs4_t *args, void *udata);
-
 
 static long hello_demo_init(const char *args, const char *event, void *__user reserved)
 {
@@ -382,23 +382,6 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     kf_kfree = (typeof(kf_kfree))kallsyms_lookup_name("kfree");
     kf__raw_spin_lock = (typeof(kf__raw_spin_lock))kallsyms_lookup_name("_raw_spin_lock");
     kf__raw_spin_unlock = (typeof(kf__raw_spin_unlock))kallsyms_lookup_name("_raw_spin_unlock");
-
-    /* new */
-    kf_mmap_read_lock = (typeof(kf_mmap_read_lock))kallsyms_lookup_name("mmap_read_lock");
-    kf_mmap_read_unlock = (typeof(kf_mmap_read_unlock))kallsyms_lookup_name("mmap_read_unlock");
-    kf_d_path = (typeof(kf_d_path))kallsyms_lookup_name("d_path");
-    kf_strstr = (typeof(kf_strstr))kallsyms_lookup_name("strstr");
-
-
-logv("SYM find_task_by_vpid=%p", kf_find_task_by_vpid);
-logv("SYM get_task_mm=%p", kf_get_task_mm);
-logv("SYM mmput=%p", kf_mmput);
-logv("SYM mmap_read_lock=%p", kf_mmap_read_lock);
-logv("SYM mmap_read_unlock=%p", kf_mmap_read_unlock);
-logv("SYM d_path=%p", kf_d_path);
-logv("SYM strstr=%p", kf_strstr);
-logv("SYM memset=%p", kf_memset);
-
 
     uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
@@ -442,20 +425,20 @@ logv("SYM memset=%p", kf_memset);
             if (kf_put_pid)
                 kf_put_pid(pid);
         } else {
-            logv("kfunc: %s not found", "get_task_pid");
+            logv("kfunc: %s not found\n", "get_task_pid");
         }
     }
+
+    flb_init(&g_flb);
 
     return (long)fp_hook_syscalln(29, 3, before_ioctl, NULL, NULL);
 }
 
-
 static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int outlen)
 {
-    logv("welcome to use my kpm");
+    logv("welcome to use my kpm\n");
     return 0;
 }
-
 
 static long hello_demo_exit(void *__user reserved)
 {
@@ -473,10 +456,9 @@ static long hello_demo_exit(void *__user reserved)
     }
     kf__raw_spin_unlock(&bp_lock);
 
-    logv("hello_demo_exit");
+    logv("hello_demo_exit\n");
     return 0;
 }
-
 
 static void before_ioctl(hook_fargs4_t *args, void *udata)
 {
@@ -484,7 +466,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     int64_t cmd = (int64_t)regs[1];
     uint64_t user_data = regs[2];
 
-    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_GET_LIB_BASE - OP_READ_MEM))
+    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_FIND_LIB_BASE - OP_READ_MEM))
         return;
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
@@ -691,32 +673,20 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         return;
     }
 
-    if (cmd == OP_GET_LIB_BASE) {
-        get_lib_base_t gcmd;
-        char lib_name[256];
-        uint64_t base = 0;
-
-        if (kf___arch_copy_from_user(&gcmd, (void __user *)user_data, sizeof(gcmd)))
+    if (cmd == OP_FIND_LIB_BASE) {
+        find_lib_cmd_t lcmd;
+        if (kf___arch_copy_from_user(&lcmd, (void __user *)user_data, sizeof(lcmd)))
             return;
 
-        if (!gcmd.lib_name || !gcmd.result)
+        char libname[256];
+        if (kf_memset) kf_memset(libname, 0, sizeof(libname));
+        if (kf___arch_copy_from_user(libname, (void __user *)lcmd.lib_name_ptr, sizeof(libname) - 1))
             return;
 
-        if (kf_memset)
-            kf_memset(lib_name, 0, sizeof(lib_name));
+        uint64_t base = find_lib_base(lcmd.pid, libname);
 
-        if (kf___arch_copy_from_user(lib_name, (void __user *)gcmd.lib_name, sizeof(lib_name) - 1))
-            return;
-
-        lib_name[sizeof(lib_name) - 1] = '\0';
-
-        if (!lib_name[0])
-            return;
-
-        base = find_lib_base(gcmd.pid, lib_name);
-        logv("get_lib_base: pid=%u lib=%s base=0x%llx", gcmd.pid, lib_name, base);
-
-        kf___arch_copy_to_user((void __user *)gcmd.result, &base, sizeof(base));
+        kf___arch_copy_to_user((void __user *)(user_data + __builtin_offsetof(find_lib_cmd_t, out_base_addr)),
+                               &base, sizeof(base));
         return;
     }
 }
