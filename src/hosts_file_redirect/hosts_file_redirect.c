@@ -9,22 +9,21 @@
 #define ENABLE_DEBUG_LOG 1
 
 #if ENABLE_DEBUG_LOG
-    #define TAG "[FCK]"
+    #define TAG "[@fkr]"
     #define logv(fmt, ...) pr_info(TAG fmt, ##__VA_ARGS__)
 #else
     #define logv(fmt, ...) do {} while(0) 
 #endif
 
 
-KPM_NAME("FCK");
+KPM_NAME("FKR");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("FKC");
-KPM_DESCRIPTION("FCK");
+KPM_AUTHOR("FKR FKR FKR FKR");
+KPM_DESCRIPTION("FKR FKR FKR FKR FKR");
 
 
 #define OP_READ_MEM                 8001
-#define OP_WRITE_MEM                8002
 #define OP_GET_CPU_NUM_BRPS         8009
 #define OP_GET_CPU_NUM_WRPS         8010
 #define OP_SET_HW_BREAKPOINT        8011
@@ -289,7 +288,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_REMOVE_ALL_HW_BREAKPOINT - OP_READ_MEM))
         return;
 
-    if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
+    if (cmd == OP_READ_MEM) {
         copy_memory_t rcmd;
         if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
             return;
@@ -369,12 +368,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
                                  - *(uint64_t *)kv_memstart_addr
                                  + (-1ULL << my_va_bits)
                                  + (phys_addr & ~(-1ULL << my_page_shift));
-                    if (cmd == OP_READ_MEM) {
-    kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
-} else {
-    for (uint64_t i = 0; i < chunk; i++)
-        *(volatile uint8_t *)(kva + i) = ((uint8_t *)outbuf)[i];
-}
+                    kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
                 }
             }
 
