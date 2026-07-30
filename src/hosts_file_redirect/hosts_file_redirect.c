@@ -1,4 +1,3 @@
-
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
@@ -30,6 +29,7 @@ KPM_DESCRIPTION("FCK");
 #define OP_SET_HW_BREAKPOINT        8011
 #define OP_REMOVE_HW_BREAKPOINT     8013
 #define OP_REMOVE_ALL_HW_BREAKPOINT 8014
+#define OP_GET_LIB_BASE             8015   // NEW
 
 
 typedef struct {
@@ -48,6 +48,14 @@ typedef struct {
     int32_t  _pad1;
     uint64_t len;
 } hw_breakpoint_cmd_t;
+
+// NEW
+typedef struct {
+    uint32_t pid;
+    uint32_t _pad0;
+    uint64_t lib_name;   // userspace ptr to lib name string
+    uint64_t result;     // userspace ptr to write base addr into
+} get_lib_base_t;
 
 
 struct bp_node {
@@ -97,6 +105,7 @@ static void *(*kf_kmalloc)(uint64_t size, uint32_t flags) = 0;
 static void (*kf_kfree)(void *ptr) = 0;
 static void (*kf__raw_spin_lock)(void *lock) = 0;
 static void (*kf__raw_spin_unlock)(void *lock) = 0;
+static char *(*kf_strstr)(const char *s1, const char *s2) = 0;   // NEW
 
 
 static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
@@ -177,6 +186,54 @@ static void hw_breakpoint_handler(void *event, void *data)
 static void before_ioctl(hook_fargs4_t *args, void *udata);
 
 
+// NEW — find lib base by name substring match using only existing deps
+static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
+{
+    void *task = kf_find_task_by_vpid(pid);
+    if (!task) return 0;
+
+    void *mm = kf_get_task_mm(task);
+    if (!mm) return 0;
+
+    uint64_t result = 0;
+
+    // mm->mmap (first VMA) is at offset 0x00 in mm_struct for kernels < 6.1
+    // For 6.1+ maple tree kernels mm->mmap may be absent; this covers common 5.x/6.0.x arm64
+    uint64_t vma_ptr = *(uint64_t *)((uint64_t)mm + 0x00);
+
+    while (vma_ptr && vma_ptr < 0xFFFFFFFF00000000ULL) {
+        uint64_t vm_start = *(uint64_t *)(vma_ptr + 0x00);
+        uint64_t vm_next  = *(uint64_t *)(vma_ptr + 0x10);   // vm_area_struct.vm_next
+        uint64_t vm_file  = *(uint64_t *)(vma_ptr + 0x40);   // vm_area_struct.vm_file (5.x)
+        // guard: on some 6.x kernels vm_file is at +0x48; try both
+        if (!vm_file)
+            vm_file = *(uint64_t *)(vma_ptr + 0x48);
+
+        if (vm_file && vm_file < 0xFFFFFFFF00000000ULL) {
+            // struct file: f_path at +0x10, f_path.dentry at f_path+0x08 => file+0x18
+            uint64_t dentry   = *(uint64_t *)(vm_file + 0x18);
+            if (dentry && dentry < 0xFFFFFFFF00000000ULL) {
+                // dentry: d_name (qstr) at +0x20, qstr.name (char*) at qstr+0x08 => dentry+0x28
+                uint64_t name_ptr = *(uint64_t *)(dentry + 0x28);
+                if (name_ptr && name_ptr < 0xFFFFFFFF00000000ULL) {
+                    // name_ptr is kernel VA — direct deref is safe
+                    if (kf_strstr((const char *)name_ptr, lib_name)) {
+                        // only report first (lowest) mapping = base
+                        result = vm_start;
+                        break;
+                    }
+                }
+            }
+        }
+
+        vma_ptr = vm_next;
+    }
+
+    if (kf_mmput) kf_mmput(mm);
+    return result;
+}
+
+
 static long hello_demo_init(const char *args, const char *event, void *__user reserved)
 {
     kv_memstart_addr = (uint64_t)kallsyms_lookup_name("memstart_addr");
@@ -201,6 +258,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
     kf_kfree = (typeof(kf_kfree))kallsyms_lookup_name("kfree");
     kf__raw_spin_lock = (typeof(kf__raw_spin_lock))kallsyms_lookup_name("_raw_spin_lock");
     kf__raw_spin_unlock = (typeof(kf__raw_spin_unlock))kallsyms_lookup_name("_raw_spin_unlock");
+    kf_strstr = (typeof(kf_strstr))kallsyms_lookup_name("strstr");   // NEW
 
     uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
@@ -286,7 +344,8 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     int64_t cmd = (int64_t)regs[1];
     uint64_t user_data = regs[2];
 
-    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_REMOVE_ALL_HW_BREAKPOINT - OP_READ_MEM))
+    // NEW: extend range check to include OP_GET_LIB_BASE
+    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_GET_LIB_BASE - OP_READ_MEM))
         return;
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
@@ -491,6 +550,28 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             pos = n;
         }
         kf__raw_spin_unlock(&bp_lock);
+        return;
+    }
+
+    // NEW
+    if (cmd == OP_GET_LIB_BASE) {
+        get_lib_base_t gcmd;
+        if (kf___arch_copy_from_user(&gcmd, (void __user *)user_data, sizeof(gcmd)))
+            return;
+
+        // copy lib name from userspace into kernel buffer
+        char lib_name[256];
+        if (kf_memset) kf_memset(lib_name, 0, sizeof(lib_name));
+        if (kf___arch_copy_from_user(lib_name, (void __user *)gcmd.lib_name, sizeof(lib_name) - 1))
+            return;
+        lib_name[255] = '\0';
+
+        if (!kf_strstr) return;
+
+        uint64_t base = find_lib_base(gcmd.pid, lib_name);
+        logv("get_lib_base: pid=%u lib=%s base=0x%llx\n", gcmd.pid, lib_name, base);
+
+        kf___arch_copy_to_user((void __user *)gcmd.result, &base, sizeof(base));
         return;
     }
 }
