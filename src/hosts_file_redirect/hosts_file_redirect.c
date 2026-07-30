@@ -192,7 +192,6 @@ struct kpm_target_vm_area {
 #define OFF_VM_FILE   0x98
 #define OFF_F_PATH    0x08
 
-static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
 
 static int local_str_contains(const char *haystack, const char *needle)
 {
