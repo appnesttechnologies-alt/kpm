@@ -386,7 +386,6 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
 
 
-// before_ioctl() mein, OP_READ_MEM ke block ke baad ye daalo:
 if (cmd == OP_WRITE_MEM) {
     copy_memory_t wcmd;
     if (kf___arch_copy_from_user(&wcmd, (void __user *)user_data, sizeof(wcmd)))
@@ -408,7 +407,6 @@ if (cmd == OP_WRITE_MEM) {
         void *mm = kf_get_task_mm(task);
         if (!mm) goto next_write;
 
-        // Same page walk as read...
         uint64_t ps = my_page_shift;
         uint64_t vb = my_va_bits;
         uint64_t es = ps - 3;
@@ -441,7 +439,9 @@ if (cmd == OP_WRITE_MEM) {
                         continue;
                     }
                     found = 1; break;
-                } else break;
+                } else {
+                    break;
+                }
             }
 
             if (found) {
@@ -450,14 +450,13 @@ if (cmd == OP_WRITE_MEM) {
                 uint64_t entry = *(uint64_t *)(tbl + idx * 8);
                 if ((~(uint16_t)entry & 0x401) == 0) {
                     uint64_t pa_frame = 0;
-                    if (my_pa_bits == 52) pa_frame = (entry << 36) & 0xF000000000000ULL;
+                    if (my_pa_bits == 52)
+                        pa_frame = (entry << 36) & 0xF000000000000ULL;
                     phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
                     phys_addr |= vaddr & ~(-1ULL << ps);
                 }
             }
         }
-
-        if (kf_mmput) kf_mmput(mm);
 
         if (phys_addr && kf_pfn_valid(phys_addr >> my_page_shift) &&
             kf_valid_phys_addr_range(phys_addr, chunk)) {
@@ -466,12 +465,13 @@ if (cmd == OP_WRITE_MEM) {
                          + (-1ULL << my_va_bits)
                          + (phys_addr & ~(-1ULL << my_page_shift));
             
-            // 🔥 WRITE: Copy from userspace to target memory
             uint8_t tmp[128];
             kf___arch_copy_from_user(tmp, (void __user *)inbuf, chunk);
             for (uint64_t i = 0; i < chunk; i++)
                 *(volatile uint8_t *)(kva + i) = tmp[i];
         }
+
+        if (kf_mmput) kf_mmput(mm);
 
     next_write:
         remaining -= chunk;
