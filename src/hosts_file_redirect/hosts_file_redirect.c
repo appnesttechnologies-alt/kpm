@@ -170,8 +170,7 @@ uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
 
 static void hw_breakpoint_handler(void *event, void *data)
 {
-    logv("hw_breakpoint: Breakpoint hit
-");
+    logv("hw_breakpoint: Breakpoint hit");
 }
 
 static void before_ioctl(hook_fargs4_t *args, void *udata);
@@ -332,8 +331,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
             if (kf_put_pid)
                 kf_put_pid(pid);
         } else {
-            logv("kfunc: %s not found
-", "get_task_pid");
+            logv("kfunc: %s not found", "get_task_pid");
         }
     }
 
@@ -342,8 +340,7 @@ static long hello_demo_init(const char *args, const char *event, void *__user re
 
 static long hello_demo_control0(const char *ctl_args, char *__user out_msg, int outlen)
 {
-    logv("welcome to use my kpm
-");
+    logv("welcome to use my kpm");
     return 0;
 }
 
@@ -363,8 +360,7 @@ static long hello_demo_exit(void *__user reserved)
     }
     kf__raw_spin_unlock(&bp_lock);
 
-    logv("hello_demo_exit
-");
+    logv("hello_demo_exit");
     return 0;
 }
 
