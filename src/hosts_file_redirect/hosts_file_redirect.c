@@ -639,7 +639,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (kf___arch_copy_from_user(lib_name, (void __user *)gcmd.lib_name, sizeof(lib_name) - 1))
             return;
 
-        lib_name[sizeof(lib_name) - 1] = '';
+        lib_name[sizeof(lib_name) - 1] = '\0';
 
         if (!lib_name[0])
             return;
