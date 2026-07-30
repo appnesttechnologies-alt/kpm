@@ -144,10 +144,6 @@ static inline void bp_list_del(struct bp_node *entry)
  */
 
 
-struct kpm_file {
-    uint8_t pad0[24];
-    struct kpm_path f_path;
-};
 
 
 
