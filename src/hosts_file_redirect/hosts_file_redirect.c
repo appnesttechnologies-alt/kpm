@@ -160,32 +160,31 @@ static int kstr_contains(const char *a, const char *b)
     return kf_strstr(a, b) ? 1 : 0;
 }
 
-// Strictly rebuild target layouts to match your 5.10.252 GKI source structure configurations
 struct kpm_target_file {
-    uint64_t pad[3];               // skip standard structure variables under 24 bytes boundary
-    struct {
-        uint64_t mnt;              // f_path.mnt
-        uint64_t dentry;           // f_path.dentry at offset +0x18
-    } f_path;
+    uint64_t pad0;
+    uint64_t pad1;
+    uint64_t f_path_mnt;
+    uint64_t f_path_dentry;
 };
 
 struct kpm_target_vm_area {
-    uint64_t vm_start;             // Offset 0x00
-    uint64_t vm_end;               // Offset 0x08
-    uint64_t vm_next;              // Offset 0x10 -> struct kpm_target_vm_area*
-    uint64_t vm_prev;              // Offset 0x18
-    uint64_t vm_rb[3];             // Offset 0x20 -> struct rb_node alignment layout (24 bytes)
-    uint64_t rb_subtree_gap;       // Offset 0x38
-    
-    /* Second cache line boundaries */
-    uint64_t vm_mm;                // Offset 0x40
-    uint64_t vm_page_prot;         // Offset 0x48
-    uint64_t vm_flags;             // Offset 0x50
-    uint64_t anon_vma_chain[2];    // Offset 0x58 (struct list_head is 16 bytes)
-    uint64_t anon_vma;             // Offset 0x68
-    uint64_t vm_ops;               // Offset 0x70
-    uint64_t vm_pgoff;             // Offset 0x78
-    uint64_t vm_file;              // Offset 0x80 -> Points to struct kpm_target_file
+    uint64_t vm_start;
+    uint64_t vm_end;
+    uint64_t vm_next;
+    uint64_t vm_prev;
+    uint64_t vm_rb0;
+    uint64_t vm_rb1;
+    uint64_t vm_rb2;
+    uint64_t rb_subtree_gap;
+    uint64_t vm_mm;
+    uint64_t vm_page_prot;
+    uint64_t vm_flags;
+    uint64_t anon_vma_chain_next;
+    uint64_t anon_vma_chain_prev;
+    uint64_t anon_vma;
+    uint64_t vm_ops;
+    uint64_t vm_pgoff;
+    uint64_t vm_file;
 };
 
 static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
@@ -197,52 +196,37 @@ static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
     if (!mm) return 0;
 
     uint64_t result = 0;
-
-    // mm_struct standard verification safely
     uint64_t *mm_ptr = (uint64_t *)mm;
     if (!mm_ptr) {
         if (kf_mmput) kf_mmput(mm);
         return 0;
     }
 
-    // Android 5.10 layout sets head mmap pointer exactly at the first field of mm_struct
-    // We cast it through pointer arithmetic layers safely
     uint64_t vma_addr = *mm_ptr;
     int safety_counter = 0;
 
-    // Boundary check using your explicit kernel memory tracking barrier loop
     while (vma_addr && vma_addr >= 0xFFFFFF0000000000ULL && safety_counter < 3000) {
         safety_counter++;
 
         struct kpm_target_vm_area *vma = (struct kpm_target_vm_area *)vma_addr;
-
-        // Fetch the target internal structure pointer variables safely
         uint64_t file_ptr = vma->vm_file;
         
         if (file_ptr && file_ptr >= 0xFFFFFF0000000000ULL) {
             struct kpm_target_file *vm_file = (struct kpm_target_file *)file_ptr;
-            
-            // Reaching f_path.dentry safely based on kernel 5.10 specifications
-            uint64_t dentry = vm_file->f_path.dentry;
+            uint64_t dentry = vm_file->f_path_dentry;
             
             if (dentry && dentry >= 0xFFFFFF0000000000ULL) {
-                
-                // struct dentry layout: struct qstr d_name is at offset +0x20
-                // inside qstr, string pointer 'name' sits at +0x08 -> Total +0x28 offset tracking
                 uint64_t name_ptr = *(uint64_t *)(dentry + 0x28);
                 
                 if (name_ptr && name_ptr >= 0xFFFFFF0000000000ULL) {
-                    
-                  
                     if (kf_strstr && kf_strstr((const char *)name_ptr, lib_name)) {
-                        result = vma->vm_start; // Core target mapping base captured
+                        result = vma->vm_start;
                         break; 
                     }
                 }
             }
         }
 
-        // Loop execution control configuration block
         uint64_t next_node = vma->vm_next;
         if (!next_node || next_node == vma_addr || next_node < 0xFFFFFF0000000000ULL) {
             break;
@@ -253,6 +237,10 @@ static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
     if (kf_mmput) kf_mmput(mm);
     return result;
 }
+
+
+
+
 
 
 
