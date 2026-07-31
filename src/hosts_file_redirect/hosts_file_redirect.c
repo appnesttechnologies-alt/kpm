@@ -3,10 +3,6 @@
 #include <linux/printk.h>
 #include <common.h>
 #include <syscall.h>
-#include <linux/mm_types.h>
-#include <linux/fs.h>
-#include <linux/dcache.h>
-
 
 #define ENABLE_DEBUG_LOG 1
 
@@ -66,63 +62,52 @@ struct bp_node {
 };
 
 static uint64_t my_page_shift = 12;
-static uint64_t my_va_bits    = 48;
-static uint64_t my_pa_bits    = 48;
+static uint64_t my_va_bits = 48;
+static uint64_t my_pa_bits = 48;
+
+/* spinlock – safe buffer, alignment guaranteed */
+static char bp_lock[16] __attribute__((aligned(8))) = {0};
 
 static struct bp_node bp_list = {
     .next = &bp_list,
     .prev = &bp_list,
 };
-static uint32_t bp_lock = 0;
 
-static uint64_t kv_memstart_addr  = 0;
+static uint64_t kv_memstart_addr = 0;
 static uint64_t kv_kimage_voffset = 0;
-static uint64_t pgd_offset        = 0;
+static uint64_t pgd_offset = 0;
 
-static uint64_t (*kf___arch_copy_from_user)(void *to, const void __user *from, uint64_t n) = 0;
-static uint64_t (*kf___arch_copy_to_user)(void __user *to, const void *from, uint64_t n)   = 0;
-static void *(*kf_get_task_pid)(void *task, int type)                                       = 0;
-static void (*kf_put_pid)(void *pid)                                                        = 0;
-static void *(*kf_find_task_by_vpid)(uint32_t pid)                                         = 0;
-static volatile uint64_t kf_attach_pid                                                      = 0;
-static void *(*kf_get_task_mm)(void *task)                                                  = 0;
-static void (*kf_mmput)(void *mm)                                                           = 0;
-static int (*kf_pfn_valid)(uint64_t pfn)                                                    = 0;
-static int (*kf_valid_phys_addr_range)(uint64_t addr, uint64_t size)                        = 0;
-static void *(*kf_register_user_hw_breakpoint)(void *attr, void *handler, void *overflow, void *task) = 0;
-static volatile uint64_t kf_modify_user_hw_breakpoint                                       = 0;
-static void (*kf_unregister_hw_breakpoint)(void *event)                                     = 0;
-static void (*kf_perf_event_enable)(void *event)                                            = 0;
-static void *(*kf_memset)(void *s, int c, uint64_t n)                                       = 0;
-static void *(*kf___kmalloc)(uint64_t size, uint32_t flags)                                 = 0;
-static void *(*kf_kmalloc)(uint64_t size, uint32_t flags)                                   = 0;
-static void (*kf_kfree)(void *ptr)                                                          = 0;
-static void (*kf__raw_spin_lock)(void *lock)                                                = 0;
-static void (*kf__raw_spin_unlock)(void *lock)                                              = 0;
-static void (*kf_down_read)(struct rw_semaphore *sem)                                       = 0;
-static void (*kf_up_read)(struct rw_semaphore *sem)                                         = 0;
-static char *(*kf_dentry_path_raw)(struct dentry *dentry, char *buf, int buflen)            = 0;
-static char *(*kf_strstr)(const char *haystack, const char *needle)                         = 0;
-static uint64_t (*kf_strlen)(const char *s)                                                 = 0;
-static char *(*kf_strrchr)(const char *s, int c)                                            = 0;
-static void *(*kf_memcpy)(void *dst, const void *src, uint64_t n)                          = 0;
-static void *(*kf_get_mm_exe_file)(struct mm_struct *mm)                                    = 0;
-static void *(*kf_get_task_exe_file)(void *task)                                            = 0;
-static void (*kf_fput)(struct file *file)                                                   = 0;
+/* ---------- Dynamically resolved function pointers ---------- */
+static uint64_t (*kf___arch_copy_from_user)(void *to, const void __user *from, uint64_t n) = NULL;
+static uint64_t (*kf___arch_copy_to_user)(void __user *to, const void *from, uint64_t n) = NULL;
+static void *(*kf_get_task_pid)(void *task, int type) = NULL;
+static void (*kf_put_pid)(void *pid) = NULL;
+static void *(*kf_find_task_by_vpid)(uint32_t pid) = NULL;
+static void *(*kf_get_task_mm)(void *task) = NULL;
+static void (*kf_mmput)(void *mm) = NULL;
+static int (*kf_pfn_valid)(uint64_t pfn) = NULL;
+static int (*kf_valid_phys_addr_range)(uint64_t addr, uint64_t size) = NULL;
+static void *(*kf_register_user_hw_breakpoint)(void *attr, void *handler, void *overflow, void *task) = NULL;
+static void (*kf_unregister_hw_breakpoint)(void *event) = NULL;
+static void (*kf_perf_event_enable)(void *event) = NULL;
+static void *(*kf_memset)(void *s, int c, uint64_t n) = NULL;
+static void *(*kf___kmalloc)(uint64_t size, uint32_t flags) = NULL;
+static void *(*kf_kmalloc)(uint64_t size, uint32_t flags) = NULL;
+static void (*kf_kfree)(void *ptr) = NULL;
+static void (*kf__raw_spin_lock)(void *lock) = NULL;
+static void (*kf__raw_spin_unlock)(void *lock) = NULL;
 
 static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
 
 #define LIST_POISON1  0xDEAD000000000100ULL
 #define LIST_POISON2  0xDEAD000000000122ULL
 
-#define FLB_PATH_BUF_SZ 512
-
 static inline void bp_list_add(struct bp_node *node, struct bp_node *head)
 {
     struct bp_node *old_next = head->next;
-    head->next     = node;
-    node->next     = (struct bp_node *)head;
-    node->prev     = old_next;
+    head->next = node;
+    node->next = head;
+    node->prev = old_next;
     old_next->next = node;
 }
 
@@ -130,120 +115,204 @@ static inline void bp_list_del(struct bp_node *entry)
 {
     struct bp_node *n = entry->next;
     struct bp_node *p = entry->prev;
-    n->prev     = p;
-    p->next     = n;
+    n->prev = p;
+    p->next = n;
     entry->next = (struct bp_node *)LIST_POISON1;
     entry->prev = (struct bp_node *)LIST_POISON2;
 }
 
-static uint64_t find_lib_base(uint32_t pid, const char *lib_name)
+/* ---------- Dynamic VMA layout discovery (flb) ---------- */
+#define FLB_OFF_UNKNOWN 0xFFFFFFFFU
+#define FLB_KVA_MIN     0xFFFF000000000000ULL
+#define FLB_SCAN_MAX    640U
+
+typedef struct {
+    uint32_t mm_mmap;
+    uint32_t vma_vm_start;
+    uint32_t vma_vm_end;
+    uint32_t vma_vm_next;
+    uint32_t vma_vm_file;
+    uint32_t file_f_path;
+    uint32_t path_dentry;
+    uint32_t dentry_d_name;
+    uint32_t qstr_name;
+    int      ready;
+} flb_ctx_t;
+
+static flb_ctx_t g_flb;
+
+static inline int flb_is_kptr(uint64_t v)
 {
-    if (!lib_name || !lib_name[0]) {
-        logv("find_lib_base: lib_name is empty\n");
-        return 0;
-    }
+    return v > FLB_KVA_MIN && v != 0xFFFFFFFFFFFFFFFFULL;
+}
 
-    struct task_struct *task = (struct task_struct *)kf_find_task_by_vpid(pid);
-    if (!task) {
-        logv("find_lib_base: find_task_by_vpid(%u) returned NULL\n", pid);
-        return 0;
-    }
-    logv("find_lib_base: task found for pid=%u\n", pid);
+static inline uint64_t flb_rd(uint64_t base, uint32_t off)
+{
+    if (!base || off == FLB_OFF_UNKNOWN) return 0;
+    return *(volatile uint64_t *)(base + off);
+}
 
-    struct mm_struct *mm = (struct mm_struct *)kf_get_task_mm(task);
-    if (!mm) {
-        logv("find_lib_base: get_task_mm returned NULL\n");
-        return 0;
-    }
-    logv("find_lib_base: mm found\n");
+static inline const char *flb_basename(const char *p)
+{
+    const char *r = p;
+    for (; *p; p++) if (*p == '/') r = p + 1;
+    return r;
+}
 
-    kf_down_read(&mm->mmap_lock);
-    logv("find_lib_base: mmap_lock acquired\n");
+static inline int flb_streq(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == '\0' && *b == '\0';
+}
 
-    uint64_t result = 0;
+static int flb_probe_file_offsets(flb_ctx_t *c, uint64_t fptr)
+{
+    for (uint32_t fp = 0; fp + 8 <= FLB_SCAN_MAX; fp += 8) {
+        uint64_t mnt = *(volatile uint64_t *)(fptr + fp);
+        if (!flb_is_kptr(mnt)) continue;
+        uint64_t dentry = *(volatile uint64_t *)(fptr + fp + 8);
+        if (!flb_is_kptr(dentry)) continue;
 
-    for (struct vm_area_struct *vma = mm->mmap; vma; vma = vma->vm_next) {
-        logv("find_lib_base: visiting vma=0x%llx vm_start=0x%llx\n",
-             (unsigned long long)(uint64_t)vma,
-             (unsigned long long)vma->vm_start);
-
-        if (!vma->vm_file) {
-            logv("find_lib_base: vm_file is NULL, skip\n");
-            continue;
-        }
-
-        struct dentry *dentry = vma->vm_file->f_path.dentry;
-        if (!dentry) {
-            logv("find_lib_base: dentry is NULL, skip\n");
-            continue;
-        }
-
-        char path_buf[FLB_PATH_BUF_SZ];
-        char *path = kf_dentry_path_raw(dentry, path_buf, sizeof(path_buf));
-        if (!path) {
-            logv("find_lib_base: dentry_path_raw returned NULL, skip\n");
-            continue;
-        }
-
-        logv("find_lib_base: path=%s\n", path);
-
-        if (kf_strstr(path, lib_name)) {
-            logv("find_lib_base: matched '%s' at vm_start=0x%llx\n",
-                 lib_name, (unsigned long long)vma->vm_start);
-            result = vma->vm_start;
-            break;
+        for (uint32_t dp = 0; dp + 8 <= FLB_SCAN_MAX; dp += 8) {
+            uint64_t nameval = *(volatile uint64_t *)(dentry + dp);
+            if (!flb_is_kptr(nameval)) continue;
+            const char *name = (const char *)nameval;
+            int ok = 0;
+            for (int i = 0; i < 256; i++) {
+                char ch = name[i];
+                if (ch == '\0') { ok = (i > 0); break; }
+                if ((unsigned char)ch > 127) break;
+            }
+            if (!ok) continue;
+            c->file_f_path   = fp;
+            c->path_dentry   = fp + 8;
+            c->dentry_d_name = dp;
+            c->qstr_name     = dp;
+            return 1;
         }
     }
+    return 0;
+}
 
-    kf_up_read(&mm->mmap_lock);
-    logv("find_lib_base: mmap_lock released\n");
+static int flb_init(flb_ctx_t *c)
+{
+    if (c->ready) return 1;
+
+    if (!kf_find_task_by_vpid || !kf_get_task_mm || !kf_mmput) return 0;
+
+    void *task = kf_find_task_by_vpid(1);
+    if (!task) return 0;
+    void *mm = kf_get_task_mm(task);
+    if (!mm) return 0;
+
+    uint64_t mm64 = (uint64_t)mm;
+
+    c->mm_mmap      = FLB_OFF_UNKNOWN;
+    c->vma_vm_start = FLB_OFF_UNKNOWN;
+    c->vma_vm_end   = FLB_OFF_UNKNOWN;
+    c->vma_vm_next  = FLB_OFF_UNKNOWN;
+    c->vma_vm_file  = FLB_OFF_UNKNOWN;
+
+    for (uint32_t mo = 0; mo + 8 <= FLB_SCAN_MAX; mo += 8) {
+        if (mo == pgd_offset) continue;
+        uint64_t vma0 = *(volatile uint64_t *)(mm64 + mo);
+        if (!flb_is_kptr(vma0)) continue;
+
+        for (uint32_t so = 0; so + 16 <= FLB_SCAN_MAX; so += 8) {
+            uint64_t vs = *(volatile uint64_t *)(vma0 + so);
+            uint64_t ve = *(volatile uint64_t *)(vma0 + so + 8);
+            if (vs == 0 || ve <= vs) continue;
+            if (vs & 0xFFF) continue;
+            if ((ve - vs) > 0x100000000ULL) continue;
+
+            for (uint32_t no = so + 16; no + 8 <= FLB_SCAN_MAX; no += 8) {
+                uint64_t vnext = *(volatile uint64_t *)(vma0 + no);
+                if (!flb_is_kptr(vnext) && vnext != 0) continue;
+                if (vnext && flb_is_kptr(vnext)) {
+                    uint64_t vs2 = *(volatile uint64_t *)(vnext + so);
+                    uint64_t ve2 = *(volatile uint64_t *)(vnext + so + 8);
+                    if (vs2 == 0 || ve2 <= vs2 || (vs2 & 0xFFF)) continue;
+                }
+
+                c->mm_mmap      = mo;
+                c->vma_vm_start = so;
+                c->vma_vm_end   = so + 8;
+                c->vma_vm_next  = no;
+                goto found_vma;
+            }
+        }
+    }
 
     kf_mmput(mm);
-    logv("find_lib_base: mmput done, returning 0x%llx\n", (unsigned long long)result);
+    return 0;
 
+found_vma:;
+    uint64_t vma_cur = *(volatile uint64_t *)(mm64 + c->mm_mmap);
+    int file_offsets_found = 0;
+
+    while (flb_is_kptr(vma_cur) && !file_offsets_found) {
+        for (uint32_t fo = 0; fo + 8 <= FLB_SCAN_MAX; fo += 8) {
+            if (fo == c->vma_vm_start || fo == c->vma_vm_end || fo == c->vma_vm_next) continue;
+            uint64_t fptr = *(volatile uint64_t *)(vma_cur + fo);
+            if (!flb_is_kptr(fptr)) continue;
+            if (flb_probe_file_offsets(c, fptr)) {
+                c->vma_vm_file = fo;
+                file_offsets_found = 1;
+                break;
+            }
+        }
+        vma_cur = *(volatile uint64_t *)(vma_cur + c->vma_vm_next);
+    }
+
+    kf_mmput(mm);
+
+    if (!file_offsets_found) return 0;
+
+    c->ready = 1;
+    return 1;
+}
+
+static uint64_t flb_get_vma_name(flb_ctx_t *c, uint64_t vma)
+{
+    uint64_t fptr = flb_rd(vma, c->vma_vm_file);
+    if (!flb_is_kptr(fptr)) return 0;
+    uint64_t dptr = flb_rd(fptr, c->path_dentry);
+    if (!flb_is_kptr(dptr)) return 0;
+    return flb_rd(dptr, c->qstr_name);
+}
+
+static uint64_t find_lib_base(uint32_t pid, const char *libname)
+{
+    if (!libname || !*libname) return 0;
+    if (!flb_init(&g_flb)) return 0;
+
+    void *task = kf_find_task_by_vpid(pid);
+    if (!task) return 0;
+    void *mm = kf_get_task_mm(task);
+    if (!mm) return 0;
+
+    uint64_t mm64   = (uint64_t)mm;
+    uint64_t result = 0;
+    uint64_t vma    = flb_rd(mm64, g_flb.mm_mmap);
+
+    while (flb_is_kptr(vma)) {
+        uint64_t nameptr = flb_get_vma_name(&g_flb, vma);
+        if (nameptr) {
+            const char *fullpath = (const char *)nameptr;
+            const char *base     = flb_basename(fullpath);
+            if (flb_streq(base, libname)) {
+                result = flb_rd(vma, g_flb.vma_vm_start);
+                break;
+            }
+        }
+        vma = flb_rd(vma, g_flb.vma_vm_next);
+    }
+
+    kf_mmput(mm);
     return result;
 }
 
-uint64_t *pgtable_entry(uint64_t table_base, uint64_t va)
-{
-    uint64_t  ps     = my_page_shift;
-    uint64_t  vb     = my_va_bits;
-    uint64_t  es     = ps - 3;
-    int64_t   levels = (int64_t)((vb - 4) / es);
-    uint64_t *result;
-
-    if (levels < 1) return 0;
-
-    int64_t  level = 4 - levels;
-    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
-    uint64_t imask = (1U << es) - 1;
-
-    while (1) {
-        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-        uint64_t idx   = (va >> shift) & imask;
-        result         = (uint64_t *)(table_base + idx * 8);
-        uint64_t entry = *result;
-        uint64_t dt    = entry & 3;
-
-        if (dt == 3) {
-            table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-            level++;
-            if (level >= 3) return result;
-        } else if (dt == 1) {
-            if (level == 0) {
-                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                table_base = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                level++;
-                if (level >= 3) return result;
-                continue;
-            }
-            return result;
-        } else {
-            return 0;
-        }
-    }
-}
-
+/* ---------- Breakpoint handler ---------- */
 static void hw_breakpoint_handler(void *event, void *data)
 {
     logv("hw_breakpoint: Breakpoint hit\n");
@@ -251,86 +320,82 @@ static void hw_breakpoint_handler(void *event, void *data)
 
 static void before_ioctl(hook_fargs4_t *args, void *udata);
 
-#define RESOLVE(sym, ptr) \
-    do { \
-        (ptr) = (typeof(ptr))kallsyms_lookup_name(#sym); \
-        if (!(ptr)) { \
-            logv("FATAL: symbol not found: %s\n", #sym); \
-            return -1; \
-        } \
-        logv("symbol resolved: %s\n", #sym); \
-    } while (0)
-
+/* ---------- Initialisation ---------- */
 static long hello_demo_init(const char *args, const char *event, void *__user reserved)
 {
-    kv_memstart_addr  = (uint64_t)kallsyms_lookup_name("memstart_addr");
-    kv_kimage_voffset = (uint64_t)kallsyms_lookup_name("kimage_voffset");
+    #define RESOLVE(ptr, name, mandatory) do {                          \
+        ptr = (typeof(ptr))kallsyms_lookup_name(name);                  \
+        logv("resolve %-40s -> %px\n", name, (void *)ptr);             \
+        if (mandatory && !(ptr)) {                                     \
+            logv("ERROR: required symbol %s not found\n", name);       \
+            return -1;                                                 \
+        }                                                              \
+    } while(0)
 
-    RESOLVE(__arch_copy_from_user, kf___arch_copy_from_user);
-    RESOLVE(__arch_copy_to_user,   kf___arch_copy_to_user);
-    RESOLVE(find_task_by_vpid,     kf_find_task_by_vpid);
-    RESOLVE(get_task_mm,           kf_get_task_mm);
-    RESOLVE(mmput,                 kf_mmput);
-    RESOLVE(down_read,             kf_down_read);
-    RESOLVE(up_read,               kf_up_read);
-    RESOLVE(dentry_path_raw,       kf_dentry_path_raw);
-    RESOLVE(strstr,                kf_strstr);
-    RESOLVE(strlen,                kf_strlen);
-    RESOLVE(strrchr,               kf_strrchr);
-    RESOLVE(memcpy,                kf_memcpy);
-    RESOLVE(memset,                kf_memset);
-    RESOLVE(get_mm_exe_file,       kf_get_mm_exe_file);
-    RESOLVE(get_task_exe_file,     kf_get_task_exe_file);
-    RESOLVE(fput,                  kf_fput);
-    RESOLVE(pfn_valid,             kf_pfn_valid);
-    RESOLVE(valid_phys_addr_range, kf_valid_phys_addr_range);
-    RESOLVE(register_user_hw_breakpoint, kf_register_user_hw_breakpoint);
-    RESOLVE(unregister_hw_breakpoint,    kf_unregister_hw_breakpoint);
-    RESOLVE(perf_event_enable,     kf_perf_event_enable);
-    RESOLVE(__kmalloc,             kf___kmalloc);
-    RESOLVE(kmalloc,               kf_kmalloc);
-    RESOLVE(kfree,                 kf_kfree);
-    RESOLVE(_raw_spin_lock,        kf__raw_spin_lock);
-    RESOLVE(_raw_spin_unlock,      kf__raw_spin_unlock);
+    RESOLVE(kv_memstart_addr,        "memstart_addr",              1);
+    RESOLVE(kv_kimage_voffset,       "kimage_voffset",             1);
+    RESOLVE(kf___arch_copy_from_user,"__arch_copy_from_user",      1);
+    RESOLVE(kf___arch_copy_to_user,  "__arch_copy_to_user",        1);
+    RESOLVE(kf_get_task_pid,         "get_task_pid",               1);
+    RESOLVE(kf_put_pid,              "put_pid",                    1);
+    RESOLVE(kf_find_task_by_vpid,    "find_task_by_vpid",          1);
+    RESOLVE(kf_get_task_mm,          "get_task_mm",                1);
+    RESOLVE(kf_mmput,                "mmput",                      1);
+    RESOLVE(kf_pfn_valid,            "pfn_valid",                  1);
+    RESOLVE(kf_valid_phys_addr_range,"valid_phys_addr_range",     1);
+    RESOLVE(kf_register_user_hw_breakpoint, "register_user_hw_breakpoint", 1);
+    RESOLVE(kf_unregister_hw_breakpoint,    "unregister_hw_breakpoint",     1);
+    RESOLVE(kf_perf_event_enable,    "perf_event_enable",          1);
+    RESOLVE(kf_memset,               "memset",                     1);
+    RESOLVE(kf___kmalloc,            "__kmalloc",                  1);
+    RESOLVE(kf_kmalloc,              "kmalloc",                    1);
+    RESOLVE(kf_kfree,                "kfree",                      1);
+    RESOLVE(kf__raw_spin_lock,       "_raw_spin_lock",             1);
+    RESOLVE(kf__raw_spin_unlock,     "_raw_spin_unlock",           1);
 
-    kf_get_task_pid              = (typeof(kf_get_task_pid))kallsyms_lookup_name("get_task_pid");
-    kf_put_pid                   = (typeof(kf_put_pid))kallsyms_lookup_name("put_pid");
-    kf_attach_pid                = (uint64_t)kallsyms_lookup_name("attach_pid");
-    kf_modify_user_hw_breakpoint = (uint64_t)kallsyms_lookup_name("modify_user_hw_breakpoint");
-
+    /* Hardware capabilities */
     uint64_t tcr_el1;
     __asm__ volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
     uint64_t tg1 = (tcr_el1 >> 30) & 0x3;
     my_va_bits = 64 - ((tcr_el1 >> 16) & 0x1F);
-    if (tg1 == 1)      my_page_shift = 14;
-    else if (tg1 == 3) my_page_shift = 16;
-    else               my_page_shift = 12;
+    if (tg1 == 1)
+        my_page_shift = 14;
+    else if (tg1 == 3)
+        my_page_shift = 16;
+    else
+        my_page_shift = 12;
 
     uint64_t mmfr0;
     __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
     uint64_t parange = mmfr0 & 0xF;
-    my_pa_bits = (parange > 6) ? 48 : pa_bits_table[parange];
+    if (parange > 6)
+        my_pa_bits = 48;
+    else
+        my_pa_bits = pa_bits_table[parange];
 
-    uint64_t ttbr1;
-    __asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
-
+    /* Discover pgd offset dynamically */
     uint64_t init_mm_addr = (uint64_t)kallsyms_lookup_name("init_mm");
-    if (init_mm_addr && init_mm_addr <= 0xFFFFFFFFFFFFFF4FULL) {
+    if (init_mm_addr && init_mm_addr <= 0xFFFFFFFFFFFFFF4FULL &&
+        kv_kimage_voffset) {
+        uint64_t ttbr1;
+        __asm__ volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
         uint64_t expected_pgd = *(uint64_t *)kv_kimage_voffset
                               + (ttbr1 & (-1ULL << my_page_shift) & 0xFFFFFFFFFFFEULL);
         for (uint64_t off = 0; off < 176; off += 4) {
             if (*(uint64_t *)(init_mm_addr + off) == expected_pgd) {
                 pgd_offset = off;
+                logv("found pgd_offset = 0x%llx\n", pgd_offset);
                 break;
             }
         }
     }
 
-    uint64_t init_task_addr = (uint64_t)kallsyms_lookup_name("init_task");
-    if (init_task_addr && kf_get_task_pid) {
-        void *pid = kf_get_task_pid((void *)init_task_addr, 0);
-        if (pid && kf_put_pid) kf_put_pid(pid);
-    }
+    if (pgd_offset == 0)
+        logv("WARNING: pgd_offset not found – memory r/w may fail\n");
+
+    /* Initialise VMA walker */
+    if (!flb_init(&g_flb))
+        logv("WARNING: VMA walker initialisation failed\n");
 
     return (long)fp_hook_syscalln(29, 3, before_ioctl, NULL, NULL);
 }
@@ -345,7 +410,7 @@ static long hello_demo_exit(void *__user reserved)
 {
     fp_unhook_syscall(29, 0, before_ioctl);
 
-    kf__raw_spin_lock(&bp_lock);
+    kf__raw_spin_lock(bp_lock);
     struct bp_node *pos = bp_list.next;
     while ((void *)pos != (void *)&bp_list) {
         struct bp_node *next_node = pos->next;
@@ -355,31 +420,33 @@ static long hello_demo_exit(void *__user reserved)
         kf_kfree(pos);
         pos = next_node;
     }
-    kf__raw_spin_unlock(&bp_lock);
+    kf__raw_spin_unlock(bp_lock);
 
     logv("hello_demo_exit\n");
     return 0;
 }
 
+/* ---------- IOCTL handler (main logic) ---------- */
 static void before_ioctl(hook_fargs4_t *args, void *udata)
 {
-    uint64_t *regs      = syscall_args(args);
-    int64_t   cmd       = (int64_t)regs[1];
-    uint64_t  user_data = regs[2];
+    uint64_t *regs = syscall_args(args);
+    int64_t cmd = (int64_t)regs[1];
+    uint64_t user_data = regs[2];
 
     if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_FIND_LIB_BASE - OP_READ_MEM))
         return;
 
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         copy_memory_t rcmd;
-        if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd))) return;
+        if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
+            return;
         uint64_t remaining = rcmd.size;
         if (!remaining) return;
-        uint64_t vaddr  = rcmd.addr;
+        uint64_t vaddr = rcmd.addr;
         uint64_t outbuf = rcmd.buffer;
 
         while (remaining) {
-            uint64_t pgsz  = 1ULL << my_page_shift;
+            uint64_t pgsz = 1ULL << my_page_shift;
             uint64_t pgoff = vaddr & (pgsz - 1);
             uint64_t chunk = pgsz - pgoff;
             if (chunk > remaining) chunk = remaining;
@@ -389,24 +456,24 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             void *mm = kf_get_task_mm(task);
             if (!mm) goto next_chunk;
 
-            uint64_t ps     = my_page_shift;
-            uint64_t vb     = my_va_bits;
-            uint64_t es     = ps - 3;
-            int64_t  levels = (int64_t)((vb - 4) / es);
+            uint64_t ps = my_page_shift;
+            uint64_t vb = my_va_bits;
+            uint64_t es = ps - 3;
+            int64_t levels = (int64_t)((vb - 4) / es);
             uint64_t phys_addr = 0;
 
-            if (levels >= 1) {
-                int64_t  level = 4 - levels;
-                uint64_t tbl   = *(uint64_t *)((uint64_t)mm + pgd_offset);
+            if (levels >= 1 && pgd_offset != 0) {
+                int64_t level = 4 - levels;
+                uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
                 uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
                 uint64_t imask = (1U << es) - 1;
                 int found = 0;
 
                 while (!found) {
                     uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx   = (vaddr >> shift) & imask;
+                    uint64_t idx = (vaddr >> shift) & imask;
                     uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                    uint64_t dt    = entry & 3;
+                    uint64_t dt = entry & 3;
 
                     if (dt == 3) {
                         tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
@@ -415,7 +482,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
                     } else if (dt == 1) {
                         if (level == 0) {
                             pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                            tbl   = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
                             level++;
                             if (level >= 3) { found = 1; break; }
                             continue;
@@ -428,13 +495,13 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
                 if (found) {
                     uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx   = (vaddr >> shift) & imask;
+                    uint64_t idx = (vaddr >> shift) & imask;
                     uint64_t entry = *(uint64_t *)(tbl + idx * 8);
                     if ((~(uint16_t)entry & 0x401) == 0) {
                         uint64_t pa_frame = 0;
                         if (my_pa_bits == 52)
                             pa_frame = (entry << 36) & 0xF000000000000ULL;
-                        phys_addr  = (pa_frame + (entry & pmask)) & (-1ULL << ps);
+                        phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
                         phys_addr |= vaddr & ~(-1ULL << ps);
                     }
                 }
@@ -453,15 +520,21 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
                     if (cmd == OP_READ_MEM) {
                         kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
                     } else {
-                        uint8_t  *tmp;
-                        uint64_t  not_copied;
+                        uint8_t *tmp;
                         tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(chunk, 0xD0)
                                          : (uint8_t *)kf___kmalloc(chunk, 0xD0);
-                        if (!tmp) goto next_chunk;
-                        not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
-                        if (not_copied) { kf_kfree(tmp); goto next_chunk; }
+                        if (!tmp)
+                            goto next_chunk;
+
+                        uint64_t not_copied = kf___arch_copy_from_user(tmp, (void __user *)outbuf, chunk);
+                        if (not_copied) {
+                            kf_kfree(tmp);
+                            goto next_chunk;
+                        }
+
                         for (uint64_t i = 0; i < chunk; i++)
                             *(volatile uint8_t *)(kva + i) = tmp[i];
+
                         kf_kfree(tmp);
                     }
                 }
@@ -469,8 +542,8 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
         next_chunk:
             remaining -= chunk;
-            vaddr     += chunk;
-            outbuf    += chunk;
+            vaddr += chunk;
+            outbuf += chunk;
         }
         return;
     }
@@ -483,27 +556,30 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
     if (cmd == OP_SET_HW_BREAKPOINT) {
         hw_breakpoint_cmd_t bcmd;
-        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd))) return;
+        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
+            return;
 
         void *task = kf_find_task_by_vpid(bcmd.pid);
         if (!task) return;
 
+        /* Use original, well‑tested attr array method */
         char attr[136];
         if (kf_memset) kf_memset(attr, 0, sizeof(attr));
 
-        *(uint32_t *)(attr + 0x00) = 5;
+        *(uint32_t *)(attr + 0x00) = 5;          /* type */
         if (kver >> 9 >= 0x285) {
-            *(uint32_t *)(attr + 0x04) = 120;
-            if (kver > 0x50EFF)
+            *(uint32_t *)(attr + 0x04) = 120;    /* size */
+            if (kver > 0x50EFF) {
                 *(uint32_t *)(attr + 0x04) = (kver >> 8 > 0x600) ? 136 : 128;
+            }
         }
-        *(uint64_t *)(attr + 0x10)  = 1;
-        *(uint64_t *)(attr + 0x28) |= 0x24;
-        *(uint32_t *)(attr + 0x34)  = bcmd.type;
-        *(uint64_t *)(attr + 0x38)  = bcmd.addr;
-        *(uint64_t *)(attr + 0x40)  = bcmd.len;
+        *(uint64_t *)(attr + 0x10) = 1;          /* disabled */
+        *(uint64_t *)(attr + 0x28) |= 0x24;      /* precise_ip = 2, etc. */
+        *(uint32_t *)(attr + 0x34) = bcmd.type;  /* bp_type */
+        *(uint64_t *)(attr + 0x38) = bcmd.addr;  /* bp_addr */
+        *(uint64_t *)(attr + 0x40) = bcmd.len;   /* bp_len */
 
-        void *ev = kf_register_user_hw_breakpoint(attr, hw_breakpoint_handler, 0, task);
+        void *ev = kf_register_user_hw_breakpoint(attr, hw_breakpoint_handler, NULL, task);
         if ((uint64_t)ev > 0xFFFFFFFFFFFFF000ULL) return;
 
         if (kf_perf_event_enable) kf_perf_event_enable(ev);
@@ -511,23 +587,27 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         void *(*alloc_fn)(uint64_t, uint32_t);
         alloc_fn = kf_kmalloc ? (void *)kf_kmalloc : (void *)kf___kmalloc;
         struct bp_node *node = (struct bp_node *)alloc_fn(sizeof(struct bp_node), 0xD0);
-        if (!node) { if (kf_unregister_hw_breakpoint) kf_unregister_hw_breakpoint(ev); return; }
+        if (!node) {
+            if (kf_unregister_hw_breakpoint) kf_unregister_hw_breakpoint(ev);
+            return;
+        }
 
-        node->pid        = bcmd.pid;
+        node->pid = bcmd.pid;
         node->perf_event = (uint64_t)ev;
-        node->addr       = bcmd.addr;
+        node->addr = bcmd.addr;
 
-        kf__raw_spin_lock(&bp_lock);
+        kf__raw_spin_lock(bp_lock);
         bp_list_add(node, &bp_list);
-        kf__raw_spin_unlock(&bp_lock);
+        kf__raw_spin_unlock(bp_lock);
         return;
     }
 
     if (cmd == OP_REMOVE_HW_BREAKPOINT) {
         hw_breakpoint_cmd_t bcmd;
-        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd))) return;
+        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
+            return;
 
-        kf__raw_spin_lock(&bp_lock);
+        kf__raw_spin_lock(bp_lock);
         struct bp_node *pos = bp_list.next;
         while ((void *)pos != (void *)&bp_list) {
             struct bp_node *n = pos->next;
@@ -540,12 +620,12 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             }
             pos = n;
         }
-        kf__raw_spin_unlock(&bp_lock);
+        kf__raw_spin_unlock(bp_lock);
         return;
     }
 
     if (cmd == OP_REMOVE_ALL_HW_BREAKPOINT) {
-        kf__raw_spin_lock(&bp_lock);
+        kf__raw_spin_lock(bp_lock);
         struct bp_node *pos = bp_list.next;
         while ((void *)pos != (void *)&bp_list) {
             struct bp_node *n = pos->next;
@@ -555,23 +635,24 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             kf_kfree(pos);
             pos = n;
         }
-        kf__raw_spin_unlock(&bp_lock);
+        kf__raw_spin_unlock(bp_lock);
         return;
     }
 
     if (cmd == OP_FIND_LIB_BASE) {
         find_lib_cmd_t lcmd;
-        if (kf___arch_copy_from_user(&lcmd, (void __user *)user_data, sizeof(lcmd))) return;
+        if (kf___arch_copy_from_user(&lcmd, (void __user *)user_data, sizeof(lcmd)))
+            return;
 
         char libname[256];
-        kf_memset(libname, 0, sizeof(libname));
-        if (kf___arch_copy_from_user(libname, (void __user *)lcmd.lib_name_ptr, sizeof(libname) - 1)) return;
+        if (kf_memset) kf_memset(libname, 0, sizeof(libname));
+        if (kf___arch_copy_from_user(libname, (void __user *)lcmd.lib_name_ptr, sizeof(libname) - 1))
+            return;
 
         uint64_t base = find_lib_base(lcmd.pid, libname);
 
-        kf___arch_copy_to_user(
-            (void __user *)(user_data + __builtin_offsetof(find_lib_cmd_t, out_base_addr)),
-            &base, sizeof(base));
+        kf___arch_copy_to_user((void __user *)(user_data + __builtin_offsetof(find_lib_cmd_t, out_base_addr)),
+                               &base, sizeof(base));
         return;
     }
 }
