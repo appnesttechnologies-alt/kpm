@@ -56,7 +56,7 @@ typedef struct {
 } bulk_entry_t;
 
 typedef struct {
-    uint64_t        entries;  /* userspace ptr â†’ bulk_entry_t[]      */
+    uint64_t        entries;  /* userspace ptr → bulk_entry_t[]      */
     uint32_t        count;    /* number of entries in the array       */
     uint32_t        _pad0;
 } bulk_read_cmd_t;
@@ -129,10 +129,10 @@ static const uint64_t pa_bits_table[] = { 32, 36, 40, 42, 44, 48, 52 };
 static inline void bp_list_add(struct bp_node *node, struct bp_node *head)
 {
     struct bp_node *old_next = head->next;
-    head->next = node;
-    node->next = (struct bp_node *)head;
-    node->prev = old_next;
-    old_next->next = node;
+    node->next = old_next;      /* node → old first element           */
+    node->prev = head;          /* node ← head                        */
+    head->next = node;          /* head → node (prepend)              */
+    old_next->prev = node;      /* old first element ← node           */
 }
 
 static inline void bp_list_del(struct bp_node *entry)
@@ -307,7 +307,7 @@ static long hello_demo_exit(void *__user reserved)
  * Shared helper used by both OP_READ_MEM and OP_BULK_READ_MEM.
  * Reads `rcmd->size` bytes from the virtual address `rcmd->addr`
  * in process `rcmd->pid` into the userspace buffer `rcmd->buffer`.
- * Identical logic to the original OP_READ_MEM path â€” nothing changed.
+ * Identical logic to the original OP_READ_MEM path — nothing changed.
  */
 static void do_read_one_region(const copy_memory_t *rcmd)
 {
@@ -493,7 +493,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (cmd == OP_READ_MEM) {
             kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
         } else {
-            // âœ… SAFE: userspace â†’ kernel buffer â†’ phys
+            // ✅ SAFE: userspace → kernel buffer → phys
             uint8_t *tmp;
             uint64_t not_copied;
 
@@ -525,7 +525,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
     }
 
     /* ------------------------------------------------------------------ *
-     * OP_BULK_READ_MEM â€” read multiple regions with a single ioctl call.  *
+     * OP_BULK_READ_MEM — read multiple regions with a single ioctl call.  *
      *                                                                      *
      * Userspace layout:                                                    *
      *   bulk_read_cmd_t cmd = {                                            *
