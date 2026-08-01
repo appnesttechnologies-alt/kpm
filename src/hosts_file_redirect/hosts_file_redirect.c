@@ -24,8 +24,7 @@ KPM_DESCRIPTION("FCK");
 
 #define OP_READ_MEM                 8001
 #define OP_WRITE_MEM                8002
-#define OP_BULK_READ_MEM            8020
-#define OP_BULK_WRITE_MEM           8021
+#define OP_BULK_READ_MEM            8003   /* NEW: read multiple regions in one ioctl */
 #define OP_GET_CPU_NUM_BRPS         8009
 #define OP_GET_CPU_NUM_WRPS         8010
 #define OP_SET_HW_BREAKPOINT        8011
@@ -41,17 +40,26 @@ typedef struct {
     uint64_t size;
 } copy_memory_t;
 
-typedef struct {
-    uint64_t addr;
-    uint64_t buffer;
-    uint64_t size;
-} bulk_item_t;
-
+/*
+ * Bulk-read: userspace fills in an array of bulk_entry_t, then passes
+ * a bulk_read_cmd_t whose `entries` pointer points to that array.
+ * Each entry is independent (can be from different virtual addresses /
+ * different pids).  On return every `buffer` has been filled (or
+ * left untouched if the physical address could not be resolved).
+ */
 typedef struct {
     uint32_t pid;
-    uint32_t count;
-    uint64_t items;
-} bulk_cmd_t;
+    uint32_t _pad0;
+    uint64_t addr;      /* virtual address to read from              */
+    uint64_t buffer;    /* userspace destination buffer              */
+    uint64_t size;      /* number of bytes to read                   */
+} bulk_entry_t;
+
+typedef struct {
+    uint64_t        entries;  /* userspace ptr â†’ bulk_entry_t[]      */
+    uint32_t        count;    /* number of entries in the array       */
+    uint32_t        _pad0;
+} bulk_read_cmd_t;
 
 typedef struct {
     uint32_t pid;
@@ -293,264 +301,125 @@ static long hello_demo_exit(void *__user reserved)
 }
 
 
+/*
+ * do_read_one_region()
+ *
+ * Shared helper used by both OP_READ_MEM and OP_BULK_READ_MEM.
+ * Reads `rcmd->size` bytes from the virtual address `rcmd->addr`
+ * in process `rcmd->pid` into the userspace buffer `rcmd->buffer`.
+ * Identical logic to the original OP_READ_MEM path â€” nothing changed.
+ */
+static void do_read_one_region(const copy_memory_t *rcmd)
+{
+    uint64_t remaining = rcmd->size;
+    if (!remaining) return;
+    uint64_t vaddr  = rcmd->addr;
+    uint64_t outbuf = rcmd->buffer;
+
+    while (remaining) {
+        uint64_t pgsz  = 1ULL << my_page_shift;
+        uint64_t pgoff = vaddr & (pgsz - 1);
+        uint64_t chunk = pgsz - pgoff;
+        if (chunk > remaining) chunk = remaining;
+
+        void *task = kf_find_task_by_vpid(rcmd->pid);
+        if (!task) goto next_chunk;
+        void *mm = kf_get_task_mm(task);
+        if (!mm) goto next_chunk;
+
+        uint64_t ps  = my_page_shift;
+        uint64_t vb  = my_va_bits;
+        uint64_t es  = ps - 3;
+        int64_t levels = (int64_t)((vb - 4) / es);
+        uint64_t phys_addr = 0;
+
+        if (levels >= 1) {
+            int64_t level = 4 - levels;
+            uint64_t tbl   = *(uint64_t *)((uint64_t)mm + pgd_offset);
+            uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
+            uint64_t imask = (1U << es) - 1;
+            int found = 0;
+
+            while (!found) {
+                uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                uint64_t idx   = (vaddr >> shift) & imask;
+                uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                uint64_t dt    = entry & 3;
+
+                if (dt == 3) {
+                    tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                    level++;
+                    if (level >= 3) { found = 1; break; }
+                } else if (dt == 1) {
+                    if (level == 0) {
+                        pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
+                        tbl   = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                        level++;
+                        if (level >= 3) { found = 1; break; }
+                        continue;
+                    }
+                    found = 1; break;
+                } else {
+                    break;
+                }
+            }
+
+            if (found) {
+                uint64_t shift = (4 - (uint8_t)level) * es + 3;
+                uint64_t idx   = (vaddr >> shift) & imask;
+                uint64_t entry = *(uint64_t *)(tbl + idx * 8);
+                if ((~(uint16_t)entry & 0x401) == 0) {
+                    uint64_t pa_frame = 0;
+                    if (my_pa_bits == 52)
+                        pa_frame = (entry << 36) & 0xF000000000000ULL;
+                    phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
+                    phys_addr |= vaddr & ~(-1ULL << ps);
+                }
+            }
+        }
+
+        if (kf_mmput) kf_mmput(mm);
+
+        if (phys_addr) {
+            if (kf_pfn_valid(phys_addr >> my_page_shift) &&
+                kf_valid_phys_addr_range(phys_addr, chunk)) {
+                uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
+                             - *(uint64_t *)kv_memstart_addr
+                             + (-1ULL << my_va_bits)
+                             + (phys_addr & ~(-1ULL << my_page_shift));
+
+                kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
+            }
+        }
+
+    next_chunk:
+        remaining -= chunk;
+        vaddr     += chunk;
+        outbuf    += chunk;
+    }
+}
+
+
 static void before_ioctl(hook_fargs4_t *args, void *udata)
 {
-    uint64_t *regs = syscall_args(args);
-    int64_t cmd = (int64_t)regs[1];
-    uint64_t user_data = regs[2];
+    uint64_t *regs    = syscall_args(args);
+    int64_t   cmd     = (int64_t)regs[1];
+    uint64_t  user_data = regs[2];
 
-    // ===== BULK READ =====
-    if (cmd == OP_BULK_READ_MEM) {
-        bulk_cmd_t bcmd;
-        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
-            return;
-        
-        if (!bcmd.count || bcmd.count > 256 || !bcmd.items)
-            return;
-        
-        uint64_t alloc_sz = bcmd.count * sizeof(bulk_item_t);
-        bulk_item_t *items = (bulk_item_t *)kf_kmalloc(alloc_sz, 0xD0);
-        if (!items) return;
-        
-        if (kf___arch_copy_from_user(items, (void __user *)bcmd.items, alloc_sz)) {
-            kf_kfree(items);
-            return;
-        }
-        
-        for (uint32_t i = 0; i < bcmd.count; i++) {
-            uint64_t vaddr = items[i].addr;
-            uint64_t outbuf = items[i].buffer;
-            uint64_t remaining = items[i].size;
-            
-            if (!remaining || remaining > 0x100000) continue;
-            
-            // EXACT SAME LOGIC AS SINGLE READ
-            void *task = kf_find_task_by_vpid(bcmd.pid);
-            if (!task) continue;
-            void *mm = kf_get_task_mm(task);
-            if (!mm) continue;
-            
-            while (remaining) {
-                uint64_t pgsz = 1ULL << my_page_shift;
-                uint64_t pgoff = vaddr & (pgsz - 1);
-                uint64_t chunk = pgsz - pgoff;
-                if (chunk > remaining) chunk = remaining;
-
-                uint64_t ps = my_page_shift;
-                uint64_t vb = my_va_bits;
-                uint64_t es = ps - 3;
-                int64_t levels = (int64_t)((vb - 4) / es);
-                uint64_t phys_addr = 0;
-
-                if (levels >= 1) {
-                    int64_t level = 4 - levels;
-                    uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
-                    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
-                    uint64_t imask = (1U << es) - 1;
-                    int found = 0;
-
-                    while (!found) {
-                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                        uint64_t idx = (vaddr >> shift) & imask;
-                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                        uint64_t dt = entry & 3;
-
-                        if (dt == 3) {
-                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                            level++;
-                            if (level >= 3) { found = 1; break; }
-                        } else if (dt == 1) {
-                            if (level == 0) {
-                                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                                tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                                level++;
-                                if (level >= 3) { found = 1; break; }
-                                continue;
-                            }
-                            found = 1; break;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if (found) {
-                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                        uint64_t idx = (vaddr >> shift) & imask;
-                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                        if ((~(uint16_t)entry & 0x401) == 0) {
-                            uint64_t pa_frame = 0;
-                            if (my_pa_bits == 52)
-                                pa_frame = (entry << 36) & 0xF000000000000ULL;
-                            phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
-                            phys_addr |= vaddr & ~(-1ULL << ps);
-                        }
-                    }
-                }
-
-                if (phys_addr) {
-                    if (kf_pfn_valid(phys_addr >> my_page_shift) &&
-                        kf_valid_phys_addr_range(phys_addr, chunk)) {
-                        uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
-                                     - *(uint64_t *)kv_memstart_addr
-                                     + (-1ULL << my_va_bits)
-                                     + (phys_addr & ~(-1ULL << my_page_shift));
-                        kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
-                    }
-                }
-
-                remaining -= chunk;
-                vaddr += chunk;
-                outbuf += chunk;
-            }
-            
-            if (kf_mmput) kf_mmput(mm);
-        }
-        
-        kf_kfree(items);
+    if ((uint64_t)(cmd - OP_READ_MEM) > (uint64_t)(OP_REMOVE_ALL_HW_BREAKPOINT - OP_READ_MEM))
         return;
-    }
 
-    // ===== BULK WRITE =====
-    if (cmd == OP_BULK_WRITE_MEM) {
-        bulk_cmd_t bcmd;
-        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
-            return;
-        
-        if (!bcmd.count || bcmd.count > 256 || !bcmd.items)
-            return;
-        
-        uint64_t alloc_sz = bcmd.count * sizeof(bulk_item_t);
-        bulk_item_t *items = (bulk_item_t *)kf_kmalloc(alloc_sz, 0xD0);
-        if (!items) return;
-        
-        if (kf___arch_copy_from_user(items, (void __user *)bcmd.items, alloc_sz)) {
-            kf_kfree(items);
-            return;
-        }
-        
-        for (uint32_t i = 0; i < bcmd.count; i++) {
-            uint64_t vaddr = items[i].addr;
-            uint64_t inbuf = items[i].buffer;
-            uint64_t remaining = items[i].size;
-            
-            if (!remaining || remaining > 0x100000) continue;
-            
-            void *task = kf_find_task_by_vpid(bcmd.pid);
-            if (!task) continue;
-            void *mm = kf_get_task_mm(task);
-            if (!mm) continue;
-            
-            // EXACT SAME LOGIC AS SINGLE WRITE
-            uint8_t *tmp = kf_kmalloc ? (uint8_t *)kf_kmalloc(remaining, 0xD0)
-                                      : (uint8_t *)kf___kmalloc(remaining, 0xD0);
-            if (!tmp) {
-                if (kf_mmput) kf_mmput(mm);
-                continue;
-            }
-            
-            uint64_t not_copied = kf___arch_copy_from_user(tmp, (void __user *)inbuf, remaining);
-            if (not_copied) {
-                kf_kfree(tmp);
-                if (kf_mmput) kf_mmput(mm);
-                continue;
-            }
-            
-            uint64_t curr_off = 0;
-            
-            while (remaining) {
-                uint64_t pgsz = 1ULL << my_page_shift;
-                uint64_t pgoff = vaddr & (pgsz - 1);
-                uint64_t chunk = pgsz - pgoff;
-                if (chunk > remaining) chunk = remaining;
-
-                uint64_t ps = my_page_shift;
-                uint64_t vb = my_va_bits;
-                uint64_t es = ps - 3;
-                int64_t levels = (int64_t)((vb - 4) / es);
-                uint64_t phys_addr = 0;
-
-                if (levels >= 1) {
-                    int64_t level = 4 - levels;
-                    uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
-                    uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
-                    uint64_t imask = (1U << es) - 1;
-                    int found = 0;
-
-                    while (!found) {
-                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                        uint64_t idx = (vaddr >> shift) & imask;
-                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                        uint64_t dt = entry & 3;
-
-                        if (dt == 3) {
-                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                            level++;
-                            if (level >= 3) { found = 1; break; }
-                        } else if (dt == 1) {
-                            if (level == 0) {
-                                pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                                tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
-                                level++;
-                                if (level >= 3) { found = 1; break; }
-                                continue;
-                            }
-                            found = 1; break;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if (found) {
-                        uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                        uint64_t idx = (vaddr >> shift) & imask;
-                        uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                        if ((~(uint16_t)entry & 0x401) == 0) {
-                            uint64_t pa_frame = 0;
-                            if (my_pa_bits == 52)
-                                pa_frame = (entry << 36) & 0xF000000000000ULL;
-                            phys_addr = (pa_frame + (entry & pmask)) & (-1ULL << ps);
-                            phys_addr |= vaddr & ~(-1ULL << ps);
-                        }
-                    }
-                }
-
-                if (phys_addr) {
-                    if (kf_pfn_valid(phys_addr >> my_page_shift) &&
-                        kf_valid_phys_addr_range(phys_addr, chunk)) {
-                        uint64_t kva = (phys_addr & (-1ULL << my_page_shift))
-                                     - *(uint64_t *)kv_memstart_addr
-                                     + (-1ULL << my_va_bits)
-                                     + (phys_addr & ~(-1ULL << my_page_shift));
-                        for (uint64_t j = 0; j < chunk; j++)
-                            *(volatile uint8_t *)(kva + j) = tmp[curr_off + j];
-                    }
-                }
-
-                remaining -= chunk;
-                vaddr += chunk;
-                curr_off += chunk;
-            }
-            
-            kf_kfree(tmp);
-            if (kf_mmput) kf_mmput(mm);
-        }
-        
-        kf_kfree(items);
-        return;
-    }
-
-    // ===== SINGLE READ/WRITE (EXACT ORIGINAL CODE) =====
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         copy_memory_t rcmd;
         if (kf___arch_copy_from_user(&rcmd, (void __user *)user_data, sizeof(rcmd)))
             return;
         uint64_t remaining = rcmd.size;
         if (!remaining) return;
-        uint64_t vaddr = rcmd.addr;
+        uint64_t vaddr  = rcmd.addr;
         uint64_t outbuf = rcmd.buffer;
 
         while (remaining) {
-            uint64_t pgsz = 1ULL << my_page_shift;
+            uint64_t pgsz  = 1ULL << my_page_shift;
             uint64_t pgoff = vaddr & (pgsz - 1);
             uint64_t chunk = pgsz - pgoff;
             if (chunk > remaining) chunk = remaining;
@@ -560,24 +429,24 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
             void *mm = kf_get_task_mm(task);
             if (!mm) goto next_chunk;
 
-            uint64_t ps = my_page_shift;
-            uint64_t vb = my_va_bits;
-            uint64_t es = ps - 3;
+            uint64_t ps  = my_page_shift;
+            uint64_t vb  = my_va_bits;
+            uint64_t es  = ps - 3;
             int64_t levels = (int64_t)((vb - 4) / es);
             uint64_t phys_addr = 0;
 
             if (levels >= 1) {
                 int64_t level = 4 - levels;
-                uint64_t tbl = *(uint64_t *)((uint64_t)mm + pgd_offset);
+                uint64_t tbl   = *(uint64_t *)((uint64_t)mm + pgd_offset);
                 uint64_t pmask = ~(-1ULL << (48 - (uint8_t)ps)) << ps;
                 uint64_t imask = (1U << es) - 1;
                 int found = 0;
 
                 while (!found) {
                     uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t idx   = (vaddr >> shift) & imask;
                     uint64_t entry = *(uint64_t *)(tbl + idx * 8);
-                    uint64_t dt = entry & 3;
+                    uint64_t dt    = entry & 3;
 
                     if (dt == 3) {
                         tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
@@ -586,7 +455,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
                     } else if (dt == 1) {
                         if (level == 0) {
                             pmask = ~(-1ULL << (48 - ((uint8_t)ps + 3 * es))) << ((uint8_t)ps + 3 * es);
-                            tbl = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
+                            tbl   = (pmask & entry) + (-1ULL << vb) - *(uint64_t *)kv_memstart_addr;
                             level++;
                             if (level >= 3) { found = 1; break; }
                             continue;
@@ -599,7 +468,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
                 if (found) {
                     uint64_t shift = (4 - (uint8_t)level) * es + 3;
-                    uint64_t idx = (vaddr >> shift) & imask;
+                    uint64_t idx   = (vaddr >> shift) & imask;
                     uint64_t entry = *(uint64_t *)(tbl + idx * 8);
                     if ((~(uint16_t)entry & 0x401) == 0) {
                         uint64_t pa_frame = 0;
@@ -624,6 +493,7 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
         if (cmd == OP_READ_MEM) {
             kf___arch_copy_to_user((void __user *)outbuf, (void *)kva, chunk);
         } else {
+            // âœ… SAFE: userspace â†’ kernel buffer â†’ phys
             uint8_t *tmp;
             uint64_t not_copied;
 
@@ -648,13 +518,68 @@ static void before_ioctl(hook_fargs4_t *args, void *udata)
 
         next_chunk:
             remaining -= chunk;
-            vaddr += chunk;
-            outbuf += chunk;
+            vaddr     += chunk;
+            outbuf    += chunk;
         }
         return;
     }
 
-    // ===== HW BREAKPOINTS (EXACT ORIGINAL CODE) =====
+    /* ------------------------------------------------------------------ *
+     * OP_BULK_READ_MEM â€” read multiple regions with a single ioctl call.  *
+     *                                                                      *
+     * Userspace layout:                                                    *
+     *   bulk_read_cmd_t cmd = {                                            *
+     *       .entries = (uint64_t)entry_array,   // bulk_entry_t[]         *
+     *       .count   = N,                                                  *
+     *   };                                                                 *
+     *   ioctl(fd, OP_BULK_READ_MEM, &cmd);                                *
+     *                                                                      *
+     * Each bulk_entry_t mirrors copy_memory_t so the same page-walk       *
+     * logic (extracted into do_read_one_region) is reused unchanged.      *
+     * ------------------------------------------------------------------ */
+    if (cmd == OP_BULK_READ_MEM) {
+        bulk_read_cmd_t bcmd;
+        if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
+            return;
+
+        if (!bcmd.count || !bcmd.entries)
+            return;
+
+        /* Allocate a kernel-side scratch buffer for the entry array.
+         * We read all entries up-front so userspace cannot TOCTOU them. */
+        uint64_t arr_size = (uint64_t)bcmd.count * sizeof(bulk_entry_t);
+        bulk_entry_t *entries;
+        entries = kf_kmalloc ? (bulk_entry_t *)kf_kmalloc(arr_size, 0xD0)
+                             : (bulk_entry_t *)kf___kmalloc(arr_size, 0xD0);
+        if (!entries)
+            return;
+
+        if (kf___arch_copy_from_user(entries, (void __user *)bcmd.entries, arr_size)) {
+            kf_kfree(entries);
+            return;
+        }
+
+        /* Process every entry using the same logic as OP_READ_MEM. */
+        for (uint32_t i = 0; i < bcmd.count; i++) {
+            copy_memory_t rcmd;
+            rcmd.pid    = entries[i].pid;
+            rcmd._pad0  = 0;
+            rcmd.addr   = entries[i].addr;
+            rcmd.buffer = entries[i].buffer;
+            rcmd.size   = entries[i].size;
+            do_read_one_region(&rcmd);
+        }
+
+        kf_kfree(entries);
+        return;
+    }
+
+    if (cmd == OP_GET_CPU_NUM_BRPS || cmd == OP_GET_CPU_NUM_WRPS) {
+        uint64_t __attribute__((unused)) dfr0;
+        __asm__ volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
+        return;
+    }
+
     if (cmd == OP_SET_HW_BREAKPOINT) {
         hw_breakpoint_cmd_t bcmd;
         if (kf___arch_copy_from_user(&bcmd, (void __user *)user_data, sizeof(bcmd)))
